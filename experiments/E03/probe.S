@@ -107,8 +107,8 @@ _start:
 	st %g4, [%g3 + 60]		! snap[15] = swap mem
 
 	! --- LDSTUB/SWAP-equivalent atomics: CASA intentionally NOT executed ---
-	! casa [%o0] 0x0a, %o1, %o2 = 0x15E22149 (rd=o2, op3=0x3c, rs1=o0,
-	! i=1, asi=0x0a, rs2=o1 — hand-derived, objdump cross-checked).
+	! casa [%o0] 0x0a, %o1, %o2 = 0xD5E22149 (op=3, rd=o2, op3=0x3c,
+	! rs1=o0, i=1, asi=0x0a, rs2=o1 — hand-derived, objdump cross-checked).
 	! The oracle (qemu-sparc 7.2 linux-user) cannot execute it: the CASA
 	! case is compiled out under CONFIG_USER_ONLY (trap 0x24 = TT_NCP_INSN,
 	! qemu kills the guest). See casa.S (expected-trap demo) + FINDINGS.

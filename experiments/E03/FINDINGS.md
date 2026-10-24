@@ -38,31 +38,37 @@ E03-PASS
 
 ## CASA encoding (hand-derived, objdump cross-checked)
 
-`casa [%o0] 0x0a, %o1, %o2` = `rd(10)<<25 | op3(0x3c)<<19 | rs1(8)<<14 |
-i(1)<<13 | asi(0x0a)<<5 | rs2(9)` = **`0x15E22149`**; ASI 0x0b variant
-**`0x15E22169`**. (An earlier draft had rs1/rd swapped — `casa [%o2]…` —
-caught by objdump decode; the translator's decoder must use architecture
-field order, not mnemonic order.)
+`casa [%o0] 0x0a, %o1, %o2` = `op(3)<<30 | rd(10)<<25 | op3(0x3c)<<19 |
+rs1(8)<<14 | i(1)<<13 | asi(0x0a)<<5 | rs2(9)` = **`0xD5E22149`**; ASI 0x0b
+variant **`0xD5E22169`**. Verified: `objdump -d` prints
+`casa [%o0] %asi, %o1, %o2` for `d5 e2 21 49`.
+(Correction history: the first draft had rs1/rd swapped (`casa [%o2]…`,
+caught by objdump); the second draft `0x15E22149` dropped the `op=3` field
+and decodes as an op0/op2=7 coprocessor branch — NOT casa. The translator's
+decoder must use architecture field order *including* `op=3`.)
 
 ## CASA oracle gap (demonstrated in-vivo by `casa.S`)
 
+With the true word `0xD5E22149`:
+
 ```
-Unhandled trap: 0x24
-pc: 000100d0  npc: 000100d4     <- the casa word
-%o0-7: 000201de 11111111 22222222 ...
-exit=1
+Illegal instruction     <- SIGILL delivered to the guest
+exit=132
 ```
 
 Root cause (qemu v7.2.0 source): `target/sparc/translate.c` gates
 `case 0x3c` (casa) with `#if !defined(CONFIG_USER_ONLY) ||
 defined(TARGET_SPARC64)` — on `qemu-sparc` linux-user the case is compiled
-out and translation traps `0x24 = TT_NCP_INSN`, which `linux-user`
-`cpu_loop` does not handle (kills the guest; no signal is delivered).
-Additionally `get_asi` (32-bit) sends every immediate-ASI alternate access to
-`TT_ILL_INSN`. So **no qemu-user variant executes 32-bit user-mode CASA**
+out and translation falls to `default: goto illegal_insn` → `TT_ILL_INSN`,
+which `linux-user` delivers to the guest as SIGILL (exit 132, no handler
+installed). So **no qemu-user variant executes 32-bit user-mode CASA**
 (the 64-bit `get_asi` path traps `asi < 0x80` in user mode too).
 The LEON3 CPU def *does* carry `CPU_FEATURE_CASA` — the feature exists, the
 user-mode translate path does not.
+
+For the record: the earlier `0x15E22149` draft produced `Unhandled trap:
+0x24` / exit 1 — that is `TT_NCP_INSN` from the op0/op2=7 coprocessor-branch
+decode (`ncp_insn`), unhandled by `cpu_loop`, and is NOT the CASA path.
 
 Translator consequence: CASA (match → swap+rd=old, mismatch → rd=old,
 mem unchanged; ASI 0x0a user data) is implemented from the manual in

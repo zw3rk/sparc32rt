@@ -1,12 +1,15 @@
-! E03 casa.S: CASA execution demo — EXPECTED ORACLE OUTCOME: guest death.
-! Attempts casa [%o0] 0x0a, %o1, %o2 (0x15E22149, match case) on the
-! qemu-sparc 7.2 linux-user oracle. The CASA case (op3=0x3c) is compiled
-! out under CONFIG_USER_ONLY (translate.c: `#if !defined(CONFIG_USER_ONLY)
-! || defined(TARGET_SPARC64)`), so translation falls to `default:
-! goto illegal_insn`... observed empirically as trap 0x24 = TT_NCP_INSN,
-! which linux-user cpu_loop does NOT handle -> prints
-! "Unhandled trap: 0x24", dumps state, exit(1). The guest print below
-! NEVER appears; its absence is the finding. Run: qemu-sparc -cpu LEON3.
+! E03 casa.S: CASA execution demo — EXPECTED ORACLE OUTCOME: guest SIGILL.
+! Attempts casa [%o0] 0x0a, %o1, %o2 (0xD5E22149, match case) on the
+! qemu-sparc 7.2 linux-user oracle. The CASA case (op=3, op3=0x3c) is
+! compiled out under CONFIG_USER_ONLY (translate.c: `#if
+! !defined(CONFIG_USER_ONLY) || defined(TARGET_SPARC64)`), so translation
+! falls to `default: goto illegal_insn` -> TT_ILL_INSN, which linux-user
+! delivers to the guest as SIGILL (guest dies, exit 132; no handler
+! installed here). The guest print below NEVER appears; its absence is
+! the finding. (An earlier draft used 0x15E22149, which drops the op=3
+! field and decodes as an op0/op2=7 coprocessor branch -> trap 0x24
+! NCP; that observation is documented in FINDINGS.md for the record but
+! is NOT the CASA path.) Run: qemu-sparc -cpu LEON3.
 ! Freestanding V8 (-m32 -fno-pie -no-pie -nostdlib -static).
 	.text
 	.align 4
@@ -18,7 +21,7 @@ _start:
 	or %o1, %lo(0x11111111), %o1
 	sethi %hi(0x22222222), %o2
 	or %o2, %lo(0x22222222), %o2
-	.word 0x15E22149		! casa [%o0] 0x0a, %o1, %o2 (match)
+	.word 0xD5E22149		! casa [%o0] 0x0a, %o1, %o2 (match)
 	! --- reached only if the oracle executes CASA: report + exit(0) ---
 	sethi %hi(msg_alive), %g2
 	or %g2, %lo(msg_alive), %g2
