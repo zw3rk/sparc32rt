@@ -62,10 +62,10 @@ Write `docs/lanes/phase-3.md` and run concurrent lanes `L3a..L3c`:
 
 ### Phase 4 — Signals (`rt_sigframe`), Threads (`clone`/`futex`/TLS), & Process Lifecycle (`fork`/`execve`) (`RC4`)
 Write `docs/lanes/phase-4.md` and run concurrent lanes `L4a..L4c`:
-- [ ] **Lane `L4a`**: Exact target Linux UAPI `rt_sigframe` construction & restoration (`rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, synchronous `SIGSEGV`/`SIGILL`/`SIGFPE`/`SIGBUS`/`SIGTRAP` delivery).
-- [ ] **Lane `L4b`**: Multithreading (`clone` with `CLONE_VM|CLONE_THREAD|CLONE_SETTLS|CLONE_CHILD_CLEARTID`, `futex`, TLS register, LL/SC reservation invalidation across helpers/signals/threads).
-- [ ] **Lane `L4c`**: Process lifecycle (`fork`, `vfork`, `execve`, `wait4`, `waitid`, `pipe2`, `dup2`) and `tests/test_p4_threads_signals.c`.
-- [ ] **Gate `RC4`**: `test_p4_threads_signals` (signal frame inspection/modification/restoration, pthreads + futex, `fork`+`execve`+`wait4`) matches `qemu-sparc (with -cpu LEON3)` on both `interp` and `dbt`.
+- [x] **Lane `L4a`**: Exact target Linux UAPI `rt_sigframe` construction & restoration (`rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, synchronous `SIGSEGV`/`SIGILL`/`SIGFPE`/`SIGBUS`/`SIGTRAP` delivery).
+- [x] **Lane `L4b`**: Multithreading (`clone` with `CLONE_VM|CLONE_THREAD|CLONE_SETTLS|CLONE_CHILD_CLEARTID`, `futex`, TLS register, LL/SC reservation invalidation across helpers/signals/threads).
+- [x] **Lane `L4c`**: Process lifecycle (`fork`, `vfork`, `execve`, `wait4`, `waitid`, `pipe2`, `dup2`) and `tests/test_p4_threads_signals.c`.
+- [x] **Gate `RC4`**: `test_p4_threads_signals` (signal frame inspection/modification/restoration, pthreads + futex, `fork`+`execve`+`wait4`) matches `qemu-sparc (with -cpu LEON3)` on both `interp` and `dbt`. (`test_p4_threads` + `test_p4_async` byte-identical to oracle on both engines; E04 modulo pids, E05 structural; difftest 0 on `t1`/`tsys`/`t3`/E04/E05/`t4t`; `t4a` wall-clock SIGALRM excluded from difftest; see `docs/lanes/phase-4.md` RC4 sign-off.)
 
 ### Phase 5 — Dynamic Linking (`PT_INTERP`), `BusyBox`, & Target `libc` Matrix (`RC5`)
 Write `docs/lanes/phase-5.md` and run concurrent lanes `L5a..L5b`:

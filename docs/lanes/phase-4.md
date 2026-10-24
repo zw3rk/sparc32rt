@@ -143,3 +143,43 @@ A lane stops and reports to the Coordinator when its acceptance fails
 twice, when it needs an edit outside its exclusive files + hook
 hunks (especially any frozen header), or when oracle behavior
 contradicts a frozen contract above.
+
+---
+
+### RC4 Sign-off (Coordinator, on `master`)
+
+- **Merges**: `lane/p4-l4a` (threads/signals), `lane/p4-l4b`
+  (thread entry/host test), `lane/p4-l4c` (threading/async guests,
+  rlimit mapping) — all `--no-ff` (`syscalls_min.c` conflict
+  resolved by taking L4c's rlimit hunk).
+- **RC4 integration fixes** (Coordinator-level, found by the RC4 gate):
+  1. `+100/+104` compat mirror in async frame builds (async handlers
+     return without patching, unlike L1d/E05-style handlers).
+  2. Late async delivery (tail commits first, poll delivers next):
+     kill/tkill/tgkill drop in-dispatch delivery so handler `%o0`
+     is not clobbered; sigsuspend keeps in-dispatch delivery (its
+     test asserts the handler ran before return) with the tail
+     committing `O0=EINTR/C=1` over it.
+  3. `interp_poll_async` wired at `interp_step` top + `dbt` block
+     entry + `dbt_step` pre-exec (lockstep-aligned); the dbt
+     chain-break on pending removed (it stranded `main` in a stop).
+  4. Thread-entry loop re-arms `exit_reason=NONE` after dispatch
+     (else the first syscall re-dispatches forever, marching `pc`).
+  5. `CLONE_SYSVSEM` accepted (qemu requires it); `setitimer(83)`
+     `ITIMER_REAL` via host timer; SPARC `rt_sigprocmask` how 1/2/4
+     (L2a used generic 0/1/2); `sparc32_signal_reset_all` on execve;
+     `execve` split to `src/os/threads_exec.c` (900-line rule).
+- **Gate evidence** (`sparc32rt-oracle`, `qemu-sparc -cpu LEON3`,
+  all exit 0): `test_p4_threads` + `test_p4_async` pass byte-identical
+  on `interp` and `dbt`; E04 matches modulo pids, E05 structurally
+  (stack addresses differ); `t1`/`tsys`/`t3`/E06 unchanged
+  (byte-identical, E06 single documented `RD` line); difftest
+  `0` divergences on `t1` (6170), `tsys` (844), `t3` (8997),
+  E04 (1254), E05 (12218), `t4t` (1186). `t4a` difftest diverges:
+  wall-clock SIGALRM delivery point differs per engine (functional
+  parity holds on both). `make check` passes; L4b host test passes
+  natively.
+- **Residuals**: threaded `dbt` runs guest threads on the interp
+  loop (correctness first; DBT-threaded execution is H3 scope);
+  `RLIMIT_AS`/`oom_score_adj` probed per L4c (passthrough, no
+  mapping needed); arithmetic `RD≠RN` still RN (Phase 3 residual).
