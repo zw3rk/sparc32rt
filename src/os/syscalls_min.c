@@ -391,6 +391,17 @@ static long sys_mprotect(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32
     return (long)rt32_vm_mprotect(ctx, addr, len, prot);
 }
 
+/* mremap(250): SPARC 5-arg form (old_addr, old_len, new_len, flags,
+ * new_addr). rt32_vm_mremap returns a guest u32 address or
+ * (uint32_t)-errno like mmap/brk, so it shares their carry-commit
+ * window below (Phase 6, host-contract section 2.1). */
+static long sys_mremap(sparc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
+                       uint32_t new_len, uint32_t flags, uint32_t new_addr)
+{
+    return ret_guest_u32(rt32_vm_mremap(ctx, old_addr, old_len, new_len,
+                                       flags, new_addr));
+}
+
 /* struct utsname: six NUL-padded fields of 65 bytes each (390 total),
  * matching the sparc32 new_utsname layout the oracle exposes. */
 #define SPARC32_UTS_FIELD  65U
@@ -645,6 +656,9 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
     case (long)SPARC32__NR_mprotect:
         ret = sys_mprotect(ctx, o0, o1, o2);
         break;
+    case (long)SPARC32__NR_mremap:
+        ret = sys_mremap(ctx, o0, o1, o2, o3, o4);
+        break;
     case (long)SPARC32__NR_close:
         ret = sparc32_l2a_close((int)(int32_t)o0);
         break;
@@ -815,11 +829,11 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
     }
 
     /* Carry commit (E04): errors are negative host errno here.
-     * mmap/brk return guest u32 addresses, whose high-bit patterns
+     * mmap/mremap/brk return guest u32 addresses, whose high-bit patterns
      * would misread as errors; treat only the kernel -4095..-1 window
-     * (u32 0xFFFFF001..0xFFFFFFFF) as an error for those two. */
+     * (u32 0xFFFFF001..0xFFFFFFFF) as an error for those three. */
     if (nr == (long)SPARC32__NR_mmap || nr == (long)SPARC32__NR_mmap2 ||
-        nr == (long)SPARC32__NR_brk) {
+        nr == (long)SPARC32__NR_mremap || nr == (long)SPARC32__NR_brk) {
         uint32_t u = (uint32_t)ret;
 
         if (u > 0xFFFFF000U) {
