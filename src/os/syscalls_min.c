@@ -37,6 +37,47 @@
 #include "os/syscall_nr.h"
 #include "rt32/rt32.h"
 
+/* Phase-2 static-libc layer (src/os/syscalls.c, lane L2a owns). Handlers
+ * return host-style results (>= 0 value, negative host errno); the carry
+ * commit below applies unchanged. */
+long sparc32_l2a_openat(sparc32_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
+    uint32_t flags, uint32_t mode);
+long sparc32_l2a_open(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t flags,
+    uint32_t mode);
+long sparc32_l2a_creat(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t mode);
+long sparc32_l2a_close(int fd);
+long sparc32_l2a_lseek(uint32_t fd, int32_t offset, uint32_t whence);
+long sparc32_l2a_getpid(void);
+long sparc32_l2a_getuid(void);
+long sparc32_l2a_geteuid(void);
+long sparc32_l2a_getgid(void);
+long sparc32_l2a_getegid(void);
+long sparc32_l2a_readv(sparc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
+    uint32_t iovcnt);
+long sparc32_l2a_writev(sparc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
+    uint32_t iovcnt);
+long sparc32_l2a_stat(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va);
+long sparc32_l2a_lstat(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va);
+long sparc32_l2a_fstat(sparc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va);
+long sparc32_l2a_stat64(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va);
+long sparc32_l2a_lstat64(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t buf_va);
+long sparc32_l2a_fstat64(sparc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va);
+long sparc32_l2a_fstatat64(sparc32_ctx_t *ctx, uint32_t dirfd,
+    uint32_t path_va, uint32_t buf_va, uint32_t flags);
+long sparc32_l2a_statx(sparc32_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
+    uint32_t flags, uint32_t mask, uint32_t buf_va);
+long sparc32_l2a_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg);
+long sparc32_l2a_clock_gettime(sparc32_ctx_t *ctx, uint32_t clk_id,
+    uint32_t tp_va);
+long sparc32_l2a_getrandom(sparc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
+    uint32_t flags);
+long sparc32_l2a_futex(sparc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
+    uint32_t val, uint32_t timeout_va);
+long sparc32_l2a_rt_sigprocmask(sparc32_ctx_t *ctx, uint32_t how,
+    uint32_t set_va, uint32_t oset_va, uint32_t sigsetsize);
+long sparc32_l2a_ioctl(sparc32_ctx_t *ctx, uint32_t fd, uint32_t request,
+    uint32_t arg_va);
+
 /* SPARC Linux errnos are the asm-generic numbers. On the AArch64 Linux
  * deployment host they match the host values, but the mapping is kept
  * explicit (rather than identity) so the E04 carry convention holds on
@@ -77,6 +118,8 @@ static uint32_t sparc_errno_from_host(long host_errno)
     case ENOSYS: return 38U;
     case ENAMETOOLONG: return 36U;
     case ELOOP: return 40U;
+    case ERANGE: return 34U;
+    case EOVERFLOW: return 75U;
     default: break;
     }
     return (uint32_t)host_errno;
@@ -149,13 +192,8 @@ int sparc32_signal_get(int sig, uint32_t *handler_va, uint32_t *restorer_va)
     return 0;
 }
 
-static long sys_close(int fd)
-{
-    if (close(fd) != 0) {
-        return -(long)errno;
-    }
-    return 0;
-}
+/* Close moved to src/os/syscalls.c (lane L2a, sparc32_l2a_close);
+ * behaviour identical (0 on success, negative host errno on failure). */
 
 /* rt_sigaction(102): SPARC 5-arg form (E05: sig, act, oact, restorer,
  * sigsetsize). Phase-1 accepts old-style handlers only (flags == 0);
@@ -458,7 +496,88 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         ret = sys_mprotect(ctx, o0, o1, o2);
         break;
     case (long)SPARC32__NR_close:
-        ret = sys_close((int)(int32_t)o0);
+        ret = sparc32_l2a_close((int)(int32_t)o0);
+        break;
+    /* Lane L2a static-libc set (src/os/syscalls.c, additive cases only). */
+    case (long)SPARC32__NR_open:
+        ret = sparc32_l2a_open(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_creat:
+        ret = sparc32_l2a_creat(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_lseek:
+        ret = sparc32_l2a_lseek(o0, (int32_t)o1, o2);
+        break;
+    case (long)SPARC32__NR_getpid:
+        ret = sparc32_l2a_getpid();
+        break;
+    case (long)SPARC32__NR_getuid:
+    case (long)SPARC32__NR_getuid32:
+        ret = sparc32_l2a_getuid();
+        break;
+    case (long)SPARC32__NR_geteuid:
+    case (long)SPARC32__NR_geteuid32:
+        ret = sparc32_l2a_geteuid();
+        break;
+    case (long)SPARC32__NR_getgid:
+    case (long)SPARC32__NR_getgid32:
+        ret = sparc32_l2a_getgid();
+        break;
+    case (long)SPARC32__NR_getegid:
+    case (long)SPARC32__NR_getegid32:
+        ret = sparc32_l2a_getegid();
+        break;
+    case (long)SPARC32__NR_stat:
+        ret = sparc32_l2a_stat(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_lstat:
+        ret = sparc32_l2a_lstat(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_fstat:
+        ret = sparc32_l2a_fstat(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_stat64:
+        ret = sparc32_l2a_stat64(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_lstat64:
+        ret = sparc32_l2a_lstat64(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_fstat64:
+        ret = sparc32_l2a_fstat64(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_fstatat64:
+        ret = sparc32_l2a_fstatat64(ctx, o0, o1, o2, o3);
+        break;
+    case (long)SPARC32__NR_statx:
+        ret = sparc32_l2a_statx(ctx, o0, o1, o2, o3, o4);
+        break;
+    case (long)SPARC32__NR_readv:
+        ret = sparc32_l2a_readv(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_writev:
+        ret = sparc32_l2a_writev(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_openat:
+        ret = sparc32_l2a_openat(ctx, o0, o1, o2, o3);
+        break;
+    case (long)SPARC32__NR_fcntl:
+    case (long)SPARC32__NR_fcntl64: /* identical F_* command set on SPARC */
+        ret = sparc32_l2a_fcntl(o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_rt_sigprocmask:
+        ret = sparc32_l2a_rt_sigprocmask(ctx, o0, o1, o2, o3);
+        break;
+    case (long)SPARC32__NR_ioctl:
+        ret = sparc32_l2a_ioctl(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_clock_gettime:
+        ret = sparc32_l2a_clock_gettime(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_getrandom:
+        ret = sparc32_l2a_getrandom(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_futex:
+        ret = sparc32_l2a_futex(ctx, o0, o1, o2, o3);
         break;
     case (long)SPARC32__NR_rt_sigaction:
         ret = sys_rt_sigaction(ctx, o0, o1, o2, o3, o4);
