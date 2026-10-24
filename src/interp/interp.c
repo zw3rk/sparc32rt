@@ -14,7 +14,8 @@
  * with the carry convention (E04), misaligned multi-byte accesses fault
  * (SIGBUS via sync delivery, oracle-compatible), single bytes never do
  * (qemu-oracle compatible), page-final non-annulled branch at 0xffc ->
- * EXIT_SINGLE_STEP. All FPU encodings -> EXIT_UNDEF (Phase 3 owns them).
+ * EXIT_SINGLE_STEP. FPU/FPMEM route to fp.c (Phase 3, lane L3a);
+ * quad, 64-bit and odd-rd double-dest FPop trap EXIT_UNDEF.
  *
  * Classification comes from the frozen L1a decoder (interp/decode.h):
  * interp_step() fetches via sparc32_fetch_decode() and dispatches on
@@ -35,6 +36,7 @@
 #include "sparc32rt.h"
 
 #include "interp/decode.h"
+#include "interp/fp.h"
 #include "interp/interp_priv.h"
 #include "os/sigframe_sparc32rt.h"
 #include "os/syscalls_min.h"
@@ -517,7 +519,9 @@ static bool interp_single(sparc32_ctx_t *ctx, uint32_t pc,
     case SPARC32_OP_CASA:
         return interp_casa(ctx, d);
     case SPARC32_OP_FPU:
-        return interp_undef(ctx, pc);
+        return sparc32_fp_step(ctx, pc, d);
+    case SPARC32_OP_FPMEM:
+        return sparc32_fp_mem(ctx, pc, d);
     default:
         break;
     }
@@ -534,6 +538,7 @@ static bool interp_is_cti(const sparc32_decoded_t *d)
 {
     return d->cls == (uint32_t)SPARC32_OP_CALL ||
         d->cls == (uint32_t)SPARC32_OP_BRANCH ||
+        d->cls == (uint32_t)SPARC32_OP_FBRANCH ||
         d->cls == (uint32_t)SPARC32_OP_JMPL;
 }
 
@@ -558,6 +563,14 @@ static void interp_cti(sparc32_ctx_t *ctx, uint32_t pc,
         annul = d->annul != 0U;
         taken = interp_eval_cond(cond, ctx->psr);
         target = pc + (uint32_t)d->disp;
+    } else if (d->cls == (uint32_t)SPARC32_OP_FBRANCH) {
+        /* FBfcc mirrors Bicc exactly (dual-PC, delay, annul,
+         * page-final) except the condition evaluates FSR.fcc in
+         * fp.c instead of PSR.icc. */
+        cond = d->cond;
+        annul = d->annul != 0U;
+        taken = sparc32_fp_branch_taken(ctx, d->cond);
+        target = pc + (uint32_t)d->disp;
     } else { /* JMPL: RETT decodes PRIV, never reaches here. */
         uint32_t b = (d->is_imm != 0U) ? (uint32_t)d->simm
                                        : ctx->r[d->rs2];
@@ -569,7 +582,8 @@ static void interp_cti(sparc32_ctx_t *ctx, uint32_t pc,
      * not-taken Bicc,a skips without fetching (no next-page fault). */
     if (taken) {
         runs = !(cond == 0x8U && annul &&
-            d->cls == (uint32_t)SPARC32_OP_BRANCH);
+            (d->cls == (uint32_t)SPARC32_OP_BRANCH ||
+             d->cls == (uint32_t)SPARC32_OP_FBRANCH));
     } else {
         runs = !annul;
     }
