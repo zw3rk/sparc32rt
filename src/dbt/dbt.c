@@ -41,6 +41,7 @@
 #include "dbt/emit_int.h"
 #include "interp/decode.h"
 #include "interp/interp.h"
+#include "os/threads.h"
 #include "rt32/a64_emit.h"
 
 #ifndef MAP_ANONYMOUS
@@ -676,18 +677,20 @@ int dbt_run(sparc32_ctx_t *ctx)
             }
             return (int)ctx->exit_reason;
         }
+        /* Async safe point (Phase 4): deliver before executing, mirroring
+         * interp_step's top poll so both engines stop at the same pc. */
+        if (ctx->pending_signals != 0U && interp_poll_async(ctx)) {
+            continue;
+        }
         r = dbt_exec_enter(ctx, b, true);
         if (r == (int)SPARC32_EXIT_BRANCH) {
             dbt_on_branch(ctx, b);
-            /* Break chaining only for async signals (pending_signals is
-             * set by another thread; Phase 4 wires main's async path).
-             * Synchronous delivery already completed inside the faulting
-             * iteration's main-loop turn, so chaining resumes normally;
-             * breaking on the sticky sync_sig_delivered flag stranded
-             * every post-handler branch back in main (fatal). */
-            if (ctx->pending_signals != 0U) {
-                return (int)ctx->exit_reason;
-            }
+            /* Never break chaining for pending signals: the block-entry
+             * poll delivers at the next boundary (or skips masked and
+             * handler-less bits), so returning here would strand main
+             * in a stop with no delivery path. Synchronous delivery
+             * already completed inside the faulting iteration's
+             * main-loop turn, so chaining resumes normally. */
             continue;
         }
         if (r == (int)SPARC32_EXIT_UNDEF ||
@@ -711,6 +714,10 @@ int dbt_step(sparc32_ctx_t *ctx)
     }
     entry_pc = ctx->pc;
     ctx->exit_reason = SPARC32_EXIT_NONE;
+    /* Async safe point: mirror interp_step (deliver before executing). */
+    if (ctx->pending_signals != 0U && interp_poll_async(ctx)) {
+        return (int)ctx->exit_reason;
+    }
     /* No chaining: a fresh single-insn fragment executes through the
      * no-chain trampoline, so exactly one guest instruction runs (a CTI
      * with its delay slot counts as one step, as in interp_step). */

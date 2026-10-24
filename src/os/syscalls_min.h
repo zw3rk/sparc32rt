@@ -24,9 +24,20 @@ const char *sparc32_syscall_name(long nr);
  * 0 otherwise. */
 long sparc32_handle_syscall(sparc32_ctx_t *ctx);
 
+/* SPARC rt_sigprocmask how values (NOT the generic 0/1/2): 1 = BLOCK,
+ * 2 = UNBLOCK, 4 = SETMASK (qemu target_signal.h; how=0 is EINVAL). */
+#define SPARC_SIG_BLOCK 1U
+#define SPARC_SIG_UNBLOCK 2U
+#define SPARC_SIG_SETMASK 4U
+
 /* Look up the installed old-style handler for sig (1..31). Returns 0 with
  * the handler/restorer VAs filled when installed, -1 otherwise. Phase-1
  * sync delivery (interp_try_deliver_sync) consults this. */
 int sparc32_signal_get(int sig, uint32_t *handler_va, uint32_t *restorer_va);
+
+/* Drop every installed disposition (execve(59): Linux resets caught
+ * signals to SIG_DFL across exec, so stale handler VAs must not fire
+ * in the new image). */
+void sparc32_signal_reset_all(void);
 
 #endif /* SPARC32RT_OS_SYSCALLS_MIN_H */

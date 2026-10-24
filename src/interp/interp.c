@@ -634,6 +634,11 @@ void interp_step(sparc32_ctx_t *ctx)
     if (ctx == NULL) {
         return;
     }
+    /* Async safe point (Phase 4): a redirected pc consumes this step. */
+    if (interp_poll_async(ctx)) {
+        ctx->r[0] = 0U;
+        return;
+    }
     ctx->r[0] = 0U;
     pc = ctx->pc;
     if (sparc32_fetch_decode(ctx, pc, &d) != 0) {

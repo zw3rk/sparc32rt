@@ -35,6 +35,7 @@
 
 #include "sparc32rt.h"
 #include "os/syscall_nr.h"
+#include "os/threads.h"
 #include "rt32/rt32.h"
 
 /* Phase-2 static-libc layer (src/os/syscalls.c, lane L2a owns). Handlers
@@ -191,6 +192,18 @@ int sparc32_signal_get(int sig, uint32_t *handler_va, uint32_t *restorer_va)
     *handler_va = sigact[sig].handler;
     *restorer_va = sigact[sig].restorer;
     return 0;
+}
+
+/* execve reset (RC4): a new image starts with no handlers installed
+ * (Linux resets caught signals to SIG_DFL across exec). */
+void sparc32_signal_reset_all(void)
+{
+    int sig;
+    for (sig = 1; sig <= 31; sig++) {
+        sigact[sig].installed = 0;
+        sigact[sig].handler = 0U;
+        sigact[sig].restorer = 0U;
+    }
 }
 
 /* Close moved to src/os/syscalls.c (lane L2a, sparc32_l2a_close);
@@ -405,16 +418,6 @@ static long sys_uname(sparc32_ctx_t *ctx, uint32_t buf_va)
     return 0;
 }
 
-/* set_tid_address(166): records clear_child_tid (used at thread exit
- * by Phase 4 clone/exit) and returns the caller's own tid, which musl
- * stores as the main thread's tid. The kernel writes nothing to
- * *tidptr here; the clear+wake happens at thread teardown. */
-static long sys_set_tid_address(sparc32_ctx_t *ctx, uint32_t tidptr_va)
-{
-    ctx->clear_child_tid = tidptr_va;
-    return (ctx->host_tid > 0) ? (long)ctx->host_tid : 1000L;
-}
-
 int sparc32_syscall_is_exit(long nr)
 {
     return (nr == (long)SPARC32__NR_exit || nr == (long)SPARC32__NR_exit_group) ? 1 : 0;
@@ -600,7 +603,51 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         ret = sys_uname(ctx, o0);
         break;
     case (long)SPARC32__NR_set_tid_address:
-        ret = sys_set_tid_address(ctx, o0);
+        /* Phase-4 completion (lane L4a): record + real tid + async init. */
+        ret = sparc32_thr_set_tid_address(ctx, o0);
+        break;
+    /* Lane L4a process/thread arms (src/os/threads.c owns the logic). */
+    case (long)SPARC32__NR_fork:
+        ret = sparc32_thr_fork(ctx);
+        break;
+    case (long)SPARC32__NR_vfork:
+        ret = sparc32_thr_vfork(ctx);
+        break;
+    case (long)SPARC32__NR_pipe:
+        ret = sparc32_thr_pipe(ctx);
+        break;
+    case (long)SPARC32__NR_pipe2:
+        ret = sparc32_thr_pipe2(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_wait4:
+        ret = sparc32_thr_wait4(ctx, o0, o1, o2, o3);
+        break;
+    case (long)SPARC32__NR_waitpid:
+        ret = sparc32_thr_waitpid(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_clone:
+        ret = sparc32_thr_clone(ctx, o0, o1, o2, o3, o4);
+        break;
+    case (long)SPARC32__NR_execve:
+        ret = sparc32_thr_execve(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_kill:
+        ret = sparc32_thr_kill(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_tkill:
+        ret = sparc32_thr_tkill(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_tgkill:
+        ret = sparc32_thr_tgkill(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_rt_sigpending:
+        ret = sparc32_thr_rt_sigpending(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_rt_sigsuspend:
+        ret = sparc32_thr_rt_sigsuspend(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_setitimer:
+        ret = sparc32_thr_setitimer(ctx, o0, o1, o2);
         break;
     default:
         ret = -ENOSYS;
