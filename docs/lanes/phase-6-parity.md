@@ -109,7 +109,9 @@ comparison of stdout; `difftest` = last line of the `--difftest` run.
 | test_p4_threads | 0 | 0 | 0 | identical x3, sorted identical | 0 divergences (1186 steps) |
 | test_p5_auxv | 0 | 0 | 0 | identical x3 | 0 divergences (9824 steps) |
 | test_p6_adjacent (new) | 0 | 0 | 0 | identical x3 | 0 divergences (1617 steps) |
-| test_p6_mmap (L6a) | — | — | — | file absent (R7) | — |
+| test_p6_mmap (L6a) | 0 | 0 | 0 | identical x3 | 0 divergences (976 steps) |
+| test_p5_auxv (L5a) | 0 | 0 | 0 | identical x3 | 0 divergences (9903 steps) |
+| test_p5_app+interp (L5a) | 0 | 0 | 0 | identical x3 | 0 divergences (446 steps) |
 | test_p5_dyn(+lib) | — | — | — | no pure-V8 toolchain (R6) | — |
 | E01 | 0 | 0 | 0 | identical modulo stack addresses (R3) | 0 divergences (5688 steps) |
 | E02 | 0 | 0 | 0 | identical x3 | 0 divergences (1354 steps) |
@@ -206,6 +208,14 @@ half (re-execution after adjacent dirtying) instead.
   `sparc32rt-oracle:latest` (`BUILD-GAP t5dyn` in the build log);
   Phase 5 already records the pure-V8 sysroot as unobtainable
   (`docs/lanes/phase-5-sysroot.md`).
-- **R7 — `test_p6_mmap` not swept (L6a pending).**
-  `tests/test_p6_mmap.c` is absent on this branch
-  (`SWEEP-GAP t6mmap` in the build log); L6a delivers and gates it.
+- **R7 — `test_p6_mmap` swept at RC6 (L6a delivered).**
+  `tests/test_p6_mmap.c` exits 0 oracle-identical on all three
+  engines with `0` divergences (976 steps, Coordinator-observed).
+- **R8 — fetch-X enforced identically (RC6 R1 resolved).**
+  Neither engine used to check `PROT_EXEC` on fetch (oracle
+  SIGSEGVs RW fetch); Coordinator added the `EXEC` bit to the shared
+  `sparc32_fetch_decode` region gate, so both engines fault
+  identically (`EXIT_FAULT` → sync SIGSEGV path) instead of
+  silently executing RW pages. Verified with a stack-NOP-sled
+  probe: both engines stop with `reason=4`. H1 SMC tests
+  `mprotect` pages `+PROT_EXEC` explicitly and are unaffected.

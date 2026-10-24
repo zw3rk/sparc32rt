@@ -102,3 +102,33 @@ A lane stops and reports to the Coordinator when its acceptance fails
 twice, when it needs an edit outside its exclusive files + hook
 hunks (especially any frozen header), or when oracle behavior
 contradicts a frozen contract above.
+
+---
+
+### RC6 Sign-off (Coordinator, on `master`)
+
+- **Merges**: `lane/p6-l6a` (mmap contract probe + mremap dispatch),
+  `lane/p6-l6b` (adjacent-4KiB probe + parity matrix) — both
+  `--no-ff`, no conflicts.
+- **RC6 integration** (Coordinator-level):
+  1. Fetch-X enforcement (L6b residual R1): the shared
+     `sparc32_fetch_decode` region gate now requires `PROT_EXEC`
+     as well as `PROT_READ`, so both engines fault
+     (`EXIT_FAULT` → sync SIGSEGV path) instead of silently
+     executing RW pages. No existing test executes from a
+     non-EXEC page (full gate re-verified green).
+  2. `test_p6_mmap` swept into the parity matrix (was R7 pending).
+- **Gate evidence** (`sparc32rt-oracle`, all exit 0):
+  full Phase 0–5 suite green on `qemu-sparc -cpu LEON3`,
+  `--interp`, `--dbt`: `test_p1_isa`, `test_p2_sys`,
+  `test_p3_fp_simd`, `test_p4_threads`, `test_p4_async`,
+  `test_p5_auxv`, `test_p5_app`+interp, `test_p6_mmap`,
+  `test_p6_adjacent`, E01–E06; difftest `0` divergences on all
+  deterministic suites (`t4a` excluded: wall-clock SIGALRM;
+  E04/`t4t` multiset-only: fork-print interleave varies even
+  qemu-vs-qemu). `make check` + L4b host test pass natively.
+- **Residuals**: `hl`-only paths (stage-1 AP/UXN splits,
+  CoW-fork snapshot cooperation beyond native `fork` duplication)
+  are construction-verified, not runtime-verified (no `hl` host
+  here); dynamic `dlopen`/`DT_NEEDED` loading still unimplemented
+  (Phase 5 residual); `t4a` excluded from difftest (wall-clock).

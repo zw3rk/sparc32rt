@@ -75,9 +75,9 @@ Write `docs/lanes/phase-5.md` and run concurrent lanes `L5a..L5b`:
 
 ### Phase 6 — `hyper-linux` (`hl`) Host Contract & Dual-Host Parity (`RC6`)
 Write `docs/lanes/phase-6.md` and run lanes `L6a..L6b`:
-- [ ] **Lane `L6a`**: Verify full compliance with `../rt-series/docs/HOST-CONTRACT.md` (`/dev/a32host A32H_ABI 1.0/1.1 negotiation and G = 0x1_0000_0000`).
-- [ ] **Lane `L6b`**: Run full parity suite (`test_p1_isa`, `test_p3_fp_simd`, `test_p4_threads_signals`, `test_p5_dyn`, adjacent 4 KiB page permissions).
-- [ ] **Gate `RC6`**: All Phase 1–5 suites pass cleanly under the AArch64 Linux runtime environment and host-contract harness.
+- [x] **Lane `L6a`**: Verify full compliance with `../rt-series/docs/HOST-CONTRACT.md` (`/dev/a32host A32H_ABI 1.0/1.1 negotiation and G = 0x1_0000_0000`).
+- [x] **Lane `L6b`**: Run full parity suite (`test_p1_isa`, `test_p3_fp_simd`, `test_p4_threads_signals`, `test_p5_dyn`, adjacent 4 KiB page permissions).
+- [x] **Gate `RC6`**: All Phase 1–5 suites pass cleanly under the AArch64 Linux runtime environment and host-contract harness. (All suites exit 0 oracle-identical on both engines; difftest 0 on deterministic suites; fetch-X enforced on both engines; see `docs/lanes/phase-6.md` RC6 sign-off + `docs/lanes/phase-6-parity.md`.)
 
 ### Phase 7 — Hardening (`SMC`, `libc-test`, LTP Syscall Subset, Instrumented CoreMark, C++17) (`RC-H`)
 Write `docs/lanes/phase-7.md` and run concurrent hardening lanes `H1..H4`:

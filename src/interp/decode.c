@@ -378,9 +378,13 @@ void sparc32_decode_word(uint32_t word, sparc32_decoded_t *out)
     decode_format3_mem(word, out);
 }
 
-/* Guest PROT bit for read (Linux PROT_READ; matches the tracked region
- * encoding in src/rt32/vm_mmap.c, which stores prot & 0x7). */
+/* Guest PROT bits for fetch (Linux PROT_READ/PROT_EXEC; matches the
+ * tracked region encoding in src/rt32/vm_mmap.c, which stores
+ * prot & 0x7). Fetch requires EXEC: the oracle SIGSEGVs execution
+ * from RW-only pages (RC6 R1), and silent execution there would also
+ * defeat W^X SMC checks (RC-H H1). */
 #define SPARC32_DECODE_PROT_READ 0x1U
+#define SPARC32_DECODE_PROT_EXEC 0x4U
 
 int sparc32_fetch_decode(sparc32_ctx_t *ctx, uint32_t va, sparc32_decoded_t *out)
 {
@@ -403,10 +407,12 @@ int sparc32_fetch_decode(sparc32_ctx_t *ctx, uint32_t va, sparc32_decoded_t *out
         for (k = 0; k < ctx->region_count; k++) {
             uint32_t start = ctx->regions[k].start;
             uint32_t end = ctx->regions[k].end;
-            /* The whole 4-byte word must sit inside one readable region;
-             * end > va guards against 32-bit wrap on small regions. */
+            /* The whole 4-byte word must sit inside one readable AND
+             * executable region; end > va guards against 32-bit wrap
+             * on small regions. */
             if (va >= start && end > va && (end - va) >= 4U &&
-                ((ctx->regions[k].prot & SPARC32_DECODE_PROT_READ) != 0U)) {
+                ((ctx->regions[k].prot & SPARC32_DECODE_PROT_READ) != 0U) &&
+                ((ctx->regions[k].prot & SPARC32_DECODE_PROT_EXEC) != 0U)) {
                 covered = 1;
                 break;
             }
