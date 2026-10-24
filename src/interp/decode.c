@@ -293,6 +293,22 @@ static void decode_format3_mem(uint32_t word, sparc32_decoded_t *out)
         out->cls = SPARC32_OP_STORE;
         return;
     }
+    /* FP loads/stores (Phase 3): purely syntactic here; odd-rd and quad
+     * traps live in fp.c so UNDEF-vs-execute stays in one place. */
+    switch (op3) {
+    case SPARC32_OP3_LDF:
+    case SPARC32_OP3_LDFSR:
+    case SPARC32_OP3_LDQF:
+    case SPARC32_OP3_LDDF:
+    case SPARC32_OP3_STF:
+    case SPARC32_OP3_STFSR:
+    case SPARC32_OP3_STQF:
+    case SPARC32_OP3_STDF:
+        out->cls = SPARC32_OP_FPMEM;
+        return;
+    default:
+        break;
+    }
     /* LDX/LDXA (V9 64-bit), PREFETCH (V9), and the remaining gaps. */
     out->cls = SPARC32_OP_ILLEGAL;
 }

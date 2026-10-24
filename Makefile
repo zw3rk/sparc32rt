@@ -38,7 +38,8 @@ SRCS_C := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) \
           $(wildcard src/os/*.c) $(wildcard src/dbt/*.c)
 SRCS_S := $(wildcard src/rt32/*.S) $(wildcard src/dbt/*.S)
 HDRS   := src/sparc32rt.h include/a32host.h src/os/syscall_nr.h \
-          $(wildcard src/rt32/*.h)
+          $(wildcard src/rt32/*.h) $(wildcard src/interp/*.h) \
+          $(wildcard src/dbt/*.h) $(wildcard src/os/*.h)
 
 OBJ_DIR      := $(BUILD_DIR)/obj
 OBJS         := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS_C)) \

@@ -60,10 +60,14 @@ typedef enum {
                          * LDSTUB atomic byte op (atomic flag set). */
     SPARC32_OP_STORE,   /* Stores incl. alternate-space (asi valid). */
     SPARC32_OP_SWAP,    /* SWAP/SWAPA atomic register/memory exchange (E03). */
-    SPARC32_OP_CASA     /* LEON CASA (op == 3, op3 0x3c): rs1/rs2/rd/asi.
+    SPARC32_OP_CASA,    /* LEON CASA (op == 3, op3 0x3c): rs1/rs2/rd/asi.
                          * Decode-only; the oracle cannot execute it
                          * (E03 casa.S: guest SIGILL, exit 132), execution
                          * is L1b. */
+    SPARC32_OP_FPMEM    /* FP loads/stores (op == 3): LDF/LDFSR/LDDF/STF/
+                         * STFSR/STDF (quad LDQF/STQF decode here and trap
+                         * in Phase 3 fp.c). Purely syntactic; semantics,
+                         * alignment faults, and traps are L3a/L3b. */
 } sparc32_op_t;
 
 /* op == 2 (Format 3 ALU/misc) op3 values (SPARC V8). */
@@ -133,6 +137,16 @@ typedef enum {
 #define SPARC32_OP3_LDSTUBA 0x1DU
 #define SPARC32_OP3_SWAPA 0x1FU
 #define SPARC32_OP3_CASA  0x3CU
+
+/* op == 3 FP memory op3 values (SPARC V8; GAS-verified encodings). */
+#define SPARC32_OP3_LDF   0x20U
+#define SPARC32_OP3_LDFSR 0x21U
+#define SPARC32_OP3_LDQF  0x22U
+#define SPARC32_OP3_LDDF  0x23U
+#define SPARC32_OP3_STF   0x24U
+#define SPARC32_OP3_STFSR 0x25U
+#define SPARC32_OP3_STQF  0x26U
+#define SPARC32_OP3_STDF  0x27U
 
 /* Bicc condition codes (op2 == 2, cond field). */
 #define SPARC32_COND_BN 0x0U
