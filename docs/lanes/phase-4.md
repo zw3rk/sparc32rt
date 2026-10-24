@@ -170,8 +170,10 @@ contradicts a frozen contract above.
      (L2a used generic 0/1/2); `sparc32_signal_reset_all` on execve;
      `execve` split to `src/os/threads_exec.c` (900-line rule).
 - **Gate evidence** (`sparc32rt-oracle`, `qemu-sparc -cpu LEON3`,
-  all exit 0): `test_p4_threads` + `test_p4_async` pass byte-identical
-  on `interp` and `dbt`; E04 matches modulo pids, E05 structurally
+  all exit 0): `test_p4_threads` + `test_p4_async` pass functionally
+  identical to oracle on `interp` and `dbt` (`t4t` multiset-identical
+  modulo fork-print interleave, which varies even qemu-vs-qemu);
+  E04 matches modulo pids, E05 structurally
   (stack addresses differ); `t1`/`tsys`/`t3`/E06 unchanged
   (byte-identical, E06 single documented `RD` line); difftest
   `0` divergences on `t1` (6170), `tsys` (844), `t3` (8997),

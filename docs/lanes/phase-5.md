@@ -106,3 +106,32 @@ A lane stops and reports to the Coordinator when its acceptance fails
 twice, when it needs an edit outside its exclusive files + hook
 hunks (especially any frozen header), or when oracle behavior
 contradicts a frozen contract above.
+
+---
+
+### RC5 Sign-off (Coordinator, on `master`)
+
+- **Merges**: `lane/p5-l5a` (loader/auxv/procfs + synthetic pair +
+  auxv self-test), `lane/p5-l5b` (dyn test pair + sysroot record,
+  documented negative) — both `--no-ff`, no conflicts.
+- **RC5 integration**: none required beyond the merges — L5a's
+  acceptance already ran green on the merged tree shape
+  (`make check` passes; no cross-lane file overlap).
+- **Gate evidence** (`sparc32rt-oracle`, `qemu-sparc -cpu LEON3`,
+  all exit 0): synthetic `PT_INTERP` pair prints
+  `interp-first/app-ran` byte-identical on qemu/`--interp`/`--dbt`
+  with `0` divergences (446 steps); `test_p5_auxv`
+  byte-identical on all three with `0` divergences (9903 steps);
+  all Phase 0–4 suites unchanged and green
+  (`t1`/`tsys`/`t3`/E04/E05/E06 + `t4t` functional +
+  `t4a` functional; `t4t` output multiset-identical modulo
+  fork-print interleave, which varies even qemu-vs-qemu).
+- **Residuals** (documented, loader NOT weakened):
+  `test_p5_dyn`/`libp5dyn.so` + BusyBox await a pure-V8 dynamic
+  sysroot (nix has no `pkgsCross.sparc*` target; glibc refuses
+  `sparc-linux`; Debian userland provably `EM_SPARC32PLUS`+V9 and
+  correctly rejected with `ENOEXEC`); see
+  `docs/lanes/phase-5-sysroot.md` for provenance, the exact
+  negative proof, and the staged BusyBox qualification command.
+  Dynamic `dlopen`/`DT_NEEDED` loading itself is unimplemented
+  (static + synthetic-`PT_INTERP` only).

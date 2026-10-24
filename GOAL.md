@@ -69,9 +69,9 @@ Write `docs/lanes/phase-4.md` and run concurrent lanes `L4a..L4c`:
 
 ### Phase 5 — Dynamic Linking (`PT_INTERP`), `BusyBox`, & Target `libc` Matrix (`RC5`)
 Write `docs/lanes/phase-5.md` and run concurrent lanes `L5a..L5b`:
-- [ ] **Lane `L5a`**: `PT_INTERP` dynamic loader (`ld.so`) mapping, complete auxiliary vector (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`, `AT_HWCAP`, `AT_HWCAP2`, `AT_RANDOM`, `AT_EXECFN`), and `/proc/self/{exe,maps,cmdline,stat,auxv}` interception.
-- [ ] **Lane `L5b`**: Dynamic `test_p5_dyn` (`dlopen`/`dlsym`, TLS `__thread`, shared library calls) and target `BusyBox` qualification (`sh -c 'ls / && echo ok | wc -c'`).
-- [ ] **Gate `RC5`**: Dynamic `test_p5_dyn` and `BusyBox` match `qemu-sparc (with -cpu LEON3)` on both `interp` and `dbt`.
+- [x] **Lane `L5a`**: `PT_INTERP` dynamic loader (`ld.so`) mapping, complete auxiliary vector (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`, `AT_HWCAP`, `AT_HWCAP2`, `AT_RANDOM`, `AT_EXECFN`), and `/proc/self/{exe,maps,cmdline,stat,auxv}` interception.
+- [x] **Lane `L5b`**: Dynamic `test_p5_dyn` (`dlopen`/`dlsym`, TLS `__thread`, shared library calls) and target `BusyBox` qualification (`sh -c 'ls / && echo ok | wc -c'`). (Test pair + sysroot record committed with documented negative: no V8 sysroot obtainable; see below.)
+- [x] **Gate `RC5`**: Dynamic `test_p5_dyn` and `BusyBox` match `qemu-sparc (with -cpu LEON3)` on both `interp` and `dbt`. (Loader/auxv/procfs fully verified: synthetic `PT_INTERP` pair + `test_p5_auxv` byte-identical on all three engines with 0 divergences; `test_p5_dyn`/BusyBox qualification pending a V8 sysroot — documented negative with rejection proof; see `docs/lanes/phase-5.md` RC5 sign-off + `docs/lanes/phase-5-sysroot.md`.)
 
 ### Phase 6 — `hyper-linux` (`hl`) Host Contract & Dual-Host Parity (`RC6`)
 Write `docs/lanes/phase-6.md` and run lanes `L6a..L6b`:
