@@ -31,10 +31,11 @@ ifeq ($(shell uname -s),Linux)
 endif
 LDFLAGS ?= -static-pie
 
-# Phase 0 sources: CLI entry plus the vendored rt32 substrate. The DBT
-# (src/dbt/) and interpreter (src/interp/) arrive in Phases 1-2, at which
-# point -DSPARC32RT_NO_DBT is dropped and these globs pick them up.
-SRCS_C := src/main.c $(wildcard src/rt32/*.c)
+# Phase 1 sources: CLI entry, vendored rt32 substrate, reference
+# interpreter, and minimal syscall layer. The DBT (src/dbt/) arrives in
+# Phase 2, at which point -DSPARC32RT_NO_DBT is dropped and its glob is added.
+SRCS_C := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) \
+          $(wildcard src/os/*.c)
 SRCS_S := $(wildcard src/rt32/*.S)
 HDRS   := src/sparc32rt.h include/a32host.h src/os/syscall_nr.h \
           $(wildcard src/rt32/*.h)

@@ -13,14 +13,19 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "sparc32rt.h"
 
-/* Sign-extend the low n bits of v (1 <= n <= 31). */
+/* Sign-extend the low n bits of v (1 <= n <= 31). Branchless and fully
+ * defined: the old ((v << shift) >> shift) form shifted right as UNSIGNED
+ * (logical shift), discarding the sign it had just shifted into bit 31. */
 static int32_t sign_extend(uint32_t v, uint32_t n)
 {
-    uint32_t shift = 32U - n;
-    return (int32_t)((v << shift) >> shift);
+    uint32_t m = 1U << (n - 1U);
+    uint32_t x = v & ((1U << n) - 1U);
+
+    return (int32_t)((x ^ m) - m);
 }
 
 /* FPop1 opf values with a double-precision destination (V8 opf table):
@@ -216,6 +221,9 @@ static void decode_format2(uint32_t word, sparc32_decoded_t *out)
     case SPARC32_OP3_FLUSH:
         out->cls = SPARC32_OP_FLUSH;
         return;
+    case SPARC32_OP3_STBAR:
+        out->cls = SPARC32_OP_STBAR;
+        return;
     case SPARC32_OP3_SAVE:
         out->cls = SPARC32_OP_SAVE;
         return;
@@ -249,7 +257,7 @@ static void decode_format3_mem(uint32_t word, sparc32_decoded_t *out)
 
     if (op3 == SPARC32_OP3_CASA) {
         /* CASA carries its ASI in bits 12:5 with i == 1 (E03: the
-         * 0x15E22149 encoding has i set and asi 0x0a in that slot). */
+         * 0xD5E22149 encoding has i set and asi 0x0a in that slot). */
         if (i == 0U) {
             out->cls = SPARC32_OP_ILLEGAL;
             return;
@@ -390,6 +398,16 @@ int sparc32_fetch_decode(sparc32_ctx_t *ctx, uint32_t va, sparc32_decoded_t *out
         if (covered == 0) {
             ctx->exit_reason = SPARC32_EXIT_FAULT;
             ctx->fault_addr = va;
+            if (ctx->trace_enabled) {
+                size_t r;
+                fprintf(stderr, "T FETCHFAIL va=%08x nregions=%zu\n", va,
+                        ctx->region_count);
+                for (r = 0; r < ctx->region_count; r++) {
+                    fprintf(stderr, "T   [%zu] %08x..%08x prot=%x\n", r,
+                            ctx->regions[r].start, ctx->regions[r].end,
+                            ctx->regions[r].prot);
+                }
+            }
             return -1;
         }
     }

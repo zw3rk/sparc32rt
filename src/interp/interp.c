@@ -6,40 +6,43 @@
  *
  * interp_step() + interp_run() for every SPEC section 2 base integer
  * instruction: dual-PC stepping, annulled-delay semantics (E02), 8-window
- * SAVE/RESTORE with inline spill/fill (E01: spill to OLD %sp, refill from
- * the rotated NEW %sp; overflow/underflow absorbed so deep chains work),
+ * SAVE/RESTORE via interp_win.c (E01 WIM model),
  * Y threading through MUL/DIV (E03), icc N/Z/V/C (E03: MULcc V is the
  * SIGNED overflow, SDIV truncates toward zero), LDSTUB/SWAP/CASA per the
  * LEON manual (match swaps, rd always gets old mem; ASI 0x0a ok, 0x0b
  * traps unless SPARC32RT_LEON_SUPERVISOR_ASI=1), ta 0x10 -> EXIT_SYSCALL
- * with the carry convention (E04), unaligned accesses emulated byte-wise
+ * with the carry convention (E04), misaligned multi-byte accesses fault
+ * (SIGBUS via sync delivery, oracle-compatible), single bytes never do
  * (qemu-oracle compatible), page-final non-annulled branch at 0xffc ->
  * EXIT_SINGLE_STEP. All FPU encodings -> EXIT_UNDEF (Phase 3 owns them).
  *
  * Classification comes from the frozen L1a decoder (interp/decode.h):
  * interp_step() fetches via sparc32_fetch_decode() and dispatches on
  * sparc32_decoded_t (cls/op3/rd/rs1/rs2/is_imm/simm/asi/cond/annul/disp).
- * Local deviations from a strict decoder reading, kept to preserve the
- * pre-merge interpreter behavior (all reported to the Coordinator):
- * STBAR (op == 2, op3 == 0x2c) executes as a host-model nop instead of
- * EXIT_UNDEF, and LDSW/LDSWA execute as word loads instead of EXIT_UNDEF.
+ * Engine policy on decoder classes (Coordinator-blessed): STBAR
+ * (SPARC32_OP_STBAR) executes as a host-model nop; LDSW/LDSWA execute as
+ * word loads (sign extension is the identity on words).
  * SAVE/RESTORE/CASA dispatch follows the L1a classes (SAVE is op == 2 /
  * op3 == 0x3c, RESTORE 0x3d, CASA op == 3 / op3 == 0x3c with i == 1).
  *
  * Guest memory uses only the [G, G + 4GiB) window via sparc32_guest_ptr()
  * after a ctx->regions coverage check; data gaps or missing R/W permission
  * set EXIT_FAULT with fault_addr. Instruction fetch faults come from
- * sparc32_fetch_decode(). The only globals are interp_step() and
- * interp_run().
+ * sparc32_fetch_decode(). Shared engine internals live behind
+ * interp/interp_priv.h (interp_mem.c, interp_win.c, interp_signal.c).
  */
 
 #include "sparc32rt.h"
 
 #include "interp/decode.h"
+#include "interp/interp_priv.h"
+#include "os/sigframe_sparc32rt.h"
+#include "os/syscalls_min.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -47,94 +50,6 @@
 #define SPARC32_TRAP_PRIV_INSN 0x03U
 #define SPARC32_TRAP_DIV_ZERO 0x2AU
 #define SPARC32_TRAP_SYSCALL 0x10U
-
-#define SPARC32_WIN_MAXSAVE 7U
-
-static void interp_wreg(sparc32_ctx_t *ctx, uint32_t rd, uint32_t v)
-{
-    if (rd != 0U) {
-        ctx->r[rd & 31U] = v;
-    }
-}
-
-/* Region coverage: every byte of [va, va+len) must be mapped with the
- * needed PROT bits. PROT_NONE/unmapped areas carry no record and fail. */
-static bool interp_range_ok(const sparc32_ctx_t *ctx, uint32_t va,
-    uint32_t len, uint32_t need)
-{
-    uint64_t end = (uint64_t)va + (uint64_t)len;
-    uint32_t cur = va;
-    size_t i;
-    if (len == 0U || end > (uint64_t)SPARC32_TASK_SIZE_TOP) {
-        return false;
-    }
-    for (i = 0; i < ctx->region_count && (uint64_t)cur < end; i++) {
-        const sparc32_region_t *r = &ctx->regions[i];
-        if ((uint64_t)cur >= (uint64_t)r->end) {
-            continue;
-        }
-        if (cur < r->start) {
-            return false;
-        }
-        if ((((uint32_t)r->prot) & need) != need) {
-            return false;
-        }
-        cur = r->end;
-    }
-    return (uint64_t)cur >= end;
-}
-
-static bool interp_mem_rd(sparc32_ctx_t *ctx, uint32_t va, void *dst,
-    uint32_t len)
-{
-    if (!interp_range_ok(ctx, va, len, 1U)) {
-        ctx->exit_reason = SPARC32_EXIT_FAULT;
-        ctx->fault_addr = va;
-        return false;
-    }
-    memcpy(dst, sparc32_guest_ptr(ctx, va), (size_t)len);
-    return true;
-}
-
-static bool interp_mem_wr(sparc32_ctx_t *ctx, uint32_t va, const void *src,
-    uint32_t len)
-{
-    if (!interp_range_ok(ctx, va, len, 2U)) {
-        ctx->exit_reason = SPARC32_EXIT_FAULT;
-        ctx->fault_addr = va;
-        return false;
-    }
-    memcpy(sparc32_guest_ptr(ctx, va), src, (size_t)len);
-    return true;
-}
-
-static bool interp_ld_be(sparc32_ctx_t *ctx, uint32_t va, uint32_t len,
-    uint32_t *out)
-{
-    uint8_t b[4];
-    uint32_t v = 0U;
-    uint32_t i;
-    if (!interp_mem_rd(ctx, va, b, len)) {
-        return false;
-    }
-    for (i = 0; i < len; i++) {
-        v = (v << 8) | (uint32_t)b[i];
-    }
-    *out = v;
-    return true;
-}
-
-static bool interp_st_be(sparc32_ctx_t *ctx, uint32_t va, uint32_t len,
-    uint32_t v)
-{
-    uint8_t b[4];
-    uint32_t i;
-    for (i = 0; i < len; i++) {
-        b[len - 1U - i] = (uint8_t)(v & 0xFFU);
-        v >>= 8;
-    }
-    return interp_mem_wr(ctx, va, b, len);
-}
 
 static void interp_icc_logic(sparc32_ctx_t *ctx, uint32_t res)
 {
@@ -227,46 +142,6 @@ static bool interp_asi_ok(uint32_t asi)
     return e != NULL && e[0] == '1' && e[1] == '\0';
 }
 
-static bool interp_spill(sparc32_ctx_t *ctx)
-{
-    uint8_t buf[SPARC32_RWINDOW_SIZE];
-    uint32_t i;
-    for (i = 0; i < 8U; i++) {
-        uint32_t l = ctx->r[SPARC32_L0 + i];
-        uint32_t k = ctx->r[SPARC32_I0 + i];
-        buf[4U * i] = (uint8_t)(l >> 24);
-        buf[4U * i + 1U] = (uint8_t)(l >> 16);
-        buf[4U * i + 2U] = (uint8_t)(l >> 8);
-        buf[4U * i + 3U] = (uint8_t)l;
-        buf[32U + 4U * i] = (uint8_t)(k >> 24);
-        buf[32U + 4U * i + 1U] = (uint8_t)(k >> 16);
-        buf[32U + 4U * i + 2U] = (uint8_t)(k >> 8);
-        buf[32U + 4U * i + 3U] = (uint8_t)k;
-    }
-    return interp_mem_wr(ctx, ctx->r[SPARC32_SP], buf,
-        SPARC32_RWINDOW_SIZE);
-}
-
-static bool interp_fill(sparc32_ctx_t *ctx)
-{
-    uint8_t buf[SPARC32_RWINDOW_SIZE];
-    uint32_t i;
-    if (!interp_mem_rd(ctx, ctx->r[SPARC32_SP], buf,
-        SPARC32_RWINDOW_SIZE)) {
-        return false;
-    }
-    for (i = 0; i < 8U; i++) {
-        ctx->r[SPARC32_L0 + i] = ((uint32_t)buf[4U * i] << 24) |
-            ((uint32_t)buf[4U * i + 1U] << 16) |
-            ((uint32_t)buf[4U * i + 2U] << 8) |
-            (uint32_t)buf[4U * i + 3U];
-        ctx->r[SPARC32_I0 + i] = ((uint32_t)buf[32U + 4U * i] << 24) |
-            ((uint32_t)buf[32U + 4U * i + 1U] << 16) |
-            ((uint32_t)buf[32U + 4U * i + 2U] << 8) |
-            (uint32_t)buf[32U + 4U * i + 3U];
-    }
-    return true;
-}
 
 /* Forward declaration: single-insn executor (no CTI). Leaves pc/npc alone
  * on clean completion; sets exit state (and trap pc advance) on stops. */
@@ -275,6 +150,10 @@ static bool interp_single(sparc32_ctx_t *ctx, uint32_t pc,
 
 static bool interp_trap_taken(sparc32_ctx_t *ctx, uint32_t num)
 {
+    /* No pc advance here: the owner (sparc32_handle_syscall, SPEC 2.2)
+     * commits pc = npc; npc += 4 exactly once per trap. Advancing here too
+     * skipped the instruction after every syscall (observed: retl skipped,
+     * guest ran off the end of .text). */
     if (num == SPARC32_TRAP_SYSCALL) {
         ctx->exit_reason = SPARC32_EXIT_SYSCALL;
         ctx->exit_arg = SPARC32_TRAP_SYSCALL;
@@ -283,8 +162,6 @@ static bool interp_trap_taken(sparc32_ctx_t *ctx, uint32_t num)
         ctx->exit_arg = num;
         ctx->exit_dest = ctx->pc;
     }
-    ctx->pc = ctx->npc;
-    ctx->npc += 4U;
     return false;
 }
 
@@ -509,61 +386,6 @@ static bool interp_rdwr(sparc32_ctx_t *ctx, const sparc32_decoded_t *d)
     return true;
 }
 
-static bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
-    bool is_save)
-{
-    uint32_t a = ctx->r[d->rs1];
-    uint32_t b = (d->is_imm != 0U) ? (uint32_t)d->simm
-                                   : ctx->r[d->rs2];
-    uint32_t i;
-    if (is_save) {
-        uint32_t old_o[8];
-        uint32_t new_sp = a + b;
-        if (!interp_spill(ctx)) {
-            return false;
-        }
-        for (i = 0; i < 8U; i++) {
-            old_o[i] = ctx->r[SPARC32_O0 + i];
-        }
-        for (i = 0; i < 8U; i++) {
-            ctx->r[SPARC32_I0 + i] = old_o[i];
-            ctx->r[SPARC32_L0 + i] = 0U;
-        }
-        ctx->cwp = (ctx->cwp + SPARC32_NWINDOWS - 1U) % SPARC32_NWINDOWS;
-        if (ctx->cansave > 0U) {
-            ctx->cansave--;
-        }
-        if (ctx->canrestore < SPARC32_WIN_MAXSAVE) {
-            ctx->canrestore++;
-        }
-        interp_wreg(ctx, d->rd, new_sp);
-        return true;
-    }
-    /* RESTORE */
-    {
-        uint32_t old_i[8];
-        uint32_t res = a + b;
-        for (i = 0; i < 8U; i++) {
-            old_i[i] = ctx->r[SPARC32_I0 + i];
-        }
-        for (i = 0; i < 8U; i++) {
-            ctx->r[SPARC32_O0 + i] = old_i[i];
-        }
-        if (!interp_fill(ctx)) {
-            return false;
-        }
-        ctx->cwp = (ctx->cwp + 1U) % SPARC32_NWINDOWS;
-        if (ctx->canrestore > 0U) {
-            ctx->canrestore--;
-        }
-        if (ctx->cansave < SPARC32_WIN_MAXSAVE) {
-            ctx->cansave++;
-        }
-        interp_wreg(ctx, d->rd, res);
-        return true;
-    }
-}
-
 static bool interp_casa(sparc32_ctx_t *ctx, const sparc32_decoded_t *d)
 {
     uint32_t cmp = ctx->r[d->rs2];
@@ -701,10 +523,8 @@ static bool interp_single(sparc32_ctx_t *ctx, uint32_t pc,
     }
     /* CALL/BRANCH/FBRANCH/JMPL/TRAP never reach here: interp_step routes
      * CTIs through interp_cti() and traps inline. Anything else illegal
-     * is UNDEF, except STBAR (op == 2, op3 == 0x2c), which the decoder
-     * reports ILLEGAL but the host model executes as a nop. */
-    if (d->cls == (uint32_t)SPARC32_OP_ILLEGAL && d->op == 0x2U &&
-        d->op3 == 0x2CU) {
+     * is UNDEF, except STBAR, which the host model executes as a nop. */
+    if (d->cls == (uint32_t)SPARC32_OP_STBAR) {
         return true;
     }
     return interp_undef(ctx, pc);
@@ -763,6 +583,10 @@ static void interp_cti(sparc32_ctx_t *ctx, uint32_t pc,
         }
         return;
     }
+    if (ctx->trace_enabled) {
+        fprintf(stderr, "T cti pc=%08x taken=%u target=%08x npc=%08x\n", pc,
+                taken ? 1U : 0U, target, npc);
+    }
     if (sparc32_fetch_decode(ctx, npc, &dd) != 0) {
         return;
     }
@@ -800,6 +624,10 @@ void interp_step(sparc32_ctx_t *ctx)
     pc = ctx->pc;
     if (sparc32_fetch_decode(ctx, pc, &d) != 0) {
         return;
+    }
+    if (ctx->trace_enabled) {
+        fprintf(stderr, "T pc=%08x npc=%08x raw=%08x cls=%u\n", pc, ctx->npc,
+                d.raw, d.cls);
     }
     if (interp_is_cti(&d)) {
         interp_cti(ctx, pc, &d);

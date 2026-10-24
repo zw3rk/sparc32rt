@@ -53,13 +53,17 @@ typedef enum {
     SPARC32_OP_TRAP,    /* Ticc (op3 0x3a): cond + rs1/src2. TA (cond == 8)
                          * with simm13 == 0x10 is the syscall trap (E04). */
     SPARC32_OP_FLUSH,   /* FLUSH (op3 0x3b): rs1/src2 address hint. */
+    SPARC32_OP_STBAR,   /* STBAR (op == 2, op3 0x2c): store barrier, host-model
+                         * nop (TSO). Explicit class so every engine agrees;
+                         * never ILLEGAL. */
     SPARC32_OP_LOAD,    /* Loads incl. alternate-space (asi valid) and the
                          * LDSTUB atomic byte op (atomic flag set). */
     SPARC32_OP_STORE,   /* Stores incl. alternate-space (asi valid). */
     SPARC32_OP_SWAP,    /* SWAP/SWAPA atomic register/memory exchange (E03). */
-    SPARC32_OP_CASA     /* LEON CASA (op3 0x3c on op == 3): rs1/rs2/rd/asi.
+    SPARC32_OP_CASA     /* LEON CASA (op == 3, op3 0x3c): rs1/rs2/rd/asi.
                          * Decode-only; the oracle cannot execute it
-                         * (E03 casa.S trap 0x24), execution is L1b. */
+                         * (E03 casa.S: guest SIGILL, exit 132), execution
+                         * is L1b. */
 } sparc32_op_t;
 
 /* op == 2 (Format 3 ALU/misc) op3 values (SPARC V8). */
@@ -96,6 +100,7 @@ typedef enum {
 #define SPARC32_OP3_RETT    0x39U
 #define SPARC32_OP3_TICC    0x3AU
 #define SPARC32_OP3_FLUSH   0x3BU
+#define SPARC32_OP3_STBAR   0x2CU
 #define SPARC32_OP3_SAVE    0x3CU
 #define SPARC32_OP3_RESTORE 0x3DU
 #define SPARC32_OP3_MULSCC  0x24U

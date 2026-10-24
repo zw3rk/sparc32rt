@@ -117,6 +117,158 @@ static int guest_range_ok(uint32_t va, uint32_t len)
     return 0;
 }
 
+/* Big-endian guest word access (guest is BE, host may be LE). */
+static int sys_ld_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t *out)
+{
+    const uint8_t *p;
+    if (guest_range_ok(va, 4U) != 0) {
+        return -EFAULT;
+    }
+    p = (const uint8_t *)sparc32_guest_ptr(ctx, va);
+    *out = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+    return 0;
+}
+
+/* Old-style (non-SA_SIGINFO) signal dispositions for sync delivery.
+ * Phase-1 scope: installed by rt_sigaction, consulted by
+ * interp_try_deliver_sync. Async delivery/threads arrive in Phase 4. */
+static struct {
+    uint32_t handler;
+    uint32_t restorer;
+    int installed;
+} sigact[32];
+
+int sparc32_signal_get(int sig, uint32_t *handler_va, uint32_t *restorer_va)
+{
+    if (sig < 1 || sig > 31 || !sigact[sig].installed) {
+        return -1;
+    }
+    *handler_va = sigact[sig].handler;
+    *restorer_va = sigact[sig].restorer;
+    return 0;
+}
+
+static long sys_close(int fd)
+{
+    if (close(fd) != 0) {
+        return -(long)errno;
+    }
+    return 0;
+}
+
+/* rt_sigaction(102): SPARC 5-arg form (E05: sig, act, oact, restorer,
+ * sigsetsize). Phase-1 accepts old-style handlers only (flags == 0);
+ * SA_SIGINFO and realtime extensions are Phase 4. */
+static long sys_rt_sigaction(sparc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
+    uint32_t oact_va, uint32_t restorer, uint32_t sigsetsize)
+{
+    uint32_t handler;
+    uint32_t flags;
+    (void)ctx;
+    (void)oact_va;
+    if (sig < 1U || sig > 31U) {
+        return -EINVAL;
+    }
+    if (sigsetsize != 8U) {
+        return -EINVAL;
+    }
+    if (guest_range_ok(act_va, 20U) != 0) {
+        return -EFAULT;
+    }
+    if (sys_ld_be32(ctx, act_va, &handler) != 0) {
+        return -EFAULT;
+    }
+    if (sys_ld_be32(ctx, act_va + 4U, &flags) != 0) {
+        return -EFAULT;
+    }
+    if (flags != 0U) {
+        return -EINVAL;
+    }
+    sigact[sig].handler = handler;
+    sigact[sig].restorer = restorer;
+    sigact[sig].installed = 1;
+    return 0;
+}
+
+/* sigreturn(216): legacy non-RT restore with qemu-sparc compatible frame
+ * addressing. The guest handler (L1d test) patches pc/npc at frame+100 /
+ * frame+104 — the non-RT struct signal_frame regs slots, which alias the
+ * RT frame's si_errno/si_code words on this kernel/qemu layout — and
+ * resumes from there. u_regs (g0..g7, i0..i7), y and psr come from the
+ * kernel-layout slots (+0xE0 regs); %o regs stay live (handler contract).
+ * fpu_save/rwin_save must be 0 (we never set them); anything else faults
+ * instead of silently mis-restoring. */
+static long sys_sigreturn(sparc32_ctx_t *ctx)
+{
+    uint32_t base = ctx->r[SPARC32_SP];
+    uint32_t u[16];
+    uint32_t pc;
+    uint32_t npc;
+    uint32_t y;
+    uint32_t psr;
+    uint32_t fp;
+    uint32_t rp;
+    uint32_t fs;
+    int i;
+    if ((base & 15U) != 0U) {
+        return -EFAULT;
+    }
+    if (guest_range_ok(base, 344U) != 0) {
+        return -EFAULT;
+    }
+    if (sys_ld_be32(ctx, base + 0xF0U + 14U * 4U, &fp) != 0) {
+        return -EFAULT;
+    }
+    if ((fp & 7U) != 0U) {
+        return -EFAULT;
+    }
+    if (sys_ld_be32(ctx, base + 100U, &pc) != 0) {
+        return -EFAULT;
+    }
+    if (sys_ld_be32(ctx, base + 104U, &npc) != 0) {
+        return -EFAULT;
+    }
+    if ((pc & 3U) != 0U || (npc & 3U) != 0U) {
+        return -EFAULT;
+    }
+    if (sys_ld_be32(ctx, base + 0x138U, &fs) != 0) {
+        return -EFAULT;
+    }
+    if (fs != 0U) {
+        return -EFAULT;
+    }
+    if (sys_ld_be32(ctx, base + 0x154U, &rp) != 0) {
+        return -EFAULT;
+    }
+    if (rp != 0U) {
+        return -EFAULT;
+    }
+    if (sys_ld_be32(ctx, base + 0xE0U, &psr) != 0) {
+        return -EFAULT;
+    }
+    if (sys_ld_be32(ctx, base + 0xECU, &y) != 0) {
+        return -EFAULT;
+    }
+    for (i = 0; i < 16; i++) {
+        if (sys_ld_be32(ctx, base + 0xF0U + (uint32_t)i * 4U, &u[i]) != 0) {
+            return -EFAULT;
+        }
+    }
+    ctx->psr = psr;
+    ctx->y = y;
+    for (i = 1; i < 8; i++) {
+        ctx->r[(uint32_t)i] = u[i];
+    }
+    for (i = 8; i < 16; i++) {
+        ctx->r[SPARC32_I0 + (uint32_t)(i - 8)] = u[i];
+    }
+    ctx->r[0] = 0U;
+    ctx->pc = pc;
+    ctx->npc = npc;
+    return 0;
+}
+
 static long sys_read(sparc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t count)
 {
     if (guest_range_ok(buf_va, count) != 0) {
@@ -304,6 +456,22 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         break;
     case (long)SPARC32__NR_mprotect:
         ret = sys_mprotect(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_close:
+        ret = sys_close((int)(int32_t)o0);
+        break;
+    case (long)SPARC32__NR_rt_sigaction:
+        ret = sys_rt_sigaction(ctx, o0, o1, o2, o3, o4);
+        break;
+    case (long)SPARC32__NR_sigreturn:
+        /* sigreturn sets an absolute resume pc/npc; the common tail
+         * advance below must not run a second time (same double-advance
+         * class as the old trap_taken bug: resume would skip +4). */
+        ret = sys_sigreturn(ctx);
+        if (ret == 0) {
+            ctx->syscalls_executed++;
+            return 0;
+        }
         break;
     case (long)SPARC32__NR_uname:
         ret = sys_uname(ctx, o0);

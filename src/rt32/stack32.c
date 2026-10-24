@@ -46,6 +46,19 @@
 #define SPARC_AT_RANDOM  25U
 #define SPARC_AT_EXECFN  31U
 
+/* Big-endian 32-bit store to guest memory (SPARC is BE; the host may be
+ * LE — never use native word stores for guest-visible words). */
+static void st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
+{
+    uint8_t b[4];
+
+    b[0] = (uint8_t)(v >> 24);
+    b[1] = (uint8_t)(v >> 16);
+    b[2] = (uint8_t)(v >> 8);
+    b[3] = (uint8_t)v;
+    memcpy(sparc32_guest_ptr(ctx, va), b, sizeof(b));
+}
+
 static uint32_t push_bytes(sparc32_ctx_t *ctx, uint32_t *sp, const void *data, size_t len)
 {
     if (*sp < ctx->stack_base || len > (size_t)(*sp - ctx->stack_base)) {
@@ -103,7 +116,6 @@ int rt32_stack_setup(sparc32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
     size_t total_words;
     uint32_t frame_bytes;
     uint32_t final_sp;
-    uint32_t *w;
     size_t pos = 0;
     size_t copy_words;
 
@@ -178,15 +190,30 @@ int rt32_stack_setup(sparc32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
     }
     final_sp = (sp - frame_bytes) & ~0x7U;
 
-    w = (uint32_t *)sparc32_guest_ptr(ctx, final_sp + SPARC32_RWINDOW_SIZE);
-    w[pos++] = (uint32_t)argc;
-    memcpy(&w[pos], arg_ptrs, (size_t)argc * sizeof(uint32_t));
-    pos += (size_t)argc;
-    w[pos++] = 0U;
-    memcpy(&w[pos], env_ptrs, (size_t)envc * sizeof(uint32_t));
-    pos += (size_t)envc;
-    w[pos++] = 0U;
-    memcpy(&w[pos], auxv, aux_idx * sizeof(uint32_t));
+    /* Guest-visible words are big-endian (st_be32); the host-order auxv[]
+     * array is kept for the ctx->auxv_data cache below. */
+    st_be32(ctx, final_sp + SPARC32_RWINDOW_SIZE + (uint32_t)(pos * 4U),
+            (uint32_t)argc);
+    pos++;
+    for (int i = 0; i < argc; i++) {
+        st_be32(ctx, final_sp + SPARC32_RWINDOW_SIZE + (uint32_t)(pos * 4U),
+                arg_ptrs[i]);
+        pos++;
+    }
+    st_be32(ctx, final_sp + SPARC32_RWINDOW_SIZE + (uint32_t)(pos * 4U), 0U);
+    pos++;
+    for (int i = 0; i < envc; i++) {
+        st_be32(ctx, final_sp + SPARC32_RWINDOW_SIZE + (uint32_t)(pos * 4U),
+                env_ptrs[i]);
+        pos++;
+    }
+    st_be32(ctx, final_sp + SPARC32_RWINDOW_SIZE + (uint32_t)(pos * 4U), 0U);
+    pos++;
+    for (size_t i = 0; i < aux_idx; i++) {
+        st_be32(ctx, final_sp + SPARC32_RWINDOW_SIZE + (uint32_t)(pos * 4U),
+                auxv[i]);
+        pos++;
+    }
 
     ctx->guest_argc = argc;
     ctx->guest_argv = guest_argv;
