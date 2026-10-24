@@ -55,10 +55,10 @@ Write `docs/lanes/phase-2.md` and run concurrent lanes `L2a..L2d`:
 
 ### Phase 3 — Floating-Point & SIMD (`src/interp/fp.c`, `src/dbt/emit_fp.c`) (`RC3`)
 Write `docs/lanes/phase-3.md` and run concurrent lanes `L3a..L3c`:
-- [ ] **Lane `L3a`**: Complete FPU & SIMD reference interpreter (`src/interp/fp.c`) implementing all `SPEC.md` §2 FP/SIMD instructions, NaN rules, condition codes, and status registers.
-- [ ] **Lane `L3b`**: AArch64 FP & NEON emitter (`src/dbt/emit_fp.c`) + phase-gated `AT_HWCAP` activation.
-- [ ] **Lane `L3c`**: `tests/test_p3_fp_simd.c` covering scalar FP, SIMD lanes, NaN propagation, rounding modes, and conversions.
-- [ ] **Gate `RC3`**: `test_p3_fp_simd` matches `qemu-sparc (with -cpu LEON3)` golden output bit-for-bit on both `interp` and `dbt` with `0` `--difftest` divergences.
+- [x] **Lane `L3a`**: Complete FPU & SIMD reference interpreter (`src/interp/fp.c`) implementing all `SPEC.md` §2 FP/SIMD instructions, NaN rules, condition codes, and status registers.
+- [x] **Lane `L3b`**: AArch64 FP & NEON emitter (`src/dbt/emit_fp.c`) + phase-gated `AT_HWCAP` activation.
+- [x] **Lane `L3c`**: `tests/test_p3_fp_simd.c` covering scalar FP, SIMD lanes, NaN propagation, rounding modes, and conversions.
+- [x] **Gate `RC3`**: `test_p3_fp_simd` matches `qemu-sparc (with -cpu LEON3)` golden output bit-for-bit on both `interp` and `dbt` with `0` `--difftest` divergences. (t3: 0/8997; t1/t2-sys/E06 also 0; E06 single documented `RD` line; see `docs/lanes/phase-3.md` RC3 sign-off.)
 
 ### Phase 4 — Signals (`rt_sigframe`), Threads (`clone`/`futex`/TLS), & Process Lifecycle (`fork`/`execve`) (`RC4`)
 Write `docs/lanes/phase-4.md` and run concurrent lanes `L4a..L4c`:

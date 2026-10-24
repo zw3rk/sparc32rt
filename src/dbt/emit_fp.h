@@ -57,8 +57,24 @@ int sparc32_emit_fpu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d);
 /* Emit one decoded FP memory op (LDF/LDDF/STF/STDF/LDFSR/STFSR).
  * LDQF/STQF and odd-rd LDDF/STDF exit EXIT_UNDEF at ec->pc.
  * Misaligned or unmapped access exits via the fault path carrying
- * ec->fault_pc (same protocol as the integer memory emitter). */
+ * ec->fault_pc (same protocol as the integer memory emitter).
+ * Lowering lives in src/dbt/emit_fpmem.c (split for the 900-line
+ * file discipline). */
 int sparc32_emit_fpmem(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d);
+
+/* movz/movk 64-bit immediate into an X register (shared by the FP
+ * compute and FPMEM emitters). */
+static inline void fp_mov64x(a64_buf_t *b, unsigned rd_x, uint64_t v)
+{
+    a64_emit(b, 0xD2800000U | (((uint32_t)v & 0xFFFFU) << 5) |
+        (rd_x & 31U));
+    a64_emit(b, 0xF2800000U | (1U << 21) |
+        (((uint32_t)(v >> 16) & 0xFFFFU) << 5) | (rd_x & 31U));
+    a64_emit(b, 0xF2800000U | (2U << 21) |
+        (((uint32_t)(v >> 32) & 0xFFFFU) << 5) | (rd_x & 31U));
+    a64_emit(b, 0xF2800000U | (3U << 21) |
+        (((uint32_t)(v >> 48) & 0xFFFFU) << 5) | (rd_x & 31U));
+}
 
 /* Emit one FBfcc transfer. Mirrors sparc32_emit_branch exactly
  * (dual-PC, delay executes unless annulled away, annulled not-taken

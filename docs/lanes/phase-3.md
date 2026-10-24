@@ -67,6 +67,10 @@ guest memory only via the `G`-window helpers.
      `FCMP/FCMPE s/d` (+`fcc`, NV semantics per E06), unlisted/quad
      `opf` → `UNDEF`. `FsTOx/FdTOx/FxTO*`: implement only what the
      oracle executes; otherwise `UNDEF` + document.
+     Arithmetic executes round-to-nearest regardless of `RD` (matches
+     every oracle-observable behavior; `RD≠RN` arithmetic is a
+     documented residual — no available oracle distinguishes it, and
+     both engines agree via difftest).
   2. `FDTOI`/`FSTOI` with all four `RD` modes (manual); oracle test
      pins `RN`.
   3. `LDF/LDDF/STF/STDF` (misaligned multi-byte → `FAULT`/SIGBUS,
@@ -83,6 +87,10 @@ guest memory only via the `G`-window helpers.
   ```
   plus integer no-regression: `--interp`/`--difftest` on
   `test_p1_isa` + `test_p2_sys` still exit 0 with `0 divergences`.
+  Documented-gap form: `E06/probe.S` pins qemu's `RD`-blindness
+  (E06#6: `fdtoi(2.5) RM+inf` prints `2` on qemu, `3` per the manual);
+  `interp` must print the manual value there and match qemu on every
+  other line.
 
 ---
 
@@ -167,3 +175,35 @@ guest memory only via the `G`-window helpers.
 A lane stops and reports to the Coordinator when its acceptance fails
 twice, when it needs an edit outside its exclusive files + hook
 hunks, or when oracle behavior contradicts a frozen contract above.
+
+---
+
+### RC3 Sign-off (Coordinator, on `master`)
+
+- **Merges**: `lane/p3-l3a` (interp `fp.c`/`fp_arith.c`), `lane/p3-l3b`
+  (`emit_fp.c`, `emit_fp.h`, `stack32.c` HWCAP hook, `dbt.c` FBRANCH
+  arms), `lane/p3-l3c` (`tests/test_p3_fp_simd.c`) — all `--no-ff`.
+- **RC3 integration fixes** (Coordinator-level, found by the RC3
+  gate):
+  1. `emit_fp.c` never committed AArch64 `FPSR` exception flags to
+     guest `FSR` (first divergence: `fdivs 0/0`, `fsr 0x210` vs
+     `0x0`). Fix: `MSR FPSR,xzr` pre-clear + post-op permute/merge
+     (`IXC/UFC/OFC/DZC/IOC` → `NXC/UFC/OFC/DZC/NVC`, cexc cleared,
+     aexc accrued), `cexc` clear on moves, signal-aware `NVC` on
+     compares (`IOC || (FCMPE && unordered)`), `FRINTI` →
+     `FRINT32X` (FRINTI never signals inexact — verified on Apple
+     Silicon against clang ground truth).
+  2. `FPMEM` block split to `src/dbt/emit_fpmem.c` (900-line file
+     discipline; `fp_mov64x` shared via `emit_fp.h` static inline).
+- **Gate evidence** (`sparc32rt-oracle`, `qemu-sparc -cpu LEON3`,
+  all exit 0): `test_p1_isa` 0/6170, `test_p2_sys` 0/844,
+  `test_p3_fp_simd` 0/8997, E06 0/2817 divergences;
+  `interp`/`dbt` byte-identical to oracle on `t1`/`tsys`/`t3`; E06
+  matches except the single documented `RD`-blindness line
+  (`fdtoi RM` manual-correct `3` on both engines vs oracle `2`,
+  E06#6). `make check` passes.
+- **Residuals** (documented, no available oracle distinguishes):
+  FP arithmetic executes round-to-nearest regardless of `RD` on both
+  engines; odd-`rd` doubles, quads, `RD≠RN` oracle cases excluded
+  from `test_p3_fp_simd`; `FMOVd/FNEGd/FABSd` SIGILL on qemu-LEON3
+  (singles only in the test, doubles implemented per manual).

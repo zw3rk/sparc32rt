@@ -38,6 +38,11 @@
 #define FP_FSR_OFF ((uint32_t)offsetof(sparc32_ctx_t, fsr))
 #define FP_F_OFF ((uint32_t)offsetof(sparc32_ctx_t, f))
 
+/* FPSR helpers (defined below, used by the convert path). */
+static void fp_fpsr_clear(a64_buf_t *b);
+static void fp_cexc_clear(a64_buf_t *b);
+static void fp_flags_commit(a64_buf_t *b);
+
 /* Raw encodings verified against clang on AArch64 (lane notes). */
 #define FP_DBIT 0x00400000U /* S->D selector in FP encodings */
 
@@ -100,19 +105,6 @@ static void fp_orr_x(a64_buf_t *b, unsigned rd_x, unsigned rn_x,
 {
     a64_emit(b, 0xAA000000U | ((rm_x & 31U) << 16) |
         ((rn_x & 31U) << 5) | (rd_x & 31U));
-}
-
-/* Materialize a 64-bit immediate into an X register. */
-static void fp_mov64x(a64_buf_t *b, unsigned rd_x, uint64_t v)
-{
-    a64_emit(b, 0xD2800000U | (((uint32_t)v & 0xFFFFU) << 5) |
-        (rd_x & 31U));
-    a64_emit(b, 0xF2800000U | (1U << 21) |
-        (((uint32_t)(v >> 16) & 0xFFFFU) << 5) | (rd_x & 31U));
-    a64_emit(b, 0xF2800000U | (2U << 21) |
-        (((uint32_t)(v >> 32) & 0xFFFFU) << 5) | (rd_x & 31U));
-    a64_emit(b, 0xF2800000U | (3U << 21) |
-        (((uint32_t)(v >> 48) & 0xFFFFU) << 5) | (rd_x & 31U));
 }
 
 /* Guest FP traffic: singles one word; doubles f[2k]=hi,f[2k+1]=lo. */
@@ -196,6 +188,9 @@ static void fp_fpcr_set_rmode(a64_buf_t *b, unsigned w_rd, unsigned w_rm)
 static void fp_fpcr_restore(a64_buf_t *b)
 {
     fp_msr_fpcr(b, FS2);
+    /* Converts are the only FPCR clients; commit their FPSR flags
+     * here (the GPR store that follows cannot disturb FPSR). */
+    fp_flags_commit(b);
 }
 
 /* NaN canonicalization (E06): a result NaN with no NaN input takes
@@ -240,10 +235,57 @@ static void fp_canon(a64_buf_t *b, int is_d, unsigned vd, unsigned va,
     a64_patch_cbz_w(b, p_done, b->count);
 }
 
-/* fcc commit (FCMP/FCMPE): map NZCV to fcc (V->3, Z->0, N^V->1,
- * else 2); replace the fcc field, set FSR bit 9 when unordered. */
+/* FPSR cumulative flags (AArch64): IXC=bit4, UFC=bit3, OFC=bit2,
+ * DZC=bit1, IOC=bit0. Guest cexc: NXC=bit0, DZC=bit1, UFC=bit2,
+ * OFC=bit3, NVC=bit4 (fp.h); every FPop clears cexc and accrues
+ * aexc (cexc<<5). MRS NZCV reads the same FPSR (bits 31:28). */
 
-static void fp_fcc_commit(a64_buf_t *b)
+/* Drop stale host cumulative flags before a guest FP op. */
+static void fp_fpsr_clear(a64_buf_t *b)
+{
+    a64_emit(b, 0xD51B4420U | 31U); /* MSR FPSR, xzr */
+}
+
+/* Clear guest cexc (moves: no flags, matching fp_clear_cexc). */
+static void fp_cexc_clear(a64_buf_t *b)
+{
+    a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
+    a64_emit_mov_imm32(b, FS1, 0xFFFFFFE0U);
+    a64_emit_and_reg_w(b, false, FS0, FS0, FS1, A64_SHIFT_LSL, 0U);
+    a64_emit_str_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
+}
+
+/* Merge fresh FPSR cumulative flags into guest FSR (NZCV already
+ * consumed): cexc = permuted fresh bits (h4->b0, h1->b1, h3->b2,
+ * h2->b3, h0->b4), aexc accrues. Uses w22 as the MRS target so the
+ * convert result in FS0 stays live (header scratch contract). */
+static void fp_flags_commit(a64_buf_t *b)
+{
+    a64_emit(b, 0xD53B4420U | 22U); /* MRS w22, FPSR */
+    a64_emit_ubfm_w(b, FS1, 22U, 4U, 4U);
+    a64_emit_ubfm_w(b, FS2, 22U, 1U, 1U);
+    a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 1U);
+    a64_emit_ubfm_w(b, FS2, 22U, 3U, 3U);
+    a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 2U);
+    a64_emit_ubfm_w(b, FS2, 22U, 2U, 2U);
+    a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 3U);
+    a64_emit_ubfm_w(b, FS2, 22U, 0U, 0U);
+    a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 4U);
+    /* fsr = (fsr & ~0x1F) | cexc | (cexc << 5). */
+    a64_emit_ldr_imm_w(b, FS2, A64_XCTX, FP_FSR_OFF);
+    a64_emit_mov_imm32(b, FS3, 0xFFFFFFE0U);
+    a64_emit_and_reg_w(b, false, FS2, FS2, FS3, A64_SHIFT_LSL, 0U);
+    a64_emit_orr_reg_w(b, FS2, FS2, FS1, A64_SHIFT_LSL, 0U);
+    a64_emit_orr_reg_w(b, FS2, FS2, FS1, A64_SHIFT_LSL, 5U);
+    a64_emit_str_imm_w(b, FS2, A64_XCTX, FP_FSR_OFF);
+}
+
+/* fcc commit (FCMP/FCMPE): map NZCV to fcc (V->3, Z->0, N^V->1,
+ * else 2); replace the fcc field, set FSR bit 9 when unordered.
+ * NVC (cexc bit4 + accrue) fires on IOC, or on FCMPE-unordered
+ * (matching fp_cmp_f32/f64: signal || SNaN). */
+
+static void fp_fcc_commit(a64_buf_t *b, int signal)
 {
     /* FS0 = NZCV nibble; FS1 = V (unordered flag); FS0 = fcc. */
     a64_emit_mrs_nzcv(b, FS0);
@@ -260,12 +302,21 @@ static void fp_fcc_commit(a64_buf_t *b)
     a64_emit_sub_imm_w(b, true, A64_ZR, FS1, 1U, 0U);
     a64_emit_mov_imm32(b, FS3, 3U);
     a64_emit_csel_w(b, FS0, FS3, FS0, A64_COND_EQ);
-    /* Merge: clear fcc bits, OR fcc << 10 and unordered << 9. */
+    /* Merge: clear fcc + cexc, OR fcc << 10 and unordered << 9. */
     a64_emit_ldr_imm_w(b, FS2, A64_XCTX, FP_FSR_OFF);
-    a64_emit_mov_imm32(b, FS3, 0xFFFFF3FFU);
+    a64_emit_mov_imm32(b, FS3, 0xFFFFF3E0U);
     a64_emit_and_reg_w(b, false, FS2, FS2, FS3, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, FS2, FS2, FS0, A64_SHIFT_LSL, 10U);
     a64_emit_orr_reg_w(b, FS2, FS2, FS1, A64_SHIFT_LSL, 9U);
+    /* NVC: IOC from a fresh FPSR read (NZCV consumed above; FS0 is
+     * spent holding fcc). V is still in FS1. */
+    a64_emit(b, 0xD53B4420U | (uint32_t)FS0); /* MRS FS0, FPSR */
+    a64_emit_ubfm_w(b, FS0, FS0, 0U, 0U);     /* FS0 = IOC */
+    if (signal != 0) {
+        a64_emit_orr_reg_w(b, FS0, FS0, FS1, A64_SHIFT_LSL, 0U);
+    }
+    a64_emit_orr_reg_w(b, FS2, FS2, FS0, A64_SHIFT_LSL, 4U);
+    a64_emit_orr_reg_w(b, FS2, FS2, FS0, A64_SHIFT_LSL, 9U);
     a64_emit_str_imm_w(b, FS2, A64_XCTX, FP_FSR_OFF);
 }
 
@@ -304,6 +355,8 @@ static int fp_emit_bitwise(sparc32_emit_ctx_t *ec, uint32_t opf,
     } else {
         a64_emit_str_imm_w(b, FS0, A64_XCTX, fp_d_off(rd));
     }
+    /* Moves never raise (matching fp.c); clear stale cexc. */
+    fp_cexc_clear(b);
     return b->overflow ? -1 : 0;
 }
 
@@ -315,6 +368,7 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
     int is_d = (opf == 0x042U || opf == 0x046U || opf == 0x04AU ||
         opf == 0x04EU || opf == 0x02AU || opf == 0x069U) ? 1 : 0;
     uint32_t base = 0U;
+    fp_fpsr_clear(b);
 
     switch (opf) {
     case 0x041U: case 0x042U: base = 0x1E202800U; break;
@@ -333,6 +387,7 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
         fp3(b, 0x1E200800U, 1, FVD, FVA, FVB);
         fp_canon(b, 1, FVD, FVA, 1, FVB);
         fp_st_d(b, rd, FVD);
+        fp_flags_commit(b);
         return b->overflow ? -1 : 0;
     }
     /* FSQRT is unary (source in rs2); the rest are binary. */
@@ -360,11 +415,13 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
     } else {
         fp_st_s(b, rd, FVD);
     }
+    fp_flags_commit(b);
     return b->overflow ? -1 : 0;
 }
 
 /* Conversions (integer operands live in the F file as raw
- * patterns). FRINTI rounds per FPCR.RMode; the rest converts
+ * patterns). FRINT32X rounds per FPCR.RMode (FRINTI never signals
+ * inexact, so it cannot drive the NXC commit); the rest converts
  * exactly, so the sequence honors FSR.RD. */
 static void fp_rd_load(a64_buf_t *b)
 {
@@ -377,6 +434,7 @@ static int fp_emit_convert(sparc32_emit_ctx_t *ec, uint32_t opf,
 {
     a64_buf_t *b = ec->buf;
 
+    fp_fpsr_clear(b);
     /* FP operands first (double loads use xFS1), then RD/FPCR. */
     switch (opf) {
     case 0x0C4U: /* FiTOs: int bits -> single */
@@ -399,7 +457,7 @@ static int fp_emit_convert(sparc32_emit_ctx_t *ec, uint32_t opf,
         fp_ld_s(b, FVA, rs2);
         fp_rd_load(b);
         fp_fpcr_set_rmode(b, FS0, FS1);
-        fp2(b, 0x1E27C000U, 0, FVA, FVA);
+        fp2(b, 0x1E28C000U, 0, FVA, FVA);
         a64_emit_fcvtzs_s_to_w(b, FS0, FVA);
         fp_fpcr_restore(b);
         a64_emit_str_imm_w(b, FS0, A64_XCTX, fp_s_off(rd));
@@ -408,7 +466,7 @@ static int fp_emit_convert(sparc32_emit_ctx_t *ec, uint32_t opf,
         fp_ld_d(b, FVA, rs2);
         fp_rd_load(b);
         fp_fpcr_set_rmode(b, FS0, FS1);
-        fp2(b, 0x1E27C000U, 1, FVA, FVA);
+        fp2(b, 0x1E28C000U, 1, FVA, FVA);
         a64_emit_fcvtzs_d_to_w(b, FS0, FVA);
         fp_fpcr_restore(b);
         a64_emit_str_imm_w(b, FS0, A64_XCTX, fp_s_off(rd));
@@ -449,8 +507,9 @@ static int fp_emit_cmp(sparc32_emit_ctx_t *ec, uint32_t opf,
         fp_ld_s(b, FVA, rs1);
         fp_ld_s(b, FVB, rs2);
     }
+    fp_fpsr_clear(b);
     fp_cmp(b, is_d, FVA, FVB);
-    fp_fcc_commit(b);
+    fp_fcc_commit(b, (opf == 0x055U || opf == 0x056U) ? 1 : 0);
     return b->overflow ? -1 : 0;
 }
 
@@ -581,129 +640,6 @@ int sparc32_emit_fpu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         return ec->buf->overflow ? -1 : 0;
     }
     return 0;
-}
-
-/* FPMEM lowering. The BLR-called helper checks alignment + region
- * through the shared interp accessors (doubleword pairs need
- * 8-alignment, which interp_mem does not enforce for len 8). */
-
-static uint32_t sparc32_rt_fpmem(sparc32_ctx_t *ctx, uint32_t va,
-    uint32_t op3, uint32_t rd)
-{
-    uint32_t v;
-
-    ctx->exit_reason = SPARC32_EXIT_NONE;
-    switch (op3) {
-    case 0x20U: /* LDF */
-        if (!interp_ld_be(ctx, va, 4U, &v)) {
-            return ctx->exit_reason;
-        }
-        ctx->f[rd & 31U] = v;
-        return SPARC32_EXIT_NONE;
-    case 0x23U: /* LDDF: even rd only (emitter guarantees) */
-        if ((va & 7U) != 0U) {
-            ctx->exit_reason = SPARC32_EXIT_FAULT;
-            ctx->fault_addr = va;
-            return SPARC32_EXIT_FAULT;
-        }
-        if (!interp_ld_be(ctx, va, 4U, &v)) {
-            return ctx->exit_reason;
-        }
-        ctx->f[rd & 31U] = v;
-        if (!interp_ld_be(ctx, va + 4U, 4U, &v)) {
-            return ctx->exit_reason;
-        }
-        ctx->f[(rd + 1U) & 31U] = v;
-        return SPARC32_EXIT_NONE;
-    case 0x24U: /* STF */
-        if (!interp_st_be(ctx, va, 4U, ctx->f[rd & 31U])) {
-            return ctx->exit_reason;
-        }
-        return SPARC32_EXIT_NONE;
-    case 0x27U: /* STDF: even rd only (emitter guarantees) */
-        if ((va & 7U) != 0U) {
-            ctx->exit_reason = SPARC32_EXIT_FAULT;
-            ctx->fault_addr = va;
-            return SPARC32_EXIT_FAULT;
-        }
-        if (!interp_st_be(ctx, va, 4U, ctx->f[rd & 31U])) {
-            return ctx->exit_reason;
-        }
-        if (!interp_st_be(ctx, va + 4U, 4U,
-            ctx->f[(rd + 1U) & 31U])) {
-            return ctx->exit_reason;
-        }
-        return SPARC32_EXIT_NONE;
-    case 0x21U: /* LDFSR: full 32-bit round-trip (frozen contract 1) */
-        if (!interp_ld_be(ctx, va, 4U, &v)) {
-            return ctx->exit_reason;
-        }
-        ctx->fsr = v;
-        return SPARC32_EXIT_NONE;
-    case 0x25U: /* STFSR */
-        if (!interp_st_be(ctx, va, 4U, ctx->fsr)) {
-            return ctx->exit_reason;
-        }
-        return SPARC32_EXIT_NONE;
-    default:
-        break;
-    }
-    ctx->exit_reason = SPARC32_EXIT_UNDEF;
-    return SPARC32_EXIT_UNDEF;
-}
-
-/* Effective address rs1 + (is_imm ? simm : rs2) into FS0. */
-static void fp_ea_into(a64_buf_t *b, const sparc32_decoded_t *d)
-{
-    a64_emit_ldr_imm_w(b, FS2, A64_XCTX, (d->rs1 & 31U) * 4U);
-    if (d->is_imm != 0U) {
-        a64_emit_mov_imm32(b, FS0, (uint32_t)d->simm);
-    } else {
-        a64_emit_ldr_imm_w(b, FS0, A64_XCTX, (d->rs2 & 31U) * 4U);
-    }
-    a64_emit_add_reg_w(b, false, FS0, FS2, FS0, A64_SHIFT_LSL, 0U);
-}
-
-int sparc32_emit_fpmem(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
-{
-    a64_buf_t *b;
-    size_t p_fault;
-    size_t p_cont;
-
-    if (ec == NULL || ec->buf == NULL || d == NULL) {
-        return -1;
-    }
-    b = ec->buf;
-    if (d->op3 == (uint32_t)SPARC32_OP3_LDQF ||
-        d->op3 == (uint32_t)SPARC32_OP3_STQF) {
-        return fp_undef(ec);
-    }
-    if ((d->op3 == (uint32_t)SPARC32_OP3_LDDF ||
-        d->op3 == (uint32_t)SPARC32_OP3_STDF) &&
-        ((d->rd & 1U) != 0U)) {
-        return fp_undef(ec);
-    }
-    fp_ea_into(b, d);
-    /* w0 = ctx, w1 = EA, w2 = op3, w3 = rd. Same faultable-call shape
-     * as the integer memory emitter (preserves x19-x28 per AAPCS64;
-     * the fault block carries ec->fault_pc in w15 and the helper's
-     * exit reason in w16, then returns to the dispatcher). */
-    a64_emit_add_uxtw_x(b, 0U, A64_XCTX, A64_ZR);
-    a64_emit_mov_w(b, 1U, FS0);
-    a64_emit_mov_imm32(b, 2U, d->op3);
-    a64_emit_mov_imm32(b, 3U, d->rd);
-    a64_emit(b, 0xF81F0FFEU);
-    fp_mov64x(b, FS2, (uint64_t)(uintptr_t)&sparc32_rt_fpmem);
-    a64_emit(b, 0xD63F0000U | ((FS2 & 31U) << 5));
-    a64_emit(b, 0xF84107FEU);
-    p_fault = a64_emit_cbz_w_placeholder(b, true, 0U);
-    p_cont = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    a64_patch_cbz_w(b, p_fault, b->count);
-    a64_emit_mov_w(b, FS1, 0U);
-    a64_emit_mov_pc32(b, FS0, ec->fault_pc);
-    a64_emit_ret(b);
-    a64_patch_b_cond(b, p_cont, b->count);
-    return b->overflow ? -1 : 0;
 }
 
 /* FBfcc transfer (mirrors Bicc on FSR.fcc: 0 equal, 1 less,
