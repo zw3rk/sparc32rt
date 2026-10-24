@@ -510,14 +510,17 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     int rc;
 
     ec->fault_pc = pc;
-    if (cond == 0x0u) { /* BN: never branches. */
+    if (cond == 0x0u) { /* BN: never branches; falls through past delay. */
         if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
             if (page_final) {
                 return e_page_final(ec, npc, npc + 4u);
             }
-            return e_emit_delay(ec, npc);
+            if (e_emit_delay(ec, npc) != 0) {
+                return -1;
+            }
         }
-        return 0;
+        a64_emit_exit_branch(b, npc + 4u);
+        return b->overflow ? -1 : 0;
     }
     if (cond == 0x8u) { /* BA: always branches. */
         if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
@@ -533,9 +536,11 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         return b->overflow ? -1 : 0;
     }
     if (page_final) {
-        /* Runtime condition at the page end: each path emits its delay
-         * (when not annulled) and leaves via SINGLE_STEP with the
-         * post-transfer PC, mirroring interp_cti's tail. */
+        /* Runtime condition at the page end, mirroring interp_cti: the
+         * delay runs unless annulled away, and SINGLE_STEP fires only
+         * when the delay ran (interp_cti's tail). An annulled not-taken
+         * path completes the transfer inline with a plain BRANCH exit
+         * (NONE after commit), never SINGLE_STEP. */
         e_cond_setup(b);
         p_taken = a64_emit_b_cond_placeholder(b, s_a64_cond[cond & 15u]);
         if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
@@ -543,8 +548,11 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
             if (rc != 0) {
                 return rc;
             }
+            rc = sparc32_emit_exit_singlestep(ec, npc + 4u);
+        } else {
+            a64_emit_exit_branch(b, npc + 4u);
+            rc = b->overflow ? -1 : 0;
         }
-        rc = sparc32_emit_exit_singlestep(ec, npc + 4u);
         if (rc != 0) {
             return rc;
         }
@@ -578,7 +586,10 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         return -1;
     }
     a64_patch_b_cond(b, p_end, b->count);
-    return 0;
+    /* Not-taken fallthrough needs its own exit: without it the B.AL above
+     * lands one word past the fragment (host SIGILL in the arena tail). */
+    a64_emit_exit_branch(b, npc + 4u);
+    return b->overflow ? -1 : 0;
 }
 
 int sparc32_emit_call(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
@@ -668,8 +679,9 @@ int sparc32_emit_trap(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     a64_emit_add_reg_w(b, false, ES0, ES0, ES1, A64_SHIFT_LSL, 0u);
     a64_emit_mov_imm32(b, ES1, 0x7Fu);
     a64_emit_and_reg_w(b, false, EKEEP, ES0, ES1, A64_SHIFT_LSL, 0u);
-    if (d->cond == 0x0u) { /* TN: never traps. */
-        return 0;
+    if (d->cond == 0x0u) { /* TN: never traps; falls through to npc. */
+        a64_emit_exit_branch(b, npc);
+        return b->overflow ? -1 : 0;
     }
     if (d->cond != 0x8u) {
         e_cond_setup(b);
@@ -699,6 +711,9 @@ int sparc32_emit_trap(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     if (d->cond != 0x8u) {
         a64_patch_b_cond(b, p_taken, b->count);
+        /* Not-taken Ticc falls through to npc (no delay slot on traps). */
+        a64_emit_exit_branch(b, npc);
+        return b->overflow ? -1 : 0;
     }
     return 0;
 }

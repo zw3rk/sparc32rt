@@ -4,8 +4,9 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Phase 1: --interp loads the guest ELF + stack and runs the reference
- * interpreter (run_interp); --dbt still reports Phase 2 and exits 1.
+ * Phase 2: --interp runs the reference interpreter, --dbt runs the
+ * AArch64 translator (both share load_guest + the syscall/signal loop),
+ * --difftest runs the lockstep differential harness.
  */
 
 /* POSIX 2008: setenv/environ under strict -std=c11 with musl. */
@@ -22,6 +23,8 @@
 #include "rt32/rt32.h"
 #include "interp/interp.h"
 #include "os/syscalls_min.h"
+#include "dbt/dbt.h"
+#include "dbt/difftest.h"
 
 extern char **environ;
 
@@ -145,14 +148,11 @@ static void apply_env(sparc32_ctx_t *ctx)
     }
 }
 
-static const char *engine_name(int engine)
-{
-    return (engine == SPARC32_ENGINE_DBT) ? "dbt" : "interp";
-}
-
 /* Load the guest ELF + initial stack, then run the reference interpreter
  * until a terminal syscall or a stop reason. Returns the guest exit status. */
-static int run_interp(sparc32_ctx_t *ctx)
+/* Shared guest load: reserve window, load ELF, build the stack + argv,
+ * install the ABI entry state. Used by --interp, --dbt and --difftest. */
+static int load_guest(sparc32_ctx_t *ctx)
 {
     rt32_elf_info_t info;
     uint32_t sp;
@@ -191,11 +191,34 @@ static int run_interp(sparc32_ctx_t *ctx)
                     ctx->regions[i].prot, ctx->regions[i].name);
         }
     }
+    return 0;
+}
+
+/* Engine run loop shared by --interp and --dbt: step until a stop, deliver
+ * synchronous signals, dispatch syscalls. The step callback is interp_run
+ * or a dbt_run shim; both report through ctx->exit_reason. */
+typedef void (*engine_step_fn)(sparc32_ctx_t *ctx);
+
+static void engine_interp_step(sparc32_ctx_t *ctx)
+{
+    interp_run(ctx);
+}
+
+static void engine_dbt_step(sparc32_ctx_t *ctx)
+{
+    (void)dbt_run(ctx);
+}
+
+static int run_engine(sparc32_ctx_t *ctx, engine_step_fn step, const char *tag)
+{
+    if (load_guest(ctx) != 0) {
+        return 1;
+    }
     for (;;) {
         long nr;
         long status;
 
-        interp_run(ctx);
+        step(ctx);
         if (ctx->exit_reason == SPARC32_EXIT_FAULT ||
             ctx->exit_reason == SPARC32_EXIT_SINGLE_STEP) {
             int signo;
@@ -209,11 +232,11 @@ static int run_interp(sparc32_ctx_t *ctx)
         }
         if (ctx->exit_reason != SPARC32_EXIT_SYSCALL) {
             fprintf(stderr,
-                    "sparc32rt: interp stopped: reason=%u pc=0x%08x "
+                    "sparc32rt: %s stopped: reason=%u pc=0x%08x "
                     "dest=0x%08x fault=0x%08x\n"
                     "  g1=%08x g2=%08x g3=%08x g4=%08x o0=%08x o1=%08x o2=%08x "
                     "sp=%08x cwp=%u\n",
-                    ctx->exit_reason, ctx->pc, ctx->exit_dest,
+                    tag, ctx->exit_reason, ctx->pc, ctx->exit_dest,
                     ctx->fault_addr, ctx->r[1], ctx->r[2], ctx->r[3],
                     ctx->r[4], ctx->r[8], ctx->r[9], ctx->r[10],
                     ctx->r[SPARC32_SP], ctx->cwp);
@@ -251,16 +274,13 @@ int main(int argc, char **argv)
         ctx.engine = SPARC32_ENGINE_INTERP; /* default oracle engine */
     }
     if (ctx.difftest) {
-        fprintf(stderr,
-                "sparc32rt: --difftest needs interp (Phase 1) and dbt (Phase 2); "
-                "dbt arrives in Phase 2\n");
-        return 1;
+        if (load_guest(&ctx) != 0) {
+            return 1;
+        }
+        return difftest_run(&ctx);
     }
     if (ctx.engine == SPARC32_ENGINE_INTERP) {
-        return run_interp(&ctx);
+        return run_engine(&ctx, engine_interp_step, "interp");
     }
-    fprintf(stderr, "sparc32rt: engine %s selected; guest execution arrives "
-                    "in Phase 2 (not executing %s)\n",
-            engine_name(ctx.engine), ctx.exec_path);
-    return 1;
+    return run_engine(&ctx, engine_dbt_step, "dbt");
 }

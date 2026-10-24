@@ -1,21 +1,15 @@
 /*
- * src/os/syscalls.c — Phase-2 static-libc syscall + struct conversion layer
- *
+ * src/os/syscalls.c — Phase-2 static-libc syscalls (lane L2a).
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
- *
- * Lane L2a (Phase 2): the static-libc set on frozen syscall numbers
- * with the L1c carry convention (C=0/%o0=ret; C=1/%o0=SPARC errno):
- * stat/lstat/fstat/fstat64/lstat64/stat64/fstatat64/statx, readv/writev,
- * openat/open/creat, fcntl, clock_gettime, getrandom, futex WAIT/WAKE,
- * rt_sigprocmask, ioctl (FIONREAD + TCGETS-isatty), lseek, ids, close.
- * Guest UABI verified against torvalds/linux + glibc sparc headers.
- * Host-style returns (negative host errno); the min dispatcher commits
- * the carry. All guest structs via the G window with BE stores. Mask is
- * file-static (single-thread Phase 1-2 scope).
+ * Frozen numbers, L1c carry convention; guest structs via the G window
+ * (BE stores); host-style returns. Mask is file-static (single-thread).
+ * Needs _GNU_SOURCE: musl hides syscall(2)/clock_gettime under -std=c11.
  */
+#define _GNU_SOURCE
 
 #include <errno.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <string.h>
@@ -41,10 +35,6 @@
 #include "sparc32rt.h"
 #include "os/sigframe_sparc32rt.h"
 #include "os/syscall_nr.h"
-
-#if defined(__linux__)
-#include <sys/syscall.h>
-#endif
 
 /* SPARC open flags (arch/sparc fcntl.h); low 2 access bits match hosts. */
 #define SP_O_APPEND 0x0008U
@@ -327,6 +317,16 @@ long sparc32_l2a_creat(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t mode)
 long sparc32_l2a_close(int fd)
 {
     return (close(fd) != 0) ? -(long)errno : 0;
+}
+
+long sparc32_l2a_unlink(sparc32_ctx_t *ctx, uint32_t path_va)
+{
+    char path[L2A_PATH_MAX];
+    long rc = l2a_copy_cstring(ctx, path_va, path, L2A_PATH_MAX);
+    if (rc != 0) {
+        return rc;
+    }
+    return (unlink(path) != 0) ? -(long)errno : 0;
 }
 
 long sparc32_l2a_lseek(uint32_t fd, int32_t offset, uint32_t whence)

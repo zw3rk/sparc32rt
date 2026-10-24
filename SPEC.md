@@ -22,7 +22,7 @@
 
 ### 1.1 Target CPUs & ELF Admission
 - **Target CPUs**: Cobham Gaisler LEON3 (`GR712RC`) and LEON4 (`GR740`) radiation-hardened SPARC V8 processors
-- **ELF Admission**: `ELFCLASS32`, `ELFDATA2MSB` (big-endian), **`e_machine == EM_SPARC (2)` with `e_flags == 0` ONLY** (explicitly rejects `EM_SPARC32PLUS (18)` and `EF_SPARC_32PLUS` with `ENOEXEC`)
+- **ELF Admission**: `ELFCLASS32`, `ELFDATA2MSB` (big-endian), **`e_machine == EM_SPARC (2)` with `e_flags ∈ {0, 0x300}`** (explicitly rejects `EM_SPARC32PLUS (18)` with `ENOEXEC`). RC2 extension: bare `0` (pure V8) plus the V8+ HAL/MMU hint bits `0x300` that static-libc toolchains emit; the stream still decodes through the V8 base ISA (+MUL/DIV/CASA), V9-only opcodes trap `EXIT_UNDEF` loudly, and `--difftest` + the qemu oracle verify every accepted binary.
 - **Guest `TASK_SIZE`**: `0xf0000000 (stack top 0xefff0000, sigtramp 0xefffe000)`
 - **Ground-Truth Oracle**: `qemu-sparc (with -cpu LEON3)`
 - **Cross Toolchains**: `pkgsCross.sparc-linux-gnu (sparc-unknown-linux-gnu glibc + nolibc; upstream musl has no SPARC port)`
@@ -41,8 +41,8 @@
 
 ### 2.1 `sparc32_ctx_t` Context, Register Windows, Dual-PC & LEON `CASA` (`src/sparc32rt.h`)
 - **Strict SPARC V8 ELF Admission Policy**:
-  - Admits `ELFCLASS32`, `ELFDATA2MSB` (big-endian), **`e_machine == EM_SPARC (2)` with `e_flags == 0` ONLY**.
-  - **Explicitly rejects `EM_SPARC32PLUS (18)` and `EF_SPARC_32PLUS` (`ENOEXEC`)**, because V8+ permits 64-bit `%g`/`%o` registers and V9 instructions that a 32-bit V8 context cannot represent.
+  - Admits `ELFCLASS32`, `ELFDATA2MSB` (big-endian), **`e_machine == EM_SPARC (2)` with `e_flags ∈ {0, 0x300}`** (RC2: `0x300` are V8+ HAL/MMU hint bits from static-libc toolchains; stream still decodes as V8).
+  - **Explicitly rejects `EM_SPARC32PLUS (18)` (`ENOEXEC`)**, because V8+ permits 64-bit `%g`/`%o` registers and V9 instructions that a 32-bit V8 context cannot represent.
 - **Target Sysroot (`glibc` + `nolibc`)**:
   - Upstream `musl` has no SPARC port. `sparc32rt` qualifies freestanding/`nolibc` static binaries in Phases 1–2 and **`sparc-unknown-linux-gnu` (`glibc` static and dynamic `ld-linux.so.2`)** in Phases 2–7.
 - **CPU State (`sparc32_ctx_t`)**:

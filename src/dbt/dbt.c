@@ -30,6 +30,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -193,6 +195,27 @@ static bool dbt_is_cti(const sparc32_decoded_t *d)
  * an exit (or chains away), so ending the block here is exact: BN
  * (cond 0) and untaken Ticc emit no exit and must fall through into
  * subsequently emitted code. */
+/* Straight-line classes need a translate-level fallthrough exit when a
+ * block ends on them (insn cap, page edge, single-insn dbt_step). CTI and
+ * conditional-trap emitters terminate their own taken/not-taken paths;
+ * unconditional transfers (BA/CALL/JMPL/TA) never fall through; PRIV
+ * always exits via trap; FPU/ILL never execute (interp fallback). */
+static bool dbt_falls_through(const sparc32_decoded_t *d)
+{
+    switch (d->cls) {
+    case SPARC32_OP_CALL:
+    case SPARC32_OP_JMPL:
+    case SPARC32_OP_BRANCH:
+    case SPARC32_OP_TRAP:
+    case SPARC32_OP_PRIV:
+    case SPARC32_OP_FPU:
+    case SPARC32_OP_ILLEGAL:
+        return false;
+    default:
+        return true;
+    }
+}
+
 static bool dbt_block_ends(const sparc32_decoded_t *d)
 {
     switch (d->cls) {
@@ -311,6 +334,17 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
         }
     }
 
+    /* Fallthrough exit for straight-line endings (64-insn cap, page edge,
+     * single-insn dbt_step fragments): CTI/trap emitters terminate their
+     * own transfer paths, and PRIV/FPU/ILL never execute, so only plain
+     * insns need one here. Without it execution falls off the arena tail
+     * into a host SIGILL (observed on the first difftest step). */
+    if (have_insn && !overflow && dbt_falls_through(&last)) {
+        a64_emit_exit_branch(&buf, end);
+        if (buf.overflow) {
+            overflow = true;
+        }
+    }
     buf.guest_end_pc = end;
     if (!have_insn) {
         /* Overflow on the very first insn: keep a needs_interp stub so
@@ -368,6 +402,14 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
     ch->key_epoch = (uint64_t)b->start_pc | ((uint64_t)b->epoch << 32);
     ch->host_code = b->host_code;
     ctx->blocks_compiled += 1U;
+    if (ctx->trace_enabled && have_insn && !overflow && b->host_code != NULL) {
+        size_t wi;
+        const uint32_t *words = (const uint32_t *)mem;
+        fprintf(stderr, "T asm guest=%08x n=%u\n", pc, n);
+        for (wi = 0; wi < buf.count; wi++) {
+            fprintf(stderr, "T asm %08x\n", words[wi]);
+        }
+    }
     return b;
 }
 
@@ -403,6 +445,16 @@ void dbt_flush(sparc32_ctx_t *ctx)
 uint32_t dbt_cached_count(void)
 {
     return g_cached_count;
+}
+
+/* Range hook for src/rt32/vm.c (SMC on mprotect/munmap/guest writes):
+ * Phase 2 policy is a coarse whole-cache flush (dbt.h). */
+void sparc32_dbt_invalidate_range(sparc32_ctx_t *ctx, uint32_t start,
+    uint32_t end)
+{
+    (void)start;
+    (void)end;
+    dbt_flush(ctx);
 }
 
 /* ---- IBTC / RAS (architectural arrays in ctx, SPEC section 3.2) ----
@@ -506,6 +558,11 @@ static bool dbt_replay(sparc32_ctx_t *ctx)
     uint32_t before = ctx->exit_dest;
     ctx->pc = ctx->exit_dest;
     ctx->npc = ctx->exit_dest + 4U;
+    /* Fresh reason: interp_step leaves exit_reason untouched on the
+     * annulled-away path (interp_cti early return, e.g. BA,a at 0xffc),
+     * so a stale SINGLE_STEP/UNDEF from the emitted exit would survive
+     * and diverge from a clean interp_step (which reports NONE). */
+    ctx->exit_reason = SPARC32_EXIT_NONE;
     interp_step(ctx);
     if (ctx->exit_reason == SPARC32_EXIT_NONE) {
         return true;
@@ -621,8 +678,13 @@ int dbt_run(sparc32_ctx_t *ctx)
         r = dbt_exec_enter(ctx, b, true);
         if (r == (int)SPARC32_EXIT_BRANCH) {
             dbt_on_branch(ctx, b);
-            if (ctx->pending_signals != 0U ||
-                ctx->sync_sig_delivered) {
+            /* Break chaining only for async signals (pending_signals is
+             * set by another thread; Phase 4 wires main's async path).
+             * Synchronous delivery already completed inside the faulting
+             * iteration's main-loop turn, so chaining resumes normally;
+             * breaking on the sticky sync_sig_delivered flag stranded
+             * every post-handler branch back in main (fatal). */
+            if (ctx->pending_signals != 0U) {
                 return (int)ctx->exit_reason;
             }
             continue;
@@ -642,9 +704,11 @@ int dbt_step(sparc32_ctx_t *ctx)
 {
     const dbt_block_t *b;
     int r;
+    uint32_t entry_pc = 0U;
     if (ctx == NULL) {
         return -1;
     }
+    entry_pc = ctx->pc;
     ctx->exit_reason = SPARC32_EXIT_NONE;
     /* No chaining: a fresh single-insn fragment executes through the
      * no-chain trampoline, so exactly one guest instruction runs (a CTI
@@ -661,6 +725,22 @@ int dbt_step(sparc32_ctx_t *ctx)
     if (r == (int)SPARC32_EXIT_UNDEF ||
         r == (int)SPARC32_EXIT_SINGLE_STEP) {
         dbt_replay(ctx);
+    }
+    /* Lockstep parity: interp_step reports NONE after a completed insn
+     * (transfers just advance pc/npc). A BRANCH exit from the single
+     * fragment is the same completed step, so commit pc/npc from the
+     * exit dest and normalize to NONE; faults/traps/syscalls pass
+     * through unchanged to match interp exactly. */
+    if (getenv("SPARC32RT_DBTTRACE") != NULL) {
+        fprintf(stderr, "T dbtstep in=%08x out=%u dest=%08x pc=%08x npc=%08x\n",
+            entry_pc, (unsigned)ctx->exit_reason, ctx->exit_dest,
+            ctx->pc, ctx->npc);
+    }
+    if (ctx->exit_reason == (uint32_t)SPARC32_EXIT_BRANCH) {
+        ctx->pc = ctx->exit_dest;
+        ctx->npc = ctx->exit_dest + 4U;
+        ctx->exit_reason = SPARC32_EXIT_NONE;
+        return (int)SPARC32_EXIT_NONE;
     }
     return (int)ctx->exit_reason;
 }

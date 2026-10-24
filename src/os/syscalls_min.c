@@ -46,6 +46,7 @@ long sparc32_l2a_open(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t flags,
     uint32_t mode);
 long sparc32_l2a_creat(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t mode);
 long sparc32_l2a_close(int fd);
+long sparc32_l2a_unlink(sparc32_ctx_t *ctx, uint32_t path_va);
 long sparc32_l2a_lseek(uint32_t fd, int32_t offset, uint32_t whence);
 long sparc32_l2a_getpid(void);
 long sparc32_l2a_getuid(void);
@@ -504,6 +505,9 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         break;
     case (long)SPARC32__NR_creat:
         ret = sparc32_l2a_creat(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_unlink:
+        ret = sparc32_l2a_unlink(ctx, o0);
         break;
     case (long)SPARC32__NR_lseek:
         ret = sparc32_l2a_lseek(o0, (int32_t)o1, o2);

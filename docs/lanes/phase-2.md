@@ -130,3 +130,35 @@ not edit `src/main.c`, `Makefile`, or `flake.nix`.
   ```sh
   sparc64-linux-gnu-gcc -m32 -fno-pie -no-pie -nostdlib -static -o /tmp/t1 tests/test_p1_isa.c && qemu-sparc -cpu LEON3 /tmp/t1
   ```
+
+---
+
+### RC2 Sign-off (Coordinator, on `master`)
+
+- **Page-final alignment fix** (`0x11ffc` `ba,a` divergence
+  `interp=NONE` vs `dbt=SINGLE_STEP`): `dbt_replay` now clears
+  `exit_reason` before the replayed `interp_step` (the annulled-away
+  early return leaves it untouched); `emit_int.c`'s conditional
+  page-final path completes annulled-not-taken transfers with a plain
+  `BRANCH` exit instead of `SINGLE_STEP`; `difftest.c` documents the
+  contract (`SINGLE_STEP` iff the delay ran, else `NONE` on both
+  sides). `sparc32_dbt_invalidate_range` wired to whole-cache flush and
+  `-DSPARC32RT_NO_DBT` dropped from `Makefile` (Phase-2-promised state).
+- **L2a gap closed**: `unlink(10)` implemented (`syscalls.c` +
+  dispatch) after `tests/test_p2_sys.c` exposed `-ENOSYS`.
+- **Gate evidence** (`sparc32rt-oracle`, `qemu-sparc -cpu LEON3`):
+  `test_p1_isa` — `interp`/`dbt` exit 0, byte-identical to oracle,
+  `--difftest` reports `0 divergences (6170 steps)`;
+  `tests/test_p2_sys.c` (new freestanding V8-only raw-syscall guest:
+  `getpid`, `brk`, `mmap2`/`munmap`, `openat`/`write`/`close`/`stat`/
+  `lseek`/`read`/`unlink`, `clock_gettime`, `getrandom`) —
+  `interp`/`dbt` exit 0, byte-identical to oracle, `0 divergences
+  (844 steps)`; `make check` (build + `<= 900` lines + ABI
+  invariants) passes.
+- **Known toolchain caveat**: the oracle image's `sparc64-linux-gnu`
+  GCC links static libc as `EM_SPARC32PLUS` with `BPcc` encodings, so
+  `tests/test_p2_libc.c` cannot execute under the V8-only SPEC oracle
+  (correctly rejected with `ENOEXEC`; `qemu-sparc -cpu LEON3` SIGILLs
+  on the same stream; both engines agree loudly with `UNDEF` at the
+  first V9 encoding). Full C-libc qualification waits on the SPEC
+  `sparc-linux-gnu` sysroot (Phase 5).

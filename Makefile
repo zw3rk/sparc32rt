@@ -25,18 +25,18 @@ HOST_CC ?= cc
 # POSIX feature-test macro is visible; expose exactly that on Linux (keeps
 # -pedantic and every prescribed warning intact). On macOS the macro would
 # hide MAP_ANONYMOUS, so it stays Linux-only.
-CFLAGS  ?= -std=c11 -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -DSPARC32RT_NO_DBT -Iinclude -Isrc -Isrc/rt32
+CFLAGS  ?= -std=c11 -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
 ifeq ($(shell uname -s),Linux)
   CFLAGS += -D_POSIX_C_SOURCE=200809L
 endif
 LDFLAGS ?= -static-pie
 
-# Phase 1 sources: CLI entry, vendored rt32 substrate, reference
-# interpreter, and minimal syscall layer. The DBT (src/dbt/) arrives in
-# Phase 2, at which point -DSPARC32RT_NO_DBT is dropped and its glob is added.
+# CLI entry, vendored rt32 substrate, reference interpreter, syscall
+# layer (src/os/), and AArch64 DBT (src/dbt/, Phase 2: no NO_DBT flag;
+# vm_invalidate_jit calls sparc32_dbt_invalidate_range).
 SRCS_C := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) \
-          $(wildcard src/os/*.c)
-SRCS_S := $(wildcard src/rt32/*.S)
+          $(wildcard src/os/*.c) $(wildcard src/dbt/*.c)
+SRCS_S := $(wildcard src/rt32/*.S) $(wildcard src/dbt/*.S)
 HDRS   := src/sparc32rt.h include/a32host.h src/os/syscall_nr.h \
           $(wildcard src/rt32/*.h)
 

@@ -25,7 +25,9 @@
 #include "sparc32rt.h"
 
 #include "dbt/difftest.h"
+#include "interp/decode.h"
 #include "interp/interp.h"
+#include "interp/interp_priv.h"
 #include "os/syscalls_min.h"
 
 /* Hang guard: the P2 guests terminate in well under a million steps. */
@@ -189,6 +191,72 @@ static int difftest_reason_div(const sparc32_ctx_t *a, const sparc32_ctx_t *b,
     return 1;
 }
 
+/* Atomic RMW sandwich (LDSTUB/SWAP/CASA): both engines share the one
+ * guest mapping, so interp stepping first would let its write be visible
+ * to dbt's subsequent read (observed: dbt g4=0xff vs interp g4=0x5a).
+ * Snapshot the touched bytes, run interp, restore them, then run dbt, so
+ * both engines read identical pre-state. Plain loads/stores need no
+ * sandwich (idempotent second write). Only entered when the range is
+ * mapped+readable; otherwise both engines fault identically. */
+typedef struct {
+    bool armed;
+    uint32_t va;
+    uint32_t len;
+    uint8_t bytes[4];
+} difftest_rmw_t;
+
+static difftest_rmw_t difftest_rmw_snap(const sparc32_ctx_t *ctx,
+    uint32_t pc)
+{
+    difftest_rmw_t s;
+    sparc32_decoded_t d;
+    const uint8_t *ip;
+    uint32_t word;
+    uint32_t va;
+    uint32_t len;
+    s.armed = false;
+    s.va = 0U;
+    s.len = 0U;
+    if (!interp_range_ok(ctx, pc, 4U, 1U)) {
+        return s;
+    }
+    ip = (const uint8_t *)sparc32_guest_ptr(ctx, pc);
+    word = ((uint32_t)ip[0] << 24) | ((uint32_t)ip[1] << 16) |
+        ((uint32_t)ip[2] << 8) | (uint32_t)ip[3];
+    sparc32_decode_word(word, &d);
+    switch (d.op3) {
+    case SPARC32_OP3_LDSTUB:
+    case SPARC32_OP3_LDSTUBA:
+        len = 1U;
+        break;
+    case SPARC32_OP3_SWAP:
+    case SPARC32_OP3_SWAPA:
+    case SPARC32_OP3_CASA:
+        len = 4U;
+        break;
+    default:
+        return s;
+    }
+    va = ctx->r[d.rs1 & 31U] +
+        (d.is_imm != 0U ? (uint32_t)d.simm : ctx->r[d.rs2 & 31U]);
+    if (!interp_range_ok(ctx, va, len, 3U)) {
+        return s;
+    }
+    memcpy(s.bytes, sparc32_guest_ptr(ctx, va), len);
+    s.armed = true;
+    s.va = va;
+    s.len = len;
+    return s;
+}
+
+static void difftest_rmw_restore(const sparc32_ctx_t *ctx, difftest_rmw_t *s)
+{
+    if (s->armed) {
+        memcpy(sparc32_guest_ptr(ctx, s->va), s->bytes, (size_t)s->len);
+        s->armed = false;
+    }
+}
+
 int difftest_run(sparc32_ctx_t *ctx)
 {
     sparc32_ctx_t a;
@@ -205,6 +273,7 @@ int difftest_run(sparc32_ctx_t *ctx)
         long nr;
         long status;
         int n;
+        difftest_rmw_t rmw;
         if (steps >= DIFFTEST_MAX_STEPS) {
             printf("difftest: step budget exhausted (%lu steps, pc=0x%08x)\n",
                 steps, a.pc);
@@ -216,16 +285,30 @@ int difftest_run(sparc32_ctx_t *ctx)
         b.exit_reason = SPARC32_EXIT_NONE;
         step_pc = a.pc;
         steps++;
+        rmw = difftest_rmw_snap(&a, step_pc);
         interp_step(&a);
+        difftest_rmw_restore(&a, &rmw);
         dbt_step(&b);
         if (a.exit_reason != b.exit_reason) {
             return difftest_reason_div(&a, &b, step_pc);
         }
         switch (a.exit_reason) {
         case SPARC32_EXIT_NONE:
+            /* Clean step: exit_dest carries no meaning (dbt leaves the
+             * fallthrough pc there; interp leaves it stale). */
+            n = difftest_cmp_state(&a, &b, step_pc);
+            if (n != 0) {
+                difftest_backtrace(&a);
+                return 1;
+            }
+            break;
         case SPARC32_EXIT_SINGLE_STEP:
-            /* SINGLE_STEP (page-final branch) already advanced pc/npc on
-             * both sides; stepping simply resumes. */
+            /* SINGLE_STEP (page-final branch whose delay ran) already
+             * advanced pc/npc on both sides; stepping simply resumes.
+             * exit_dest IS the resume point here, so it must agree.
+             * A page-final branch whose delay was annulled away reports
+             * NONE on both sides (interp_cti early return; dbt replays
+             * to the same NONE), never SINGLE_STEP. */
             n = difftest_cmp_state(&a, &b, step_pc);
             if (a.exit_dest != b.exit_dest) {
                 printf("difftest: divergence at pc=0x%08x: exit_dest interp=0x%08x dbt=0x%08x\n",
@@ -257,8 +340,43 @@ int difftest_run(sparc32_ctx_t *ctx)
              * (advanced pc/npc, carry result) into both engines. */
             b = a;
             break;
+        case SPARC32_EXIT_FAULT:
+            /* Matching fault: state and fault address must agree first,
+             * then attempt synchronous delivery on both copies (same
+             * signo rule as main.c: misaligned VA -> SIGBUS, else
+             * SIGSEGV). Delivery is deterministic, so identical
+             * pre-states stay identical. */
+            n = difftest_cmp_state(&a, &b, step_pc);
+            if (a.fault_addr != b.fault_addr) {
+                printf("difftest: divergence at pc=0x%08x: fault_addr interp=0x%08x dbt=0x%08x\n",
+                    step_pc, a.fault_addr, b.fault_addr);
+                n++;
+            }
+            if (n != 0) {
+                difftest_backtrace(&a);
+                return 1;
+            }
+            {
+                int signo = (a.fault_addr & 3U) != 0U ? 10 : 11;
+                bool da = interp_try_deliver_sync(&a, signo);
+                bool db = interp_try_deliver_sync(&b, signo);
+                if (da && db) {
+                    break;
+                }
+                if (da != db) {
+                    printf("difftest: divergence at pc=0x%08x: delivery interp=%d dbt=%d\n",
+                        step_pc, (int)da, (int)db);
+                    difftest_backtrace(&a);
+                    return 1;
+                }
+            }
+            /* Neither copy has a handler: agreement, guest would die. */
+            *ctx = a;
+            printf("difftest: both engines faulted with no handler at pc=0x%08x (agreement, guest did not exit)\n",
+                step_pc);
+            return 2;
         default:
-            /* Matching non-continuable stop (FAULT/TRAP/UNDEF/...):
+            /* Matching non-continuable stop (TRAP/UNDEF/...):
              * agreement, but the guest did not exit cleanly. */
             n = difftest_cmp_state(&a, &b, step_pc);
             if (a.fault_addr != b.fault_addr) {

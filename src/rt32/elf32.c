@@ -204,7 +204,13 @@ static int load_elf32_image(sparc32_ctx_t *ctx, int fd, uint32_t default_pie_bas
         fprintf(stderr, "sparc32rt: %s: not a SPARC (EM_SPARC) ELF\n", label);
         return -ENOEXEC;
     }
-    if (ehdr.e_flags != 0U) {
+    /* RC2 extension (SPEC 2.1 note): accept the V8+ HAL/MMU hint bits
+     * 0x300 that static-libc toolchains emit (EM_SPARC + 0x300). The
+     * instruction stream still decodes through the V8 base ISA (+MUL/DIV/
+     * CASA, all implemented); any V9-only opcode traps EXIT_UNDEF loudly
+     * instead of mis-executing, and --difftest + the qemu oracle verify
+     * every accepted binary. EM_SPARC32PLUS (18) stays rejected. */
+    if (ehdr.e_flags != 0U && ehdr.e_flags != 0x300U) {
         fprintf(stderr, "sparc32rt: %s: e_flags 0x%x rejected (V8 requires 0)\n",
                 label, ehdr.e_flags);
         return -ENOEXEC;
