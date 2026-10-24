@@ -40,6 +40,16 @@
 #define SPARC_AT_EUID    12U
 #define SPARC_AT_GID     13U
 #define SPARC_AT_EGID    14U
+/* SPARC Linux AT_HWCAP bits (glibc bits/hwcap.h, mirroring the kernel
+ * arch/sparc uapi header): FLUSH/STBAR/SWAP/MULDIV are exactly what
+ * qemu-sparc -cpu LEON3 advertises (auxv-dump probe: 0x0F); V9 stays
+ * clear (V9-only encodings trap EXIT_UNDEF). No FPU bit exists in the
+ * header (FPU is baseline V8, verified via E06 fcc/NaN/RD); the oracle
+ * does not advertise FSMULD (0x400), so neither do we. */
+#define SPARC_HWCAP_FLUSH   1U
+#define SPARC_HWCAP_STBAR   2U
+#define SPARC_HWCAP_SWAP    4U
+#define SPARC_HWCAP_MULDIV  8U
 #define SPARC_AT_HWCAP   16U
 #define SPARC_AT_CLKTCK  17U
 #define SPARC_AT_SECURE  23U
@@ -173,7 +183,9 @@ int rt32_stack_setup(sparc32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
     AUXV_PUT(SPARC_AT_EUID, (uint32_t)geteuid());
     AUXV_PUT(SPARC_AT_GID, (uint32_t)getgid());
     AUXV_PUT(SPARC_AT_EGID, (uint32_t)getegid());
-    AUXV_PUT(SPARC_AT_HWCAP, 0U);
+    AUXV_PUT(SPARC_AT_HWCAP,
+        SPARC_HWCAP_FLUSH | SPARC_HWCAP_STBAR | SPARC_HWCAP_SWAP |
+        SPARC_HWCAP_MULDIV);
     AUXV_PUT(SPARC_AT_CLKTCK, 100U);
     AUXV_PUT(SPARC_AT_SECURE, 0U);
     AUXV_PUT(SPARC_AT_RANDOM, at_random_va);

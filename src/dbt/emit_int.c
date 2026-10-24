@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dbt/emit_fp.h"
 #include "dbt/emit_priv.h"
 #include "interp/decode.h"
 #include "interp/interp_priv.h"
@@ -263,6 +264,15 @@ static int e_emit_delay(sparc32_emit_ctx_t *ec, uint32_t npc)
          * dispatcher replays the outer CTI with interp_step. */
         return sparc32_emit_exit_singlestep(ec, ec->fault_pc);
     case SPARC32_OP_FPU:
+        ec->pc = npc;
+        rc = sparc32_emit_fpu(ec, d);
+        ec->pc = saved_pc;
+        return rc;
+    case SPARC32_OP_FPMEM:
+        ec->pc = npc;
+        rc = sparc32_emit_fpmem(ec, d);
+        ec->pc = saved_pc;
+        return rc;
     case SPARC32_OP_FBRANCH:
     case SPARC32_OP_ILLEGAL:
         a64_emit_exit_undef(ec->buf, npc);
@@ -854,7 +864,11 @@ static int e_emit_one(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     case SPARC32_OP_CASA:
         return sparc32_emit_casa(ec, d);
     case SPARC32_OP_FPU:
+        return sparc32_emit_fpu(ec, d);
     case SPARC32_OP_FBRANCH:
+        return sparc32_emit_fbranch(ec, d);
+    case SPARC32_OP_FPMEM:
+        return sparc32_emit_fpmem(ec, d);
     case SPARC32_OP_ILLEGAL:
     default:
         break;

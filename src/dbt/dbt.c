@@ -188,6 +188,7 @@ static bool dbt_is_cti(const sparc32_decoded_t *d)
 {
     return d->cls == (uint32_t)SPARC32_OP_CALL ||
         d->cls == (uint32_t)SPARC32_OP_BRANCH ||
+        d->cls == (uint32_t)SPARC32_OP_FBRANCH ||
         d->cls == (uint32_t)SPARC32_OP_JMPL;
 }
 
@@ -223,10 +224,10 @@ static bool dbt_block_ends(const sparc32_decoded_t *d)
     case SPARC32_OP_JMPL:
     case SPARC32_OP_PRIV:
     case SPARC32_OP_FPU:
-    case SPARC32_OP_FBRANCH:
     case SPARC32_OP_ILLEGAL:
         return true;
     case SPARC32_OP_BRANCH:
+    case SPARC32_OP_FBRANCH:
         return d->cond != 0U;
     case SPARC32_OP_TRAP:
         return d->cond == 8U;
