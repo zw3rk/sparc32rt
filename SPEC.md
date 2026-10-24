@@ -63,19 +63,19 @@
   - Syscall number in `%g1` (`r[1]`); arguments 1..6 in `%o0..%o5` (`r[8..13]`).
   - Success: **`PSR.icc.C = 0`**, `%o0 = (uint32_t)ret`. Error: **`PSR.icc.C = 1`**, **`%o0 = sparc_errno_from_host(-ret)`** (positive SPARC errno). Always advances `pc = npc; npc = npc + 4`.
   - `pipe (42)` returns `fd[0]` in `%o0`, `fd[1]` in `%o1`; `fork (2)` / `vfork (66)` / `clone (217)` returns `%o1 = 0` in parent and **`%o0 = parent_pid, %o1 = 1`** in child.
-- **Complete SPARC32 `rt_signal_frame32` Layout (`src/os/sigframe_sparc32.h`, Verified in `tests/check_abi_invariants.c`)**:
-  - Per Linux `arch/sparc/include/uapi/asm/ptrace.h` and `arch/sparc/kernel/signal_32.c`, `rt_signal_frame32` (**348 bytes** fixed structure before optional FPU/rwin tail) has exact offsets:
+- **Complete SPARC32 `rt_signal_frame32` Layout (`src/os/sigframe_sparc32rt.h`, Verified in `tests/check_abi_invariants.c`)**:
+  - Per Linux `arch/sparc/include/uapi/asm/ptrace.h` and `arch/sparc/kernel/signal_32.c` `struct rt_signal_frame` (verified first-hand against Linux v6.6; matches qemu `target_rt_signal_frame`), `rt_signal_frame32` (**344 bytes**, `0x158`, fixed structure before optional FPU/rwin tail) has exact offsets:
     - `0x000..0x05f`: **`struct sparc_stackf ss` (96 bytes)**: `uint32_t locals[8]` (32 B) + `uint32_t ins[6]` (24 B) + `uint32_t fp` (4 B) + `uint32_t callers_pc` (4 B) + `uint32_t structptr` (4 B) + `uint32_t xargs[6]` (24 B) + `uint32_t xxargs[1]` (4 B),
     - `0x060..0x0df`: `siginfo_t info` (128 B),
     - `0x0e0..0x12f`: `struct pt_regs32 regs` (80 B: `uint32_t psr, pc, npc, y, u_regs[16]`),
     - `0x130..0x137`: `uint32_t mask[2]` (8 B `sigset_t`),
     - `0x138..0x13b`: `uint32_t fpu_save` (4 B guest pointer to inline `sigfpu32` tail or `0`),
     - `0x13c..0x143`: `uint32_t insns[2]` (8 B: `set __NR_rt_sigreturn, %g1; ta 0x10`),
-    - `0x144..0x147`: `uint32_t extramask[1]` (4 B),
-    - `0x148..0x14b`: `uint32_t extra_size` (4 B),
-    - `0x14c..0x14f`: `uint32_t rwin_save` (4 B guest pointer to saved windows or `0`),
-    - `0x150..0x15b`: `sparc32_stack_t stack` (12 B: `{uint32_t ss_sp; int32_t ss_flags; uint32_t ss_size;}`),
-    - `0x15c..`: optional inline `sigfpu32` and `rwin_save` tails.
+    - `0x144..0x14f`: `sparc32_stack_t stack` (12 B: `{uint32_t ss_sp; int32_t ss_flags; uint32_t ss_size;}`),
+    - `0x150..0x153`: `uint32_t extra_size` (4 B, always 0),
+    - `0x154..0x157`: `uint32_t rwin_save` (4 B guest pointer to saved windows or `0`),
+    - `0x158..`: optional inline `sigfpu32` and `rwin_save` tails.
+  - (Coordinator correction at RC0: an earlier draft ordered the tail as `extramask, extra_size, rwin_save, stack` (348 B), conflating the non-RT `struct signal_frame` with the RT frame. Kernel v6.6 + qemu agree on the order above; the frozen header implements it.)
   - At initial `_start`, `argc` sits at `%sp + 64` immediately after the 64-byte `rwindow_32` save area.
 
 ---
