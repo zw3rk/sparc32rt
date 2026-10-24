@@ -180,3 +180,37 @@ libc-linked (static or dynamic) V8 guest is therefore impossible in
 this environment — the eight `SKIP-sysroot` rows above — and every
 assertion those programs would have checked is instead ported into
 the freestanding guests of sections 4–5. No gate was weakened.
+
+## 9. Coordinator resolution of R1 + R2 (`RC-H`, on `master`)
+
+Both section-7 escalations are fixed on `master`; the lane verdict in
+section 1 stands as the lane-run record, and this section is the
+fix record with fresh oracle evidence (same image, recipe, and
+container hygiene as section 2).
+
+- **R1 — SUBcc C is the borrow.** Oracle probes (freestanding,
+  V8-clean, `qemu-sparc -cpu LEON3`): `cmp` + `bleu/bgu/bcs/bcc` on
+  equal/less/greater print `100110100101`, i.e. `BCS` is taken exactly
+  when `a < b`. Fix: `interp_icc_sub`/`rt_icc_sub` set `C` on
+  `a < b + bin` (was inverted); interp `SUBX`/`SUBXcc` subtract the
+  outstanding borrow; the DBT commits borrow for `SUBS`/`SBCS`, seeds
+  the complement into host `C` for `SBC`, and flips the reconstructed
+  host `C` for `BLEU`/`BGU` (`LS`/`HI` sense). `Bicc`/`Ticc` tables are
+  untouched. After the fix `r1probe` prints `100110100101` and the
+  `ADDX`/`SUBX` chain probe prints `10111111` on oracle, `--interp`,
+  `--dbt`, and `--difftest` reports `0 divergences` on both.
+  Regression coverage: `tests/test_p1_isa.c` (`ccu` block + `msg_ccu`).
+- **R2 — five syscalls dispatched.** `dup(41)`, `dup2(90)`,
+  `getppid(197)`, `gettimeofday(116)`, `clock_nanosleep(259)` are now
+  dispatched in `src/os/syscalls_min.c` with helpers in
+  `src/os/syscalls.c` (`gettimeofday` uses the BE `u32` timeval;
+  `clock_nanosleep` the 4-arg SPARC form over the `__kernel_timespec`
+  layout). A 7-bit freestanding probe prints `1111111` on oracle,
+  `--interp`, `--dbt`, with `0 divergences` under `--difftest`.
+  Regression coverage: `tests/test_h2_libc.c` now asserts `getppid`,
+  `dup`/`dup2`, `gettimeofday` (NULL and non-NULL `tz`), and
+  `clock_nanosleep` (relative, with and without remainder).
+- Updated accounting: **pass 36 (+R1 `ccu`, +R2 five), `SKIP-sysroot`
+  8, escalated 0, unexpected 0.** `nanosleep(162)` and `dup3` remain
+  undispatched: the oracle does not implement the 162 form either
+  (section 6), and no committed guest needs `dup3`.

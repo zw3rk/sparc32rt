@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dbt/emit_cc.h"
 #include "dbt/emit_fp.h"
 #include "dbt/emit_priv.h"
 #include "interp/decode.h"
@@ -106,65 +107,9 @@ static void e_ea_into(a64_buf_t *b, unsigned wd, const sparc32_decoded_t *d)
     a64_emit_add_reg_w(b, false, wd, ES2, wd, A64_SHIFT_LSL, 0u);
 }
 
-/* Commit host NZCV (set by the preceding ADDS/SUBS/ANDS/ADCS/SBCS) into
- * ctx->psr icc bits N=23,Z=22,V=21,C=20. Host N/Z match; host C/V match
- * SPARC add/sub carry/overflow, and logical ops leave them zeroed, which
- * is exactly what interp_icc_logic/add/sub compute. */
-static void e_commit_flags(a64_buf_t *b)
-{
-    uint32_t psr_off = (uint32_t)offsetof(sparc32_ctx_t, psr);
-
-    a64_emit_mrs_nzcv(b, ES2);
-    a64_emit_ubfm_w(b, ES0, ES2, 28u, 31u); /* w15 = NZCV nibble */
-    a64_emit_ldr_imm_w(b, ES1, A64_XCTX, psr_off);
-    a64_emit_mov_imm32(b, ES3, 0xFF0FFFFFu);
-    a64_emit_and_reg_w(b, false, ES1, ES1, ES3, A64_SHIFT_LSL, 0u);
-    a64_emit_mov_imm32(b, ES3, 8u); /* N(8) -> bit 23 */
-    a64_emit_and_reg_w(b, false, ES2, ES0, ES3, A64_SHIFT_LSL, 0u);
-    a64_emit_orr_reg_w(b, ES1, ES1, ES2, A64_SHIFT_LSL, 20u);
-    a64_emit_mov_imm32(b, ES3, 4u); /* Z(4) -> bit 22 */
-    a64_emit_and_reg_w(b, false, ES2, ES0, ES3, A64_SHIFT_LSL, 0u);
-    a64_emit_orr_reg_w(b, ES1, ES1, ES2, A64_SHIFT_LSL, 20u);
-    a64_emit_mov_imm32(b, ES3, 2u); /* C(2) -> bit 20 */
-    a64_emit_and_reg_w(b, false, ES2, ES0, ES3, A64_SHIFT_LSL, 0u);
-    a64_emit_orr_reg_w(b, ES1, ES1, ES2, A64_SHIFT_LSL, 19u);
-    a64_emit_mov_imm32(b, ES3, 1u); /* V(1) -> bit 21 */
-    a64_emit_and_reg_w(b, false, ES2, ES0, ES3, A64_SHIFT_LSL, 0u);
-    a64_emit_orr_reg_w(b, ES1, ES1, ES2, A64_SHIFT_LSL, 21u);
-    a64_emit_str_imm_w(b, ES1, A64_XCTX, psr_off);
-}
-
-/* Seed the host carry flag from PSR.icc.C for ADDX/SUBX (ADC/SBC). */
-static void e_seed_carry(a64_buf_t *b)
-{
-    uint32_t psr_off = (uint32_t)offsetof(sparc32_ctx_t, psr);
-
-    a64_emit_ldr_imm_w(b, ES0, A64_XCTX, psr_off);
-    a64_emit_ubfm_w(b, ES0, ES0, 20u, 20u); /* C bit */
-    a64_emit_orr_reg_w(b, ES0, A64_ZR, ES0, A64_SHIFT_LSL, 29u);
-    a64_emit_msr_nzcv(b, ES0);
-}
-
-/* Build host NZCV from ctx->psr icc for Bicc/Ticc evaluation. */
-static void e_cond_setup(a64_buf_t *b)
-{
-    uint32_t psr_off = (uint32_t)offsetof(sparc32_ctx_t, psr);
-
-    a64_emit_ldr_imm_w(b, ES3, A64_XCTX, psr_off);
-    a64_emit_mov_imm32(b, ES0, 0x800000u); /* N(23) -> 31 */
-    a64_emit_and_reg_w(b, false, ES2, ES3, ES0, A64_SHIFT_LSL, 0u);
-    a64_emit_orr_reg_w(b, ES1, A64_ZR, ES2, A64_SHIFT_LSL, 8u);
-    a64_emit_mov_imm32(b, ES0, 0x400000u); /* Z(22) -> 30 */
-    a64_emit_and_reg_w(b, false, ES2, ES3, ES0, A64_SHIFT_LSL, 0u);
-    a64_emit_orr_reg_w(b, ES1, ES1, ES2, A64_SHIFT_LSL, 8u);
-    a64_emit_mov_imm32(b, ES0, 0x100000u); /* C(20) -> 29 */
-    a64_emit_and_reg_w(b, false, ES2, ES3, ES0, A64_SHIFT_LSL, 0u);
-    a64_emit_orr_reg_w(b, ES1, ES1, ES2, A64_SHIFT_LSL, 9u);
-    a64_emit_mov_imm32(b, ES0, 0x200000u); /* V(21) -> 28 */
-    a64_emit_and_reg_w(b, false, ES2, ES3, ES0, A64_SHIFT_LSL, 0u);
-    a64_emit_orr_reg_w(b, ES1, ES1, ES2, A64_SHIFT_LSL, 7u);
-    a64_emit_msr_nzcv(b, ES1);
-}
+/* icc <-> NZCV translation lives in src/dbt/emit_cc.c (split for the
+ * 900-line discipline): sparc32_emit_commit_flags, sparc32_emit_seed_carry,
+ * sparc32_emit_cond_setup. */
 
 /* Privileged-state access trap (RDPSR/RDWIM/RDTBR, WRPSR/WRWIM/WRTBR,
  * RETT, numbered ASR, supervisor ASI): EXIT_TRAP with exit_arg 3. */
@@ -372,13 +317,13 @@ int sparc32_emit_alu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         a64_emit_eor_reg_w(b, ES0, ES0, ES2, A64_SHIFT_LSL, 0u);
         break;
     case 0x08U:
-        e_seed_carry(b);
+        sparc32_emit_seed_carry(b, false);
         e_ldgreg(b, ES0, d->rs1);
         e_src2(b, ES1, d);
         a64_emit_adc_w(b, false, ES0, ES0, ES1);
         break;
     case 0x0CU:
-        e_seed_carry(b);
+        sparc32_emit_seed_carry(b, true);
         e_ldgreg(b, ES0, d->rs1);
         e_src2(b, ES1, d);
         a64_emit_sbc_w(b, false, ES0, ES0, ES1);
@@ -413,13 +358,13 @@ int sparc32_emit_alu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         a64_emit_and_reg_w(b, true, A64_ZR, ES0, ES0, A64_SHIFT_LSL, 0u);
         break;
     case 0x18U:
-        e_seed_carry(b);
+        sparc32_emit_seed_carry(b, false);
         e_ldgreg(b, ES0, d->rs1);
         e_src2(b, ES1, d);
         a64_emit_adc_w(b, true, ES0, ES0, ES1);
         break;
     case 0x1CU:
-        e_seed_carry(b);
+        sparc32_emit_seed_carry(b, true);
         e_ldgreg(b, ES0, d->rs1);
         e_src2(b, ES1, d);
         a64_emit_sbc_w(b, true, ES0, ES0, ES1);
@@ -431,7 +376,7 @@ int sparc32_emit_alu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     e_stgreg(b, d->rd, ES0);
     if (d->cc != 0u) {
-        e_commit_flags(b);
+        sparc32_emit_commit_flags(b, d->op3 == 0x14U || d->op3 == 0x1CU);
     }
     return b->overflow ? -1 : 0;
 }
@@ -551,7 +496,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
          * when the delay ran (interp_cti's tail). An annulled not-taken
          * path completes the transfer inline with a plain BRANCH exit
          * (NONE after commit), never SINGLE_STEP. */
-        e_cond_setup(b);
+        sparc32_emit_cond_setup(b, cond);
         p_taken = a64_emit_b_cond_placeholder(b, s_a64_cond[cond & 15u]);
         if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
             rc = e_emit_delay(ec, npc);
@@ -575,7 +520,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         }
         return sparc32_emit_exit_singlestep(ec, target);
     }
-    e_cond_setup(b);
+    sparc32_emit_cond_setup(b, cond);
     p_taken = a64_emit_b_cond_placeholder(b, s_a64_cond[cond & 15u]);
     if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
         rc = e_emit_delay(ec, npc);
@@ -694,7 +639,7 @@ int sparc32_emit_trap(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         return b->overflow ? -1 : 0;
     }
     if (d->cond != 0x8u) {
-        e_cond_setup(b);
+        sparc32_emit_cond_setup(b, d->cond);
         p_taken = a64_emit_b_cond_placeholder(b, s_a64_cond[d->cond & 15u]);
     } else {
         p_taken = (size_t)-1;

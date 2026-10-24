@@ -89,6 +89,9 @@ static void interp_icc_add(sparc32_ctx_t *ctx, uint32_t res, uint32_t a,
     }
 }
 
+/* SUBcc C is the borrow out of bit 31 (R1: oracle-verified LEON3
+ * truth: C = 1 iff a < b + bin). BCS/BCC/BLEU/BGU read it directly,
+ * and SUBX subtracts the outstanding borrow (cin below). */
 static void interp_icc_sub(sparc32_ctx_t *ctx, uint32_t res, uint32_t a,
     uint32_t b, uint32_t bin)
 {
@@ -99,7 +102,7 @@ static void interp_icc_sub(sparc32_ctx_t *ctx, uint32_t res, uint32_t a,
     if (s != (int64_t)(int32_t)res) {
         ctx->psr |= SPARC32_PSR_V;
     }
-    if ((uint64_t)a >= bb) {
+    if ((uint64_t)a < bb) {
         ctx->psr |= SPARC32_PSR_C;
     }
 }
@@ -212,7 +215,7 @@ static bool interp_alu(sparc32_ctx_t *ctx, uint32_t pc,
         interp_wreg(ctx, rd, a + b + cin);
         return true;
     case 0x0CU:
-        cin = (ctx->psr & SPARC32_PSR_C) != 0U ? 0U : 1U;
+        cin = (ctx->psr & SPARC32_PSR_C) != 0U ? 1U : 0U;
         interp_wreg(ctx, rd, a - b - cin);
         return true;
     case 0x10U: res = a + b; interp_icc_add(ctx, res, a, b, 0U);
@@ -234,7 +237,7 @@ static bool interp_alu(sparc32_ctx_t *ctx, uint32_t pc,
     case 0x18U: cin = (ctx->psr & SPARC32_PSR_C) != 0U ? 1U : 0U;
         res = a + b + cin; interp_icc_add(ctx, res, a, b, cin);
         interp_wreg(ctx, rd, res); return true;
-    case 0x1CU: cin = (ctx->psr & SPARC32_PSR_C) != 0U ? 0U : 1U;
+    case 0x1CU: cin = (ctx->psr & SPARC32_PSR_C) != 0U ? 1U : 0U;
         res = a - b - cin; interp_icc_sub(ctx, res, a, b, cin);
         interp_wreg(ctx, rd, res); return true;
     case 0x0AU: { /* UMUL */

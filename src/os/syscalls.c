@@ -33,6 +33,7 @@
 #endif
 
 #include "sparc32rt.h"
+#include "os/l2a_access.h"
 #include "os/sigframe_sparc32rt.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_min.h"
@@ -66,16 +67,8 @@
 #define SP_FIONREAD 0x4004667fU
 #define SP_TCGETS 0x80245408U
 
-#define SP_CLOCK_REALTIME 0U
-#define SP_CLOCK_MONOTONIC 1U
-
 #define SP_FUTEX_WAIT 0U
 #define SP_FUTEX_WAKE 1U
-
-
-#define SP_GRND_NONBLOCK 0x0001U
-#define SP_GRND_RANDOM 0x0002U
-#define SP_GRND_INSECURE 0x0004U
 
 #define SP_AT_FDCWD ((int32_t)-100)
 #define SP_AT_SYMLINK_NOFOLLOW 0x100U
@@ -94,43 +87,7 @@ uint64_t sparc32_l2a_blocked_mask(void)
     return ((uint64_t)l2a_blocked[0] << 32) | (uint64_t)l2a_blocked[1];
 }
 
-static void put_be16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)(v >> 8);
-    p[1] = (uint8_t)v;
-}
-
-static void put_be32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)(v >> 24);
-    p[1] = (uint8_t)(v >> 16);
-    p[2] = (uint8_t)(v >> 8);
-    p[3] = (uint8_t)v;
-}
-
-static void put_be64(uint8_t *p, uint64_t v)
-{
-    put_be32(p, (uint32_t)(v >> 32));
-    put_be32(p + 4, (uint32_t)v);
-}
-
-static uint32_t get_be32(const uint8_t *p)
-{
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-}
-
-/* Bounds check for [va, va+len): reject 32-bit wrap + low guard (L1c model). */
-static int l2a_range_ok(uint32_t va, uint64_t len)
-{
-    if (len == 0U) {
-        return 0;
-    }
-    if (len > 0x100000000ULL || (uint64_t)va + len > 0x100000000ULL) {
-        return -EFAULT;
-    }
-    return (va < SPARC32_LOW_GUARD_SIZE) ? -EFAULT : 0;
-}
+/* BE words, range model, and guest stores live in os/l2a_access.h. */
 
 /* NUL-terminated guest string -> out (0 ok, -EFAULT/-ENAMETOOLONG). */
 static long l2a_copy_cstring(sparc32_ctx_t *ctx, uint32_t va, char *out,
@@ -162,18 +119,6 @@ static int l2a_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
         return -EFAULT;
     }
     put_be32((uint8_t *)sparc32_guest_ptr(ctx, va), v);
-    return 0;
-}
-
-static int l2a_store(sparc32_ctx_t *ctx, uint32_t va, const void *src,
-    uint64_t len)
-{
-    if (l2a_range_ok(va, len) != 0) {
-        return -EFAULT;
-    }
-    if (len != 0U) {
-        memcpy(sparc32_guest_ptr(ctx, va), src, (size_t)len);
-    }
     return 0;
 }
 
@@ -369,6 +314,25 @@ long sparc32_l2a_getgid(void)
 long sparc32_l2a_getegid(void)
 {
     return (long)getegid();
+}
+
+long sparc32_l2a_getppid(void)
+{
+    return (long)getppid();
+}
+
+/* R2: dup/dup2 over host fds (the oracle implements both; both engines
+ * returned ENOSYS before dispatch existed). */
+long sparc32_l2a_dup(uint32_t fd)
+{
+    int rc = dup((int)(int32_t)fd);
+    return (rc < 0) ? -(long)errno : (long)rc;
+}
+
+long sparc32_l2a_dup2(uint32_t oldfd, uint32_t newfd)
+{
+    int rc = dup2((int)(int32_t)oldfd, (int)(int32_t)newfd);
+    return (rc < 0) ? -(long)errno : (long)rc;
 }
 
 /* readv/writev over guest iovec chains ({BE base, BE len} x iovcnt). */
@@ -745,57 +709,6 @@ long sparc32_l2a_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg)
     default:
         return -EINVAL;
     }
-}
-
-/* Guest buffer is __kernel_timespec: BE u64 tv_sec, BE u32 tv_nsec, 4 B pad. */
-long sparc32_l2a_clock_gettime(sparc32_ctx_t *ctx, uint32_t clk_id,
-    uint32_t tp_va)
-{
-    struct timespec ts;
-    uint8_t b[16];
-    clockid_t host_clk;
-    switch (clk_id) {
-    case SP_CLOCK_REALTIME: host_clk = CLOCK_REALTIME; break;
-    case SP_CLOCK_MONOTONIC: host_clk = CLOCK_MONOTONIC; break;
-    default: return -EINVAL;
-    }
-    if (l2a_range_ok(tp_va, sizeof(b)) != 0) {
-        return -EFAULT;
-    }
-    if (clock_gettime(host_clk, &ts) != 0) {
-        return -(long)errno;
-    }
-    if (ts.tv_sec < 0) {
-        return -EOVERFLOW;
-    }
-    memset(b, 0, sizeof(b));
-    put_be64(b, (uint64_t)ts.tv_sec);
-    put_be32(b + 8, (uint32_t)ts.tv_nsec);
-    return l2a_store(ctx, tp_va, b, sizeof(b));
-}
-
-long sparc32_l2a_getrandom(sparc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
-    uint32_t flags)
-{
-#if defined(__linux__) && defined(SYS_getrandom)
-    long rc;
-    if ((flags & ~(SP_GRND_NONBLOCK | SP_GRND_RANDOM | SP_GRND_INSECURE)) !=
-        0U) {
-        return -EINVAL;
-    }
-    if (l2a_range_ok(buf_va, len) != 0) {
-        return -EFAULT;
-    }
-    if (len == 0U) {
-        return 0;
-    }
-    rc = syscall(SYS_getrandom, sparc32_guest_ptr(ctx, buf_va), (size_t)len,
-        (unsigned int)flags);
-    return (rc < 0) ? -(long)errno : rc;
-#else
-    (void)ctx; (void)buf_va; (void)len; (void)flags;
-    return -ENOSYS;
-#endif
 }
 
 /* futex WAIT/WAKE via host futex. BE guest words: WAIT expectation is

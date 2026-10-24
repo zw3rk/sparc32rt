@@ -60,6 +60,9 @@ long sparc32_l2a_getuid(void);
 long sparc32_l2a_geteuid(void);
 long sparc32_l2a_getgid(void);
 long sparc32_l2a_getegid(void);
+long sparc32_l2a_getppid(void);
+long sparc32_l2a_dup(uint32_t fd);
+long sparc32_l2a_dup2(uint32_t oldfd, uint32_t newfd);
 long sparc32_l2a_readv(sparc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
     uint32_t iovcnt);
 long sparc32_l2a_writev(sparc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
@@ -77,6 +80,10 @@ long sparc32_l2a_statx(sparc32_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
 long sparc32_l2a_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg);
 long sparc32_l2a_clock_gettime(sparc32_ctx_t *ctx, uint32_t clk_id,
     uint32_t tp_va);
+long sparc32_l2a_gettimeofday(sparc32_ctx_t *ctx, uint32_t tv_va,
+    uint32_t tz_va);
+long sparc32_l2a_clock_nanosleep(sparc32_ctx_t *ctx, uint32_t clk_id,
+    uint32_t flags, uint32_t req_va, uint32_t rem_va);
 long sparc32_l2a_getrandom(sparc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
     uint32_t flags);
 long sparc32_l2a_futex(sparc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
@@ -662,6 +669,17 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
     case (long)SPARC32__NR_close:
         ret = sparc32_l2a_close((int)(int32_t)o0);
         break;
+    /* R2: dup/dup2/getppid/gettimeofday/clock_nanosleep (oracle-verified;
+     * both engines returned ENOSYS before these dispatch arms). */
+    case (long)SPARC32__NR_dup:
+        ret = sparc32_l2a_dup(o0);
+        break;
+    case (long)SPARC32__NR_dup2:
+        ret = sparc32_l2a_dup2(o0, o1);
+        break;
+    case (long)SPARC32__NR_getppid:
+        ret = sparc32_l2a_getppid();
+        break;
     /* Lane L2a static-libc set (src/os/syscalls.c, additive cases only). */
     case (long)SPARC32__NR_open:
         ret = sparc32_l2a_open(ctx, o0, o1, o2);
@@ -746,6 +764,12 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         break;
     case (long)SPARC32__NR_clock_gettime:
         ret = sparc32_l2a_clock_gettime(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_gettimeofday:
+        ret = sparc32_l2a_gettimeofday(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_clock_nanosleep:
+        ret = sparc32_l2a_clock_nanosleep(ctx, o0, o1, o2, o3);
         break;
     case (long)SPARC32__NR_getrandom:
         ret = sparc32_l2a_getrandom(ctx, o0, o1, o2);

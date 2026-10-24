@@ -18,13 +18,16 @@
  * fadds/fsubs/fmuls/fdivs/fsqrts/fcmps+FBfcc/fbu-NaN (math float);
  * faddd/fsubd bit-exact (math double); getpid/getuid/getgid/
  * geteuid/getegid/getppid, pipe+read/write/close round-trip, fcntl
- * GETFL/SETFL/DUPFD, fork+wait4 exit-status, mmap/mprotect/munmap,
- * uname sysname, clock_gettime, getrandom, rt_sigaction+kill delivery,
- * rt_sigprocmask block/mask/unblock (signal/functional/LTP/).
- * Deliberately NOT covered here (translator -ENOSYS, oracle-verified
- * escalations in docs/h2-report.md): dup/dup2/dup3, nanosleep,
- * clock_nanosleep, gettimeofday. pthread/clone/futex/TLS: covered by
- * tests/test_p4_threads.c, cited in the report.
+ * GETFL/SETFL/DUPFD, dup/stdout, dup2 1->30, fork+wait4 exit-status,
+ * mmap/mprotect/munmap, uname sysname, clock_gettime, gettimeofday
+ * (tz NULL and non-NULL), clock_nanosleep relative with/without rem,
+ * getrandom, rt_sigaction+kill delivery, rt_sigprocmask block/mask/
+ * unblock (signal/functional/LTP/). The R2 syscall set (dup, dup2,
+ * getppid, gettimeofday, clock_nanosleep) was escalated in
+ * docs/h2-report.md and is asserted here after the Coordinator fix.
+ * Deliberately NOT covered here: dup3, nanosleep(162) (the oracle does
+ * not implement the 162 form either — report section 6). pthread/clone/
+ * futex/TLS: covered by tests/test_p4_threads.c, cited in the report.
  *
  * Build (E-phase discipline):
  *   sparc64-linux-gnu-gcc -m32 -fno-pie -no-pie -nostdlib -static \
@@ -257,14 +260,14 @@ __asm__(
 "\tmov 20, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
 "\ttst %o0\n\tble fail\n\tnop\n"
 "\tsethi %hi(saved_pid), %g5\nor %g5, %lo(saved_pid), %g5\n\tst %o0, [%g5]\n"
-/* --- getuid(24)/getgid(47)/geteuid(49)/getegid(50): ok.
- * getppid(197) is NOT asserted here: declared in syscall_nr.h but with
- * no dispatch case, so both engines return -ENOSYS while the oracle
- * implements it (report residual R2; probed, not assumed). --- */
+/* --- getuid(24)/getgid(47)/geteuid(49)/getegid(50): ok. --- */
 "\tmov 24, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
 "\tmov 47, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
 "\tmov 49, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
 "\tmov 50, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
+/* --- getppid(197) > 0 (R2: dispatch added; oracle-verified). --- */
+"\tmov 197, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
+"\ttst %o0\n\tble fail\n\tnop\n"
 "\tsethi %hi(msg_sysid), %g2\nor %g2, %lo(msg_sysid), %g2\n\tcall puts\n\tnop\n"
 /* --- pipe(42): o0=read end, o1=write end (SPARC dual-return). --- */
 "\tmov 42, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
@@ -292,6 +295,14 @@ __asm__(
 "\tsethi %hi(saved_dup), %g5\nor %g5, %lo(saved_dup), %g5\n\tst %o0, [%g5]\n\tmov 6, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
 "\tsethi %hi(saved_pipe), %g5\nor %g5, %lo(saved_pipe), %g5\n\tld [%g5], %o0\n\tmov 6, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
 "\tsethi %hi(saved_pipe), %g5\nor %g5, %lo(saved_pipe), %g5\n\tld [%g5 + 4], %o0\n\tmov 6, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
+/* --- dup(41) stdout -> fd >= 0, then close it (R2; oracle-verified). --- */
+"\tmov 1, %o0\n\tmov 41, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
+"\ttst %o0\n\tbl fail\n\tnop\n"
+"\tsethi %hi(saved_dup), %g5\nor %g5, %lo(saved_dup), %g5\n\tst %o0, [%g5]\n\tmov 6, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
+/* --- dup2(90) 1 -> 30 returns 30; close 30 (R2; oracle-verified). --- */
+"\tmov 1, %o0\n\tmov 30, %o1\n\tmov 90, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
+"\tcmp %o0, 30\n\tbne fail\n\tnop\n"
+"\tmov 30, %o0\n\tmov 6, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
 "\tsethi %hi(msg_pipe), %g2\nor %g2, %lo(msg_pipe), %g2\n\tcall puts\n\tnop\n"
 /* --- fork(2)+wait4(7): child exits 42 silently; status 0x2A00. --- */
 "\tmov 2, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
@@ -334,6 +345,25 @@ __asm__(
 /* --- getrandom(347) 16 B: exactly 16; bytes never printed. --- */
 "\tsethi %hi(randbuf), %g5\nor %g5, %lo(randbuf), %g5\n\tmov %g5, %o0\n\tmov 16, %o1\n\tmov 0, %o2\n\tmov 347, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
 "\tcmp %o0, 16\n\tbne fail\n\tnop\n"
+/* --- gettimeofday(116): sec > 0; tz!=NULL still ok (R2). --- */
+"\tsethi %hi(h2_tv), %g5\nor %g5, %lo(h2_tv), %g5\n\tmov %g5, %o0\n\tmov 0, %o1\n\tmov 116, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
+"\tcmp %o0, 0\n\tbne fail\n\tnop\n"
+"\tld [%g5], %g6\n\ttst %g6\n\tble fail\n\tnop\n"
+"\tsethi %hi(h2_tv), %g5\nor %g5, %lo(h2_tv), %g5\n\tmov %g5, %o0\n"
+"\tsethi %hi(h2_tz), %g6\nor %g6, %lo(h2_tz), %g6\n\tmov %g6, %o1\n"
+"\tmov 116, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
+/* --- clock_nanosleep(259) MONOTONIC rel 10 ms, rem stored, rc 0 (R2);
+ * then rem==NULL, rc 0. tsbuf (clock_gettime's) is reused as req. --- */
+"\tsethi %hi(tsbuf), %g5\nor %g5, %lo(tsbuf), %g5\n"
+"\tst %g0, [%g5]\n\tst %g0, [%g5 + 4]\n\tset 10000000, %g6\n\tst %g6, [%g5 + 8]\n\tst %g0, [%g5 + 12]\n"
+"\tmov 1, %o0\n\tmov 0, %o1\n\tmov %g5, %o2\n"
+"\tsethi %hi(h2_tsrem), %g6\nor %g6, %lo(h2_tsrem), %g6\n\tmov %g6, %o3\n"
+"\tmov 259, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
+"\tcmp %o0, 0\n\tbne fail\n\tnop\n"
+"\tsethi %hi(tsbuf), %g5\nor %g5, %lo(tsbuf), %g5\n"
+"\tmov 1, %o0\n\tmov 0, %o1\n\tmov %g5, %o2\n\tmov 0, %o3\n"
+"\tmov 259, %g1\n\tta 0x10\n\tbcs fail\n\tnop\n"
+"\tcmp %o0, 0\n\tbne fail\n\tnop\n"
 "\tsethi %hi(msg_time), %g2\nor %g2, %lo(msg_time), %g2\n\tcall puts\n\tnop\n"
 /* --- rt_sigaction(102): install SIGUSR1(30) counter handler. --- */
 "\tsethi %hi(act), %g5\nor %g5, %lo(act), %g5\n"
@@ -456,6 +486,9 @@ __asm__(
 "saved_map:\n\t.skip 4\n"
 "wstatus:\n\t.skip 4\n"
 "tsbuf:\n\t.skip 16\n"
+"h2_tv:\n\t.skip 8\n"
+"h2_tz:\n\t.skip 8\n"
+"h2_tsrem:\n\t.skip 16\n"
 "randbuf:\n\t.skip 16\n"
 "utsbuf:\n\t.skip 400\n"
 "act:\n\t.skip 20\n"

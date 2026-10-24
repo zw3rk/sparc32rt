@@ -5,11 +5,13 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Lane L1d (Phase 1): ALU, shifts, branches (taken / not-taken / annulled
- * both ways), a page-final branch plus a PROT_NONE data page, LDSTUB /
- * SWAP, unaligned-offset loads/stores plus one misaligned word load,
- * SAVE / RESTORE depth, ta 0x10 write / exit. CASA appears only as an
- * encoding word plus pre-state assertion: the oracle cannot execute it
- * (qemu-sparc 7.2 linux-user trap 0x24, see experiments/E03/FINDINGS.md).
+ * both ways), SUBcc borrow-C with BLEU/BGU/BCS/BCC on less/equal/greater
+ * plus SUBX/ADDX carry chains (R1 regression), a page-final branch plus
+ * a PROT_NONE data page, LDSTUB / SWAP, unaligned-offset loads/stores
+ * plus one misaligned word load, SAVE / RESTORE depth, ta 0x10 write /
+ * exit. CASA appears only as an encoding word plus pre-state assertion:
+ * the oracle cannot execute it (qemu-sparc 7.2 linux-user trap 0x24,
+ * see experiments/E03/FINDINGS.md).
  *
  * Build (E-phase discipline):
  *   sparc64-linux-gnu-gcc -m32 -fno-pie -no-pie -nostdlib -static \
@@ -60,6 +62,27 @@ __asm__(
 "cc_c:\n	mov 3, %g2\n	subcc %g2, 5, %g3\n	bneg cc_n\n	nop\n	ba fail\n	nop\n"
 "cc_n:\n	set 0x7fffffff, %g2\n	addcc %g2, 1, %g3\n	bvs cc_v\n	nop\n	ba fail\n	nop\n"
 "cc_v:\n	sethi %hi(msg_cc), %g2\nor %g2, %lo(msg_cc), %g2\n	call puts\n	nop\n"
+"	! --- R1: SUBcc C is the borrow (LEON3 oracle truth): BLEU/BGU/BCS/ ---\n"
+"	! --- BCC after cmp on less/equal/greater, plus SUBX/ADDX chains. ---\n"
+"	mov 3, %g2\n	mov 5, %g4\n	cmp %g2, %g4\n	bleu ccu_lt1\n	nop\n	ba fail\n	nop\n"
+"ccu_lt1:\n	cmp %g2, %g4\n	bgu fail\n	nop\n"
+"	cmp %g2, %g4\n	bcs ccu_lt2\n	nop\n	ba fail\n	nop\n"
+"ccu_lt2:\n	cmp %g2, %g4\n	bcc fail\n	nop\n"
+"	mov 5, %g2\n	mov 3, %g4\n	cmp %g2, %g4\n	bleu fail\n	nop\n"
+"	cmp %g2, %g4\n	bgu ccu_gt1\n	nop\n	ba fail\n	nop\n"
+"ccu_gt1:\n	cmp %g2, %g4\n	bcs fail\n	nop\n"
+"	cmp %g2, %g4\n	bcc ccu_gt2\n	nop\n	ba fail\n	nop\n"
+"ccu_gt2:\n	cmp %g2, %g2\n	bleu ccu_eq1\n	nop\n	ba fail\n	nop\n"
+"ccu_eq1:\n	cmp %g2, %g2\n	bgu fail\n	nop\n"
+"	cmp %g2, %g2\n	bcs fail\n	nop\n"
+"	cmp %g2, %g2\n	bcc ccu_x1\n	nop\n	ba fail\n	nop\n"
+"ccu_x1:\n	mov 0, %g2\n	mov 1, %g4\n	subcc %g2, %g4, %g5\n	subx %g0, %g0, %g5\n"
+"	set 0xffffffff, %g6\n	cmp %g5, %g6\n	bne fail\n	nop\n"
+"	mov 3, %g2\n	mov 5, %g4\n	subcc %g2, %g4, %g5\n	addx %g0, %g0, %g5\n"
+"	cmp %g5, 1\n	bne fail\n	nop\n"
+"	mov 5, %g2\n	mov 3, %g4\n	subcc %g2, %g4, %g5\n	addx %g0, %g0, %g5\n"
+"	cmp %g5, %g0\n	bne fail\n	nop\n"
+"	sethi %hi(msg_ccu), %g2\nor %g2, %lo(msg_ccu), %g2\n	call puts\n	nop\n"
 "	! --- shifts: sll / srl / sra ---\n"
 "	set 0x80000001, %g2\n"
 "	sll %g2, 1, %g5\n	set 0x00000002, %g6\n	cmp %g5, %g6\n	bne fail\n	nop\n"
@@ -308,6 +331,7 @@ __asm__(
 "msg_start:\n	.asciz \"P1-ISA start\\n\"\n"
 "msg_alu:\n	.asciz \"alu \"\n"
 "msg_cc:\n	.asciz \"cc z=1 c=1 n=1 v=1\\n\"\n"
+"msg_ccu:\n	.asciz \"ccu bleu/bgu/bcs/bcc/subx/addx ok\\n\"\n"
 "msg_shift:\n	.asciz \"shift \"\n"
 "msg_mul:\n	.asciz \"mul \"\n"
 "msg_mulcc:\n	.asciz \"mulcc \"\n"

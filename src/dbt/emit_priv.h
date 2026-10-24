@@ -72,6 +72,8 @@ static void rt_icc_add(sparc32_ctx_t *ctx, uint32_t res, uint32_t a,
     }
 }
 
+/* SUBcc C is the borrow out of bit 31 (R1: oracle-verified LEON3
+ * truth, mirrors interp_icc_sub). */
 static void rt_icc_sub(sparc32_ctx_t *ctx, uint32_t res, uint32_t a,
     uint32_t b, uint32_t bin)
 {
@@ -83,7 +85,7 @@ static void rt_icc_sub(sparc32_ctx_t *ctx, uint32_t res, uint32_t a,
     if (s != (int64_t)(int32_t)res) {
         ctx->psr |= SPARC32_PSR_V;
     }
-    if ((uint64_t)a >= bb) {
+    if ((uint64_t)a < bb) {
         ctx->psr |= SPARC32_PSR_C;
     }
 }
