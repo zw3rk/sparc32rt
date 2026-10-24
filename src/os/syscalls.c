@@ -36,6 +36,7 @@
 #include "os/sigframe_sparc32rt.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_min.h"
+#include "rt32/procfs.h"
 
 /* SPARC open flags (arch/sparc fcntl.h); low 2 access bits match hosts. */
 #define SP_O_APPEND 0x0008U
@@ -274,7 +275,6 @@ static long sys_openat(sparc32_ctx_t *ctx, int32_t dirfd, uint32_t path_va,
     char path[L2A_PATH_MAX];
     long rc = l2a_copy_cstring(ctx, path_va, path, L2A_PATH_MAX);
     int host_flags;
-    int fd;
     if (rc != 0) {
         return rc;
     }
@@ -282,9 +282,10 @@ static long sys_openat(sparc32_ctx_t *ctx, int32_t dirfd, uint32_t path_va,
     if (rc != 0) {
         return rc;
     }
-    fd = openat((dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)dirfd, path,
-        host_flags, (mode_t)(mode & 0777U));
-    return (fd < 0) ? -(long)errno : (long)fd;
+    /* L5a hook: /proc/self/* served from translator state, all else host. */
+    rc = rt32_procfs_openat(ctx, (dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)dirfd,
+        path, host_flags, (mode_t)(mode & 0777U));
+    return rc;
 }
 
 long sparc32_l2a_openat(sparc32_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,

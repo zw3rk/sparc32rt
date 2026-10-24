@@ -522,6 +522,12 @@ int rt32_elf_load(sparc32_ctx_t *ctx, int exec_fd, const char *path, rt32_elf_in
         out_info->interp_base = interp_info.load_bias;
         ctx->interp_base      = interp_info.load_bias;
         ctx->elf_entry        = interp_info.entry;
+        /* Linux runs the interpreter first: the run entry becomes the
+         * interpreter's while the app entry is preserved in app_entry
+         * for AT_ENTRY (stack32.c). info.entry feeds main/exec run PCs
+         * with no further edits; AT_PHDR/PHENT/PHNUM stay the app's. */
+        out_info->app_entry = out_info->entry;
+        out_info->entry     = interp_info.entry;
         interp_end            = sparc32_page_up(interp_info.max_vaddr);
         if (ctx->brk_base >= interp_info.load_bias && ctx->brk_base < interp_end) {
             ctx->brk_base = interp_end;

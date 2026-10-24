@@ -34,6 +34,11 @@
 #define SPARC_AT_PHENT   4U
 #define SPARC_AT_PHNUM   5U
 #define SPARC_AT_PAGESZ  6U
+/* AT_BASE is 7 on SPARC (NOT 4: tag 4 is AT_PHENT, verified against the
+ * qemu-sparc -cpu LEON3 oracle which reports PHENT=0x20 at tag 4 and
+ * BASE=0 at tag 7 for static binaries). AT_HWCAP2 is 26 (always 0:
+ * no V8 HWCAP2 bit is defined). */
+#define SPARC_AT_BASE    7U
 #define SPARC_AT_FLAGS   8U
 #define SPARC_AT_ENTRY   9U
 #define SPARC_AT_UID     11U
@@ -54,6 +59,7 @@
 #define SPARC_AT_CLKTCK  17U
 #define SPARC_AT_SECURE  23U
 #define SPARC_AT_RANDOM  25U
+#define SPARC_AT_HWCAP2  26U
 #define SPARC_AT_EXECFN  31U
 
 /* Big-endian 32-bit store to guest memory (SPARC is BE; the host may be
@@ -121,7 +127,7 @@ int rt32_stack_setup(sparc32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
     uint32_t arg_ptrs[512];
     int envc = 0;
     int argc = 0;
-    uint32_t auxv[34];
+    uint32_t auxv[40];
     size_t aux_idx = 0U;
     size_t total_words;
     uint32_t frame_bytes;
@@ -178,7 +184,11 @@ int rt32_stack_setup(sparc32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
     AUXV_PUT(SPARC_AT_PHNUM, elf_info->phnum);
     AUXV_PUT(SPARC_AT_PAGESZ, SPARC32_PAGE_SIZE);
     AUXV_PUT(SPARC_AT_FLAGS, 0U);
-    AUXV_PUT(SPARC_AT_ENTRY, elf_info->entry);
+    /* App entry with PT_INTERP (elf32.c preserves it in app_entry while
+     * entry becomes the interpreter's run entry); plain entry otherwise. */
+    AUXV_PUT(SPARC_AT_ENTRY, elf_info->app_entry != 0U ? elf_info->app_entry
+                                                       : elf_info->entry);
+    AUXV_PUT(SPARC_AT_BASE, ctx->interp_base);
     AUXV_PUT(SPARC_AT_UID, (uint32_t)getuid());
     AUXV_PUT(SPARC_AT_EUID, (uint32_t)geteuid());
     AUXV_PUT(SPARC_AT_GID, (uint32_t)getgid());
@@ -186,6 +196,7 @@ int rt32_stack_setup(sparc32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
     AUXV_PUT(SPARC_AT_HWCAP,
         SPARC_HWCAP_FLUSH | SPARC_HWCAP_STBAR | SPARC_HWCAP_SWAP |
         SPARC_HWCAP_MULDIV);
+    AUXV_PUT(SPARC_AT_HWCAP2, 0U);
     AUXV_PUT(SPARC_AT_CLKTCK, 100U);
     AUXV_PUT(SPARC_AT_SECURE, 0U);
     AUXV_PUT(SPARC_AT_RANDOM, at_random_va);
