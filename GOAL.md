@@ -23,17 +23,17 @@ Implement, verify, and harden **`sparc32rt`** — a zero-dependency, static-PIE 
 
 ### Phase E — Pre-Implementation Empirical Experiments (`RC-E`)
 Read [`docs/lanes/phase-e.md`](docs/lanes/phase-e.md) and run concurrent experiment lanes `E01..E06`:
-- [ ] **E01 (`SAVE`/`RESTORE` 64-Byte Stack Spill/Fill & `_start` (`%sp + 64`))**: Verify `SAVE`/`RESTORE` 64-byte `rwindow_32` spill/fill at `[%sp + 0..60]` and initial `argc`/`argv` stack offset under `qemu-sparc`. (`experiments/E01/FINDINGS.md`)
-- [ ] **E02 (Dual-PC `(pc, npc)` & `Bicc,a` / `BA,a` Annulled Delay Slots)**: Verify `Bicc,a` (annul when not taken) vs `BA,a` (always annul) including page-end `0xffc` before an unmapped page under `qemu-sparc`. (`experiments/E02/FINDINGS.md`)
-- [ ] **E03 (LEON3/4 `UMUL`/`SDIV`/`Y` Register & `CASA` (`ASI 0x0a` vs `0x0b`))**: Verify 64-bit `Y:rs1` division, overflow flags, `LDSTUB`/`SWAP`, and `CASA` user/supervisor ASI semantics. (`experiments/E03/FINDINGS.md`)
-- [ ] **E04 (SPARC32 `ta 0x10` Syscall (`PSR.icc.C`), `pipe`, `clone` (`%o1=0/1`))**: Verify `ta 0x10` carry-bit error return, dual-return `pipe(42)`, and `fork`/`clone` child `%o1=1` convention. (`experiments/E04/FINDINGS.md`)
-- [ ] **E05 (SPARC32 `rt_signal_frame32` (348 B, `sparc_stackf` 96 B))**: Verify exact byte offsets of `sparc_stackf` (96 B), `pt_regs32` (80 B), and `rt_signal_frame32` (348 B). (`experiments/E05/FINDINGS.md`)
-- [ ] **E06 (SPARC V8 FPU (`%f0..%f31`, Even-Pair Doubles, `FSR.fcc`))**: Verify `FABSs`, `FADDd`, `FCMPd` -> `FSR.fcc`, and `FBfcc,a` branch semantics under `qemu-sparc`. (`experiments/E06/FINDINGS.md`)
-- [ ] **Gate `RC-E`**: All `experiments/E01..E06/FINDINGS.md` committed on `master` with target cross-compiler `sizeof`/`offsetof` and `qemu-sparc (with -cpu LEON3)` ground-truth verification.
+- [x] **E01 (`SAVE`/`RESTORE` 64-Byte Stack Spill/Fill & `_start` (`%sp + 64`))**: Verify `SAVE`/`RESTORE` 64-byte `rwindow_32` spill/fill at `[%sp + 0..60]` and initial `argc`/`argv` stack offset under `qemu-sparc`. (`experiments/E01/FINDINGS.md`)
+- [x] **E02 (Dual-PC `(pc, npc)` & `Bicc,a` / `BA,a` Annulled Delay Slots)**: Verify `Bicc,a` (annul when not taken) vs `BA,a` (always annul) including page-end `0xffc` before an unmapped page under `qemu-sparc`. (`experiments/E02/FINDINGS.md`)
+- [x] **E03 (LEON3/4 `UMUL`/`SDIV`/`Y` Register & `CASA` (`ASI 0x0a` vs `0x0b`))**: Verify 64-bit `Y:rs1` division, overflow flags, `LDSTUB`/`SWAP`, and `CASA` user/supervisor ASI semantics. (`experiments/E03/FINDINGS.md`)
+- [x] **E04 (SPARC32 `ta 0x10` Syscall (`PSR.icc.C`), `pipe`, `clone` (`%o1=0/1`))**: Verify `ta 0x10` carry-bit error return, dual-return `pipe(42)`, and `fork`/`clone` child `%o1=1` convention. (`experiments/E04/FINDINGS.md`)
+- [x] **E05 (SPARC32 `rt_signal_frame32` (348 B, `sparc_stackf` 96 B))**: Verify exact byte offsets of `sparc_stackf` (96 B), `pt_regs32` (80 B), and `rt_signal_frame32` (348 B). (`experiments/E05/FINDINGS.md`)
+- [x] **E06 (SPARC V8 FPU (`%f0..%f31`, Even-Pair Doubles, `FSR.fcc`))**: Verify `FABSs`, `FADDd`, `FCMPd` -> `FSR.fcc`, and `FBfcc,a` branch semantics under `qemu-sparc`. (`experiments/E06/FINDINGS.md`)
+- [x] **Gate `RC-E`**: All `experiments/E01..E06/FINDINGS.md` committed on `master` with target cross-compiler `sizeof`/`offsetof` and `qemu-sparc (with -cpu LEON3)` ground-truth verification.
 
 ### Phase 0 — Repository Scaffold, Frozen Headers & Substrate Copy (`RC0`)
 Read [`docs/lanes/phase-0.md`](docs/lanes/phase-0.md) and run lanes `L0a..L0b`:
-- [ ] **Lane `L0a`**: Copy and adapt `src/rt32/ from ../i686rt`, create `flake.nix`, `Makefile`, `src/sparc32rt.h`, and CLI entry (`--version`, `--help`, `--interp`, `--dbt`, `--difftest`, `--trace`).
+- [x] **Lane `L0a`**: Copy and adapt `src/rt32/ from ../i686rt`, create `flake.nix`, `Makefile`, `src/sparc32rt.h`, and CLI entry (`--version`, `--help`, `--interp`, `--dbt`, `--difftest`, `--trace`).
 - [ ] **Lane `L0b`**: Create `tests/check_abi_invariants.c` verifying all `sparc32_ctx_t`, `sigframe`, `ucontext`, and `stat` `sizeof`/`offsetof` invariants with `_Static_assert` and runtime checks.
 - [ ] **Gate `RC0`**: `_build/sparc32rt` builds cleanly as a static-PIE `aarch64-unknown-linux-musl` binary; `make check-line-limits` (`<= 900 LOC`) and `check_abi_invariants` pass.
 
