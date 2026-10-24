@@ -1,0 +1,27 @@
+# Oracle image for sparc32rt Phase E experiments:
+# SPARC cross toolchain (32-bit V8 via -m32) + qemu-sparc user-mode emulator.
+# Built once so every E01..E06 probe compiles and runs fast.
+# Usage:
+#   docker build -t sparc32rt-oracle -f tools/Dockerfile.oracle tools/
+#   docker run --rm -v "$PWD:/w" -w /w sparc32rt-oracle \
+#     sparc64-linux-gnu-gcc -m32 -nostdlib -static -o /tmp/probe experiments/E01/probe.S
+#   docker run --rm -v "$PWD:/w" -w /w sparc32rt-oracle \
+#     qemu-sparc -cpu LEON3 /tmp/probe
+FROM --platform=linux/amd64 debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends \
+      gcc-sparc64-linux-gnu \
+      gcc-12-multilib-sparc64-linux-gnu \
+      lib32gcc-12-dev-sparc64-cross \
+      qemu-user \
+      curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+# Authoritative SPARC syscall numbers + 32-bit signal frame implementation,
+# fetched once at image build time (Linux v6.6, matches qemu-sparc era ABI).
+RUN mkdir -p /oracle \
+ && curl -fsSL -o /oracle/syscall.tbl \
+      https://raw.githubusercontent.com/torvalds/linux/v6.6/arch/sparc/kernel/syscalls/syscall.tbl \
+ && curl -fsSL -o /oracle/signal_32.c \
+      https://raw.githubusercontent.com/torvalds/linux/v6.6/arch/sparc/kernel/signal_32.c
+RUN qemu-sparc --version | head -n 1; sparc64-linux-gnu-gcc --version | head -n 1
