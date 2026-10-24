@@ -59,6 +59,7 @@ long rt32_safe_syscall(long nr, long a0, long a1, long a2, long a3, long a4, lon
 /* ELF32 loader & initial stack (elf32.c, stack32.c) */
 typedef struct rt32_elf_info {
     uint32_t entry;
+    uint32_t app_entry;
     uint32_t phdr_vaddr;
     uint32_t phent;
     uint32_t phnum;

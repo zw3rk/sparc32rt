@@ -42,6 +42,7 @@
 #include "os/syscall_nr.h"
 #include "os/threads.h"
 #include "rt32/rt32.h"
+#include "rt32/procfs.h"
 
 /* Phase-2 static-libc layer (src/os/syscalls.c, lane L2a owns). Handlers
  * return host-style results (>= 0 value, negative host errno); the carry
@@ -711,6 +712,13 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         break;
     case (long)SPARC32__NR_openat:
         ret = sparc32_l2a_openat(ctx, o0, o1, o2, o3);
+        break;
+    /* Lane L5a /proc/self interception (src/rt32/procfs.c owns the logic). */
+    case (long)SPARC32__NR_readlink:
+        ret = rt32_procfs_readlink(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_readlinkat:
+        ret = rt32_procfs_readlinkat(ctx, o0, o1, o2, o3);
         break;
     case (long)SPARC32__NR_fcntl:
     case (long)SPARC32__NR_fcntl64: /* identical F_* command set on SPARC */
