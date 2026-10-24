@@ -26,10 +26,15 @@
  * treats exit/exit_group as terminal instead of resuming at pc.
  */
 
+/* Needs _GNU_SOURCE: prlimit(2) is hidden under strict -std=c11
+ * (and under the Makefile's Linux-only _POSIX_C_SOURCE=200809L). */
+#define _GNU_SOURCE
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -418,6 +423,146 @@ static long sys_uname(sparc32_ctx_t *ctx, uint32_t buf_va)
     return 0;
 }
 
+/* set_tid_address(166): records clear_child_tid (used at thread exit
+ * by Phase 4 clone/exit) and returns the caller's own tid, which musl
+ * stores as the main thread's tid. The kernel writes nothing to
+ * *tidptr here; the clear+wake happens at thread teardown. */
+static long sys_set_tid_address(sparc32_ctx_t *ctx, uint32_t tidptr_va)
+{
+    ctx->clear_child_tid = tidptr_va;
+    return (ctx->host_tid > 0) ? (long)ctx->host_tid : 1000L;
+}
+
+/* Big-endian guest word stores (guest is BE, host may be LE). */
+static int sys_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
+{
+    uint8_t *p;
+    if (guest_range_ok(va, 4U) != 0) {
+        return -EFAULT;
+    }
+    p = (uint8_t *)sparc32_guest_ptr(ctx, va);
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+    return 0;
+}
+
+#if defined(__linux__)
+/* 64-bit guest words: prlimit64-only (non-Linux builds stub that path). */
+static int sys_ld_be64(sparc32_ctx_t *ctx, uint32_t va, uint64_t *out)
+{
+    uint32_t hi;
+    uint32_t lo;
+    if (sys_ld_be32(ctx, va, &hi) != 0) {
+        return -EFAULT;
+    }
+    if (sys_ld_be32(ctx, va + 4U, &lo) != 0) {
+        return -EFAULT;
+    }
+    *out = ((uint64_t)hi << 32) | (uint64_t)lo;
+    return 0;
+}
+
+static int sys_st_be64(sparc32_ctx_t *ctx, uint32_t va, uint64_t v)
+{
+    if (sys_st_be32(ctx, va, (uint32_t)(v >> 32)) != 0) {
+        return -EFAULT;
+    }
+    return sys_st_be32(ctx, va + 4U, (uint32_t)v);
+}
+#endif
+
+/* L4c RLIMIT_AS + prlimit64/getrlimit mapping (oracle: qemu-sparc
+ * -cpu LEON3): getrlimit(144) reports cur=max=0x7fffffff (32-bit
+ * infinity); prlimit64(331) reports cur=max=0xffffffffffffffff
+ * (RLIM64_INFINITY); /proc/self/oom_score_adj reads "0\n" and accepts
+ * writes through the existing openat/read/write passthrough, so it
+ * needs no mapping (probed: read 2 B, write 3 B, both ok).
+ * Previously both traps fell into default -ENOSYS, which deviates
+ * from the oracle; hence this fix (case arms below).
+ * Placement note: these helpers live here as static sys_* functions
+ * (this file's own sys_rt_sigaction/sys_sigreturn/sys_uname pattern),
+ * not in src/os/syscalls.c — that TU sits at 899/900 lines and the
+ * hard `make check-line-limits` gate forbids any growth there. */
+
+/* 64-bit host limit -> 32-bit guest rlimit word: infinity and anything
+ * above the signed-32-bit range land on 0x7FFFFFFF (oracle shape). */
+static uint32_t rlim32_sat(uint64_t v)
+{
+    return (v >= 0x7FFFFFFFULL) ? 0x7FFFFFFFUL : (uint32_t)v;
+}
+
+static long sys_getrlimit(sparc32_ctx_t *ctx, uint32_t res, uint32_t buf_va)
+{
+    struct rlimit h;
+    if (guest_range_ok(buf_va, 8U) != 0) {
+        return -EFAULT;
+    }
+    if (getrlimit((int)res, &h) != 0) {
+        return -(long)errno;
+    }
+    if (sys_st_be32(ctx, buf_va, rlim32_sat((uint64_t)h.rlim_cur)) != 0) {
+        return -EFAULT;
+    }
+    if (sys_st_be32(ctx, buf_va + 4U, rlim32_sat((uint64_t)h.rlim_max)) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+static long sys_prlimit64(sparc32_ctx_t *ctx, uint32_t pid, uint32_t res,
+    uint32_t new_va, uint32_t old_va)
+{
+#if defined(__linux__)
+    struct rlimit newh;
+    struct rlimit oldh;
+    struct rlimit *newp = NULL;
+    struct rlimit *oldp = NULL;
+    uint64_t cur;
+    uint64_t max;
+    if (new_va != 0U) {
+        if (guest_range_ok(new_va, 16U) != 0) {
+            return -EFAULT;
+        }
+        if (sys_ld_be64(ctx, new_va, &cur) != 0) {
+            return -EFAULT;
+        }
+        if (sys_ld_be64(ctx, new_va + 8U, &max) != 0) {
+            return -EFAULT;
+        }
+        newh.rlim_cur = (rlim_t)cur;
+        newh.rlim_max = (rlim_t)max;
+        newp = &newh;
+    }
+    if (old_va != 0U) {
+        if (guest_range_ok(old_va, 16U) != 0) {
+            return -EFAULT;
+        }
+        oldp = &oldh;
+    }
+    if (prlimit((pid_t)(int32_t)pid, (int)res, newp, oldp) != 0) {
+        return -(long)errno;
+    }
+    if (old_va != 0U) {
+        if (sys_st_be64(ctx, old_va, (uint64_t)oldh.rlim_cur) != 0) {
+            return -EFAULT;
+        }
+        if (sys_st_be64(ctx, old_va + 8U, (uint64_t)oldh.rlim_max) != 0) {
+            return -EFAULT;
+        }
+    }
+    return 0;
+#else
+    (void)ctx;
+    (void)pid;
+    (void)res;
+    (void)new_va;
+    (void)old_va;
+    return -ENOSYS;
+#endif
+}
+
 int sparc32_syscall_is_exit(long nr)
 {
     return (nr == (long)SPARC32__NR_exit || nr == (long)SPARC32__NR_exit_group) ? 1 : 0;
@@ -585,6 +730,13 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         break;
     case (long)SPARC32__NR_futex:
         ret = sparc32_l2a_futex(ctx, o0, o1, o2, o3);
+        break;
+    /* Lane L4c rlimit hook (oracle: values above, was default -ENOSYS). */
+    case (long)SPARC32__NR_getrlimit:
+        ret = sys_getrlimit(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_prlimit64:
+        ret = sys_prlimit64(ctx, o0, o1, o2, o3);
         break;
     case (long)SPARC32__NR_rt_sigaction:
         ret = sys_rt_sigaction(ctx, o0, o1, o2, o3, o4);
