@@ -28,6 +28,11 @@ bool interp_ld_be(sparc32_ctx_t *ctx, uint32_t va, uint32_t len,
     uint32_t *out);
 bool interp_st_be(sparc32_ctx_t *ctx, uint32_t va, uint32_t len, uint32_t v);
 bool interp_spill_to(sparc32_ctx_t *ctx, uint32_t w, uint32_t va);
+
+/* Async safe-point poll (interp_signal.c, Phase 4): deliver the lowest
+ * unblocked pending signal with an installed handler; true when a
+ * delivery redirected pc (caller keeps running). */
+bool interp_poll_async(sparc32_ctx_t *ctx);
 bool interp_fill_from(sparc32_ctx_t *ctx, uint32_t w, uint32_t va);
 bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
     bool is_save);

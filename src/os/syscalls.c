@@ -35,6 +35,7 @@
 #include "sparc32rt.h"
 #include "os/sigframe_sparc32rt.h"
 #include "os/syscall_nr.h"
+#include "os/syscalls_min.h"
 
 /* SPARC open flags (arch/sparc fcntl.h); low 2 access bits match hosts. */
 #define SP_O_APPEND 0x0008U
@@ -70,9 +71,6 @@
 #define SP_FUTEX_WAIT 0U
 #define SP_FUTEX_WAKE 1U
 
-#define SP_SIG_BLOCK 0U
-#define SP_SIG_UNBLOCK 1U
-#define SP_SIG_SETMASK 2U
 
 #define SP_GRND_NONBLOCK 0x0001U
 #define SP_GRND_RANDOM 0x0002U
@@ -869,13 +867,14 @@ long sparc32_l2a_rt_sigprocmask(sparc32_ctx_t *ctx, uint32_t how,
         n0 = get_be32(p);
         n1 = get_be32(p + 4);
         switch (how) {
-        case SP_SIG_BLOCK: l2a_blocked[0] |= n0; l2a_blocked[1] |= n1; break;
-        case SP_SIG_UNBLOCK:
+        case SPARC_SIG_BLOCK: l2a_blocked[0] |= n0; l2a_blocked[1] |= n1; break;
+        case SPARC_SIG_UNBLOCK:
             l2a_blocked[0] &= ~n0; l2a_blocked[1] &= ~n1; break;
-        case SP_SIG_SETMASK: l2a_blocked[0] = n0; l2a_blocked[1] = n1; break;
+        case SPARC_SIG_SETMASK: l2a_blocked[0] = n0; l2a_blocked[1] = n1; break;
         default: return -EINVAL;
         }
-    } else if (how > SP_SIG_SETMASK) {
+    } else if (how != SPARC_SIG_BLOCK && how != SPARC_SIG_UNBLOCK &&
+        how != SPARC_SIG_SETMASK) {
         return -EINVAL;
     }
     return (oset_va != 0U) ? l2a_store(ctx, oset_va, old, sizeof(old)) : 0;
