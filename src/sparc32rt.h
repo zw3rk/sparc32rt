@@ -310,9 +310,12 @@ static inline uint32_t sparc32_ibtc_hash(uint32_t pc)
  */
 int vm32_attach(sparc32_ctx_t *ctx);
 void vm32_publish_page(uint32_t gva, uint32_t prot, uint32_t state);
+void vm32_page_revert_clean(uint32_t gva);
 void vm32_tlb_invalidate(uint32_t start, uint32_t len);
 void vm_file_note_mutation(uint64_t dev, uint64_t ino, int host_fd,
     uint64_t new_size);
+void vm_file_note_mapping(uint64_t dev, uint64_t ino, int host_fd,
+    uint32_t map_gva, uint32_t map_pages, uint64_t map_off);
 
 /*
  * Guest prot -> host prot for window mappings. Guest PROT_EXEC is never

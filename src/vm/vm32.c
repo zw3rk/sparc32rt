@@ -199,6 +199,29 @@ void vm32_publish_page(uint32_t gva, uint32_t prot, uint32_t state)
 }
 
 /*
+ * Revert one page to CLEAN after a file shrink (RC-U3-r4): pages fully
+ * beyond the new EOF must refill from the file on next fault instead of
+ * serving stale DIRTY bytes. Other state bits (CODE/RESERVATION) and
+ * the recorded protection are preserved. No TLB refresh here; callers
+ * invalidate the shrunk span once after walking it.
+ */
+void vm32_page_revert_clean(uint32_t gva)
+{
+    uint64_t vpn = (uint64_t)(gva / VM32_GUEST_PAGE);
+    uint8_t state;
+    if (!g_vm32_ready || vpn >= (uint64_t)VM32_PAGE_COUNT) {
+        return;
+    }
+    state = g_vm32_state[vpn];
+    if ((state & (uint8_t)RT_PAGE_COW_DIRTY) == 0u) {
+        return;
+    }
+    state &= (uint8_t)~RT_PAGE_COW_DIRTY;
+    state |= (uint8_t)RT_PAGE_COW_CLEAN;
+    g_vm32_state[vpn] = state;
+}
+
+/*
  * Soft-TLB miss helper (shared per-block trampoline target, section
  * 4.3.3): validates [gva, gva+width) against the published tables,
  * refreshes the calling thread's entry, and returns the canonical HVA.

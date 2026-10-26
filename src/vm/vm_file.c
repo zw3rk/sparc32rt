@@ -66,6 +66,13 @@ typedef struct {
     _Atomic uint64_t code_generation;
     int host_fd;
     bool live;
+    /* Canonical mapping range for shrink enforcement (RC-U3-r4): the
+     * gva span and file offset of the latest mapping of this inode, so
+     * vm_file_note_mutation can revert and invalidate exactly the pages
+     * that fall beyond a shrunk EOF. */
+    uint32_t map_gva;
+    uint32_t map_pages;
+    uint64_t map_off;
 } vm_inode_shared_t;
 
 static vm_inode_shared_t g_inodes[VMF_MAX_INODES];
@@ -143,6 +150,20 @@ uint32_t vm_file_apply_shrink(vm_file_page_t *pages, uint32_t page_count,
  * inode resize/code-generation clocks only after the host call succeeds
  * (section 4.5 Step 3 -> Step 4). new_size == UINT64_MAX keeps size.
  */
+/* Record the canonical mapping range of an inode (called at mmap). */
+void vm_file_note_mapping(uint64_t dev, uint64_t ino, int host_fd,
+    uint32_t map_gva, uint32_t map_pages, uint64_t map_off)
+{
+    vm_inode_shared_t *e = vmf_intern(vmf_key(dev, ino), host_fd);
+
+    if (e == NULL) {
+        return;
+    }
+    e->map_gva = map_gva;
+    e->map_pages = map_pages;
+    e->map_off = map_off;
+}
+
 void vm_file_note_mutation(uint64_t dev, uint64_t ino, int host_fd,
     uint64_t new_size)
 {
@@ -156,6 +177,29 @@ void vm_file_note_mutation(uint64_t dev, uint64_t ino, int host_fd,
         atomic_store_explicit(&e->file_size, new_size,
             memory_order_relaxed);
         if (new_size < old) {
+            /* Shrink: revert pages fully beyond the new EOF to CLEAN
+             * (refill from the file on next fault) and drop their
+             * Soft-TLB tags so no stale DIRTY bytes survive. This is
+             * the shrink-helper enforcement for the regime page table
+             * (RC-U3-r4); the dense-table vm_file_apply_shrink covers
+             * the same transition once a page table is attached. */
+            uint64_t map_lo = e->map_off;
+            uint64_t map_hi = map_lo + (uint64_t)e->map_pages * 4096ULL;
+            uint64_t lo = (new_size > map_lo) ? new_size : map_lo;
+            uint64_t hi = (old < map_hi) ? old : map_hi;
+            if (hi > lo && e->map_pages != 0u) {
+                uint64_t f;
+                uint32_t glo = e->map_gva + (uint32_t)(lo - map_lo);
+                uint32_t ghi = e->map_gva + (uint32_t)(hi - map_lo);
+                glo &= ~(uint32_t)4095U;
+                ghi = (ghi + 4095U) & ~(uint32_t)4095U;
+                for (f = glo; f < ghi; f += 4096U) {
+                    vm32_page_revert_clean((uint32_t)f);
+                }
+                if (ghi > glo) {
+                    vm32_tlb_invalidate(glo, ghi - glo);
+                }
+            }
             atomic_store_explicit(&e->min_shrunk, new_size,
                 memory_order_relaxed);
         }
