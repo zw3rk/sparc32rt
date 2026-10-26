@@ -47,10 +47,16 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
         return false;
     }
     addr = ctx->fault_addr;
-    for (k = 0; k < ctx->region_count; k++) {
-        if (addr >= ctx->regions[k].start && addr < ctx->regions[k].end) {
-            code = 2U;
-            break;
+    if (signo == 10) {
+        /* BUS_ADRALN: an alignment fault reports code 1 even when the
+         * address is mapped; ADRERR (2) is a SIGSEGV-class code. */
+        code = 1U;
+    } else {
+        for (k = 0; k < ctx->region_count; k++) {
+            if (addr >= ctx->regions[k].start && addr < ctx->regions[k].end) {
+                code = 2U;
+                break;
+            }
         }
     }
     frame = (ctx->r[SPARC32_SP] - SPARC32_RT_SIGFRAME_SIZE) & ~15U;

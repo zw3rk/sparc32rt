@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -41,6 +42,21 @@
 #endif
 
 #include "os/backend.h"
+#include "sparc32rt.h"
+
+/* Publish a post-mutation size into the Provider-A family table so
+ * truncate/write/pwrite paths keep shrink-then-regrow and the code
+ * generation clock coherent (RC-U3-r3 #4). Best effort: a failed fstat
+ * never fails the completed host call. */
+static void backend_note_file_size(int fd)
+{
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        return;
+    }
+    vm_file_note_mutation((uint64_t)st.st_dev, (uint64_t)st.st_ino, fd,
+        (uint64_t)st.st_size);
+}
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -343,6 +359,9 @@ int64_t rt_host_write(int fd, const void *buf, size_t count,
     (void)ws;
     (void)expected_seq;
     rc = write(fd, buf, count);
+    if (rc >= 0) {
+        backend_note_file_size(fd);
+    }
     return (rc < 0) ? -errno : (int64_t)rc;
 }
 
@@ -356,6 +375,9 @@ int64_t rt_host_pwrite64(int fd, const void *buf, size_t count,
     int64_t offset)
 {
     ssize_t rc = pwrite(fd, buf, count, (off_t)offset);
+    if (rc >= 0) {
+        backend_note_file_size(fd);
+    }
     return (rc < 0) ? -errno : (int64_t)rc;
 }
 
@@ -376,6 +398,9 @@ int64_t rt_host_writev(int fd, const struct iovec *iov, int iovcnt,
     (void)ws;
     (void)expected_seq;
     rc = writev(fd, iov, iovcnt);
+    if (rc >= 0) {
+        backend_note_file_size(fd);
+    }
     return (rc < 0) ? -errno : (int64_t)rc;
 }
 
@@ -387,7 +412,11 @@ int64_t rt_host_lseek(int fd, int64_t offset, int linux_whence)
 
 int64_t rt_host_ftruncate(int fd, int64_t length)
 {
-    return (ftruncate(fd, (off_t)length) == 0) ? 0 : -errno;
+    if (ftruncate(fd, (off_t)length) != 0) {
+        return -errno;
+    }
+    backend_note_file_size(fd);
+    return 0;
 }
 
 int64_t rt_host_fsync(int fd, int datasync_only)

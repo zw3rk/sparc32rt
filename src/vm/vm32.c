@@ -243,6 +243,15 @@ void *vm_tlb_miss_helper(sparc32_ctx_t *ctx, uint32_t gva, uint32_t width,
         ctx->fault_addr = gva;
         return NULL;
     }
+    if (is_store && (state & RT_PAGE_COW_CLEAN) != 0U &&
+        (prot & 2u) != 0u &&
+        (state & (RT_PAGE_HAS_CODE | RT_PAGE_HAS_SW_RESERVATION)) == 0u) {
+        /* First write to a clean COW page: promote in place so this
+         * very miss succeeds without a second fault. HVA is unchanged. */
+        state = (uint8_t)((state & (uint8_t)~RT_PAGE_COW_CLEAN) |
+            (uint8_t)RT_PAGE_COW_DIRTY);
+        g_vm32_state[vpn] = state;
+    }
     if (is_store && !rt_write_tag_allowed((uint32_t)state, (uint32_t)prot)) {
         ctx->exit_reason = SPARC32_EXIT_FAULT;
         ctx->fault_addr = gva;

@@ -60,7 +60,7 @@ static void vm_mmap_note_file(int host_fd)
         return;
     }
     vm_file_note_mutation((uint64_t)st.st_dev, (uint64_t)st.st_ino,
-        host_fd, UINT64_MAX);
+        host_fd, (uint64_t)st.st_size);
 }
 
 static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
