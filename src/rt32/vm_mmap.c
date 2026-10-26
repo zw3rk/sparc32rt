@@ -13,12 +13,55 @@
 #define _GNU_SOURCE
 #include "vm_int.h"
 
+#include "dbt/aot/mem_site.h"
 #include "os/backend.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+
+/* Ensure the Regime VM observes the rt32 window (RC-U3-r2 #4):
+ * vm32_attach is idempotent, so mapping operations call it
+ * unconditionally before publishing. */
+static void vm_mmap_ensure_regime(sparc32_ctx_t *ctx)
+{
+    if (ctx != NULL) {
+        (void)vm32_attach(ctx);
+    }
+}
+
+/* Publish one mapping commit to the Regime VM (RC-U3-r2 #4): per-page
+ * guest protection for the Soft-TLB miss helper, plus a TLB generation
+ * bump over the range so stale A2 tags cannot survive a remap. */
+static void vm_mmap_publish(sparc32_ctx_t *ctx, uint32_t start, uint32_t end,
+    uint32_t prot)
+{
+    uint32_t va;
+    if (ctx == NULL || end <= start) {
+        return;
+    }
+    for (va = start; va < end; va += SPARC32_PAGE_SIZE) {
+        vm32_publish_page(va, prot & 0x7U, 0U);
+    }
+    vm32_tlb_invalidate(start, end - start);
+}
+
+/* Record a file-backed mapping in the Provider-A family table (RC-U3-r2
+ * #4): fstat the host fd for its (dev, ino) identity so later
+ * truncate/write hooks can match the mapping. Size is kept (UINT64_MAX)
+ * here; only identity registration and the code-generation clock move. */
+static void vm_mmap_note_file(int host_fd)
+{
+    struct stat st;
+    if (host_fd < 0 || fstat(host_fd, &st) != 0) {
+        return;
+    }
+    vm_file_note_mutation((uint64_t)st.st_dev, (uint64_t)st.st_ino,
+        host_fd, UINT64_MAX);
+}
 
 static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
                                 uint32_t flags, int fd, uint32_t pgoffset)
@@ -99,6 +142,16 @@ static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
         }
     }
 
+    /* Regime VM + Provider-A lifecycle (RC-U3-r2 #4): attach, publish
+     * the committed protection, drop stale Soft-TLB tags, and register
+     * file-backed ranges by inode identity. */
+    vm_mmap_ensure_regime(ctx);
+    vm_mmap_publish(ctx, target_va,
+        (uint32_t)((uint64_t)target_va + aligned_len), prot);
+    if ((host_flags & MAP_ANONYMOUS) == 0) {
+        vm_mmap_note_file(fd);
+    }
+
     if (update_cursor) {
         g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + aligned_len);
     }
@@ -158,6 +211,10 @@ static int vm_mprotect_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         }
     }
 
+    /* Regime VM lifecycle (RC-U3-r2 #4): publish the committed
+     * protection and drop stale Soft-TLB tags over the range. */
+    vm_mmap_ensure_regime(ctx);
+    vm_mmap_publish(ctx, addr, (uint32_t)end64, prot);
     vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
     return 0;
 }
@@ -204,6 +261,10 @@ int vm_munmap_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len)
     if (rc != 0) {
         return rc;
     }
+    /* Regime VM lifecycle (RC-U3-r2 #4): the range is PROT_NONE now;
+     * publish that and drop its Soft-TLB tags. */
+    vm_mmap_ensure_regime(ctx);
+    vm_mmap_publish(ctx, start, (uint32_t)((uint64_t)start + aligned_len), 0U);
 
     end = (uint32_t)((uint64_t)start + aligned_len);
     vm_unmap_regions_pub(start, end);

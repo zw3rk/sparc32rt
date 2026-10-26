@@ -215,6 +215,13 @@ typedef struct sparc32_ctx {
     /* Signal-frame anchor, per thread (fork/exec reset in Phase 4). */
     uint32_t sig_last_frame_va; /* 0 = none pending */
     uint32_t sig_last_frame_rt;
+
+    /* JMPL delay-slot recovery (RC-U3-r2 #3): the DBT-emitted JMPL
+     * sequence records its computed dynamic target here before running
+     * the delay slot; delay-slot fault recovery reads this per-context
+     * field (never the aot_sites.c global table, whose entries can be
+     * evicted by other live contexts). */
+    uint32_t jmpl_target;
 } sparc32_ctx_t;
 
 /* ABI-locked offsets (Phase 2 trampoline + a64 emitter must agree). */
@@ -295,6 +302,17 @@ static inline uint32_t sparc32_ibtc_hash(uint32_t pc)
 {
     return (pc >> 2U) & (SPARC32_IBTC_SIZE - 1U);
 }
+
+/*
+ * Regime VM + Provider-A runtime hooks (RC-U3-r2 #4: defined in
+ * src/vm/vm32.c and src/vm/vm_file.c; wired into the runtime VM
+ * lifecycle from src/main.c and src/rt32/vm_mmap.c).
+ */
+int vm32_attach(sparc32_ctx_t *ctx);
+void vm32_publish_page(uint32_t gva, uint32_t prot, uint32_t state);
+void vm32_tlb_invalidate(uint32_t start, uint32_t len);
+void vm_file_note_mutation(uint64_t dev, uint64_t ino, int host_fd,
+    uint64_t new_size);
 
 /*
  * Guest prot -> host prot for window mappings. Guest PROT_EXEC is never

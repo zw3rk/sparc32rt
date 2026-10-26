@@ -44,6 +44,14 @@ else
 U3_BACKEND_SRC := src/os/backend_linux.c
 endif
 U3_OS_SRCS := $(filter-out src/os/backend_linux.c src/os/backend_darwin.c,$(wildcard src/os/*.c)) $(U3_BACKEND_SRC)
+# Mach-O has no static-PIE mode: when the selected CC targets darwin,
+# drop the Linux-only -static-pie. An explicit LDFLAGS from the
+# environment or command line still wins (only the default is cleared).
+ifeq ($(origin LDFLAGS),file)
+  ifeq ($(findstring darwin,$(shell $(U3_PROBE_CC) -dumpmachine 2>/dev/null)),darwin)
+    LDFLAGS :=
+  endif
+endif
 SRCS_C := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) \
           $(U3_OS_SRCS) $(wildcard src/dbt/*.c) \
           $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c)

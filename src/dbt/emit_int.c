@@ -609,8 +609,9 @@ int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
      * helper calls) cannot clobber it. */
     e_ea_into(b, EKEEP, d);
     /* Publish the dynamic target before the delay slot so fault recovery
-     * can resolve RT_NPC_DYNAMIC_CTX via aot_delay_target_get (Rev 4
-     * 4.3.3). EKEEP (w22) is callee-saved, so the call keeps it. */
+     * can resolve RT_NPC_DYNAMIC_CTX from the per-context ctx->jmpl_target
+     * (Rev 4 4.3.3, RC-U3-r2 #3). EKEEP (w22) is callee-saved, so the
+     * call keeps it. */
     e_arg_ctx(b);
     a64_emit_mov_w(b, 1u, EKEEP);
     e_call_prologue(b, (uint64_t)(uintptr_t)&dbt_jmpl_record_target);

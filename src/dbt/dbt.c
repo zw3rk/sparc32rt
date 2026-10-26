@@ -525,17 +525,24 @@ void dbt_patch_chain(sparc32_ctx_t *ctx, const dbt_block_t *from,
     ctx->last_exec_entry = (void *)to->host_code;
 }
 
-/* ---- JMPL delay-slot fault recovery (Rev 4 4.3.3) ----
+/* ---- JMPL delay-slot fault recovery (Rev 4 4.3.3, RC-U3-r2 #3) ----
  * Emitted JMPL code calls dbt_jmpl_record_target before the delay slot;
- * a stop inside the slot then resolves npc from aot_delay_target_get
- * instead of dest + 4, matching interp_cti. The arm is per-execution
- * (reset on block entry), so a stale table entry from an earlier JMPL
- * can never leak into an unrelated stop. */
+ * a stop inside the slot then resolves npc from the per-context
+ * ctx->jmpl_target instead of dest + 4, matching interp_cti. The target
+ * lives on the context (not in the aot_sites.c global table, whose
+ * 64 entries can be evicted by other live contexts); the table write is
+ * retained only as metadata for static-site consumers. The arm is
+ * per-execution (reset on block entry), so a stale target from an
+ * earlier JMPL can never leak into an unrelated stop. */
 
 static _Thread_local bool t_jmpl_delay_armed;
 
 void dbt_jmpl_record_target(sparc32_ctx_t *ctx, uint32_t target)
 {
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->jmpl_target = target;
     aot_delay_target_set(ctx, target);
     t_jmpl_delay_armed = true;
 }
@@ -561,10 +568,9 @@ static void dbt_commit(sparc32_ctx_t *ctx)
     case SPARC32_EXIT_FAULT:
         ctx->pc = dest;
         /* JMPL delay-slot stop (emitted fault_pc is the delay address):
-         * npc is the recorded transfer target; any other stop resumes
-         * at dest + 4. */
-        ctx->npc = t_jmpl_delay_armed ? aot_delay_target_get(ctx) :
-            dest + 4U;
+         * npc is the per-context recorded transfer target; any other
+         * stop resumes at dest + 4. */
+        ctx->npc = t_jmpl_delay_armed ? ctx->jmpl_target : dest + 4U;
         break;
     case SPARC32_EXIT_SYSCALL:
         ctx->pc = dest - 4U;

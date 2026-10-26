@@ -189,8 +189,9 @@ int rt_host_preempt_worker_darwin(uint64_t host_tid)
 /* Unsuffixed canonical backend exports (backend.h, Rev 4 section 6).
  * The tree calls rt_host_*; the _darwin bodies above stay the single
  * implementation. Only the symbols the tree references are exported
- * here (window reservation for the Regime VM, entropy for the syscall
- * hook); the rest of backend.h stays header-first for a later lane. */
+ * here (window reservation + file mapping + protection for the Regime
+ * VM and the mmap engine, entropy for the syscall hook); the rest of
+ * backend.h stays header-first for a later lane. */
 
 size_t rt_host_page_size(void)
 {
@@ -252,6 +253,99 @@ int rt_host_unmap(void *host_addr, size_t len)
 #else
     (void)host_addr;
     (void)len;
+    return -ENOSYS;
+#endif
+}
+
+/*
+ * File-backed host mapping for src/rt32/vm_mmap.c (RC-U3-r2 #4: the same
+ * unsuffixed name the Linux backend exports, so the Darwin link closes).
+ * PROT translation mirrors rt_host_map_anon above: PROT_EXEC never
+ * becomes host-exec (W^X; guest data pages stay data, JIT code lives in
+ * its own MAP_JIT arena). The caller guarantees a host-page-aligned
+ * file offset; anything else fails instead of silently rounding.
+ */
+int rt_host_map_file(void *hint_addr, size_t len, int linux_prot, int shared,
+    int fixed, int host_fd, uint64_t aligned_file_offset,
+    void **out_host_addr)
+{
+#if defined(__APPLE__)
+    long host_page = sysconf(_SC_PAGESIZE);
+    int prot = 0;
+    int flags = (shared != 0) ? MAP_SHARED : MAP_PRIVATE;
+    void *p;
+    if (out_host_addr == NULL || len == 0u || host_fd < 0) {
+        return -EINVAL;
+    }
+    if (host_page <= 0 ||
+        (aligned_file_offset % (uint64_t)host_page) != 0u) {
+        return -EINVAL;
+    }
+    if ((linux_prot & 1) != 0) {
+        prot |= PROT_READ;
+    }
+    if ((linux_prot & 2) != 0) {
+        prot |= PROT_WRITE;
+    }
+    if ((linux_prot & 4) != 0) {
+        prot |= PROT_READ;
+    }
+    if (fixed != 0) {
+        flags |= MAP_FIXED;
+    }
+    p = mmap(hint_addr, len, prot, flags, host_fd,
+        (off_t)aligned_file_offset);
+    if (p == MAP_FAILED) {
+        return -errno;
+    }
+    *out_host_addr = p;
+    return 0;
+#else
+    (void)hint_addr;
+    (void)len;
+    (void)linux_prot;
+    (void)shared;
+    (void)fixed;
+    (void)host_fd;
+    (void)aligned_file_offset;
+    (void)out_host_addr;
+    return -ENOSYS;
+#endif
+}
+
+/*
+ * Host protection change for src/rt32/vm_mmap.c (RC-U3-r2 #4: unsuffixed
+ * name matching the Linux backend). Same PROT translation as the map
+ * primitives above (no host-exec). The caller passes page-aligned
+ * address/length; anything else fails.
+ */
+int rt_host_protect(void *host_addr, size_t len, int linux_prot)
+{
+#if defined(__APPLE__)
+    long host_page = sysconf(_SC_PAGESIZE);
+    int prot = 0;
+    if (host_addr == NULL || len == 0u || host_page <= 0 ||
+        ((uintptr_t)host_addr % (uintptr_t)host_page) != 0u ||
+        (len % (size_t)host_page) != 0u) {
+        return -EINVAL;
+    }
+    if ((linux_prot & 1) != 0) {
+        prot |= PROT_READ;
+    }
+    if ((linux_prot & 2) != 0) {
+        prot |= PROT_WRITE;
+    }
+    if ((linux_prot & 4) != 0) {
+        prot |= PROT_READ;
+    }
+    if (mprotect(host_addr, len, prot) != 0) {
+        return -errno;
+    }
+    return 0;
+#else
+    (void)host_addr;
+    (void)len;
+    (void)linux_prot;
     return -ENOSYS;
 #endif
 }
