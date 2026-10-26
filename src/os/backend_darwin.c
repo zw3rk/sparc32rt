@@ -37,6 +37,7 @@
 
 #if defined(__APPLE__)
 #include <sys/event.h>
+#include <sys/random.h>
 #include <sys/time.h>
 #endif
 
@@ -181,6 +182,105 @@ int rt_host_preempt_worker_darwin(uint64_t host_tid)
     return 0;
 #else
     (void)host_tid;
+    return -ENOSYS;
+#endif
+}
+
+/* Unsuffixed canonical backend exports (backend.h, Rev 4 section 6).
+ * The tree calls rt_host_*; the _darwin bodies above stay the single
+ * implementation. Only the symbols the tree references are exported
+ * here (window reservation for the Regime VM, entropy for the syscall
+ * hook); the rest of backend.h stays header-first for a later lane. */
+
+size_t rt_host_page_size(void)
+{
+    return rt_host_page_size_darwin();
+}
+
+int rt_host_map_anon(void *hint_addr, size_t len, int linux_prot,
+    int fixed, int noreplace, void **out_host_addr)
+{
+#if defined(__APPLE__)
+    int prot = 0;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    void *p;
+    if (out_host_addr == NULL || len == 0u) {
+        return -EINVAL;
+    }
+    if ((linux_prot & 1) != 0) {
+        prot |= PROT_READ;
+    }
+    if ((linux_prot & 2) != 0) {
+        prot |= PROT_WRITE;
+    }
+    if ((linux_prot & 4) != 0) {
+        prot |= PROT_READ;
+    }
+    if (fixed != 0) {
+        flags |= MAP_FIXED;
+    }
+    p = mmap(hint_addr, len, prot, flags, -1, 0);
+    if (p == MAP_FAILED) {
+        return -errno;
+    }
+    if (noreplace != 0 && fixed == 0 && hint_addr != NULL && p != hint_addr) {
+        /* No MAP_FIXED_NOREPLACE on Mach-O: keep the mapping only when
+         * the kernel honoured the hint. */
+        (void)munmap(p, len);
+        return -EEXIST;
+    }
+    *out_host_addr = p;
+    return 0;
+#else
+    (void)hint_addr;
+    (void)len;
+    (void)linux_prot;
+    (void)fixed;
+    (void)noreplace;
+    (void)out_host_addr;
+    return -ENOSYS;
+#endif
+}
+
+int rt_host_unmap(void *host_addr, size_t len)
+{
+#if defined(__APPLE__)
+    if (munmap(host_addr, len) != 0) {
+        return -errno;
+    }
+    return 0;
+#else
+    (void)host_addr;
+    (void)len;
+    return -ENOSYS;
+#endif
+}
+
+/* Host entropy: getentropy(2) caps one call at 256 bytes and takes no
+ * flags (always non-blocking); drain in chunks. */
+int64_t rt_host_getrandom(void *buf, size_t buflen, unsigned int flags)
+{
+#if defined(__APPLE__)
+    size_t done = 0u;
+    (void)flags;
+    if (buf == NULL) {
+        return -EINVAL;
+    }
+    while (done < buflen) {
+        size_t step = buflen - done;
+        if (step > 256u) {
+            step = 256u;
+        }
+        if (getentropy((char *)buf + done, step) != 0) {
+            return -errno;
+        }
+        done += step;
+    }
+    return (int64_t)buflen;
+#else
+    (void)buf;
+    (void)buflen;
+    (void)flags;
     return -ENOSYS;
 #endif
 }

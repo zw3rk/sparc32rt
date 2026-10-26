@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "sparc32rt.h"
+#include "os/backend.h"
 #include "os/l2a_access.h"
 
 #define SP_CLOCK_REALTIME 0U
@@ -143,8 +144,7 @@ long sparc32_l2a_clock_gettime(sparc32_ctx_t *ctx, uint32_t clk_id,
 long sparc32_l2a_getrandom(sparc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
     uint32_t flags)
 {
-#if defined(__linux__) && defined(SYS_getrandom)
-    long rc;
+    int64_t rc;
     if ((flags & ~(SP_GRND_NONBLOCK | SP_GRND_RANDOM | SP_GRND_INSECURE)) !=
         0U) {
         return -EINVAL;
@@ -155,11 +155,10 @@ long sparc32_l2a_getrandom(sparc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
     if (len == 0U) {
         return 0;
     }
-    rc = syscall(SYS_getrandom, sparc32_guest_ptr(ctx, buf_va), (size_t)len,
+    /* Host entropy through the backend hook (Rev 4 section 6): Linux
+     * forwards flags to getrandom(2); Darwin drains getentropy(2). The
+     * hook returns -errno on failure, bytes filled on success. */
+    rc = rt_host_getrandom(sparc32_guest_ptr(ctx, buf_va), (size_t)len,
         (unsigned int)flags);
-    return (rc < 0) ? -(long)errno : rc;
-#else
-    (void)ctx; (void)buf_va; (void)len; (void)flags;
-    return -ENOSYS;
-#endif
+    return (long)rc;
 }

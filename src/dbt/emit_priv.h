@@ -43,6 +43,8 @@
 #include <string.h>
 
 #include "sparc32rt.h"
+#include "dbt/aot/aot_atomic.h"
+#include "dbt/aot/mem_site.h"
 #include "interp/decode.h"
 #include "interp/interp_priv.h"
 
@@ -328,35 +330,24 @@ static uint32_t sparc32_rt_mem(sparc32_ctx_t *ctx, uint32_t va, uint32_t op3,
 
     ctx->exit_reason = SPARC32_EXIT_NONE;
     if (op3 == 0x3Cu) { /* CASA: match swaps, rd always gets old mem. */
-        uint32_t cmp = ctx->r[rs2 & 31u];
-        uint32_t old_rd = ctx->r[rd & 31u];
-        uint32_t mem;
-
         if (rt_asi_ok(asi) == 0) {
             return rt_trap(ctx, 0x03u, va);
         }
-        if (!interp_ld_be(ctx, va, 4u, &mem)) {
-            return ctx->exit_reason;
-        }
-        interp_wreg(ctx, rd, mem);
-        if (mem == cmp && !interp_st_be(ctx, va, 4u, old_rd)) {
+        /* SEQ_CST RMW on the canonical HVA (Rev 4 4.4): never a load
+         * + store pair, which loses a racing concurrent writer. */
+        if (!sparc32_atomic_casa(ctx, va, rs2, rd)) {
             return ctx->exit_reason;
         }
         return SPARC32_EXIT_NONE;
     }
     if (op3 == 0x0Fu || op3 == 0x1Fu) { /* SWAP/SWAPA */
-        uint32_t old_rd = ctx->r[rd & 31u];
-
         if (((op3 & 0x10u) != 0u) && rt_asi_ok(asi) == 0) {
             return rt_trap(ctx, 0x03u, va);
         }
-        if (!interp_ld_be(ctx, va, 4u, &v)) {
+        /* SEQ_CST exchange on the canonical HVA (Rev 4 4.4). */
+        if (!sparc32_atomic_swap(ctx, va, rd)) {
             return ctx->exit_reason;
         }
-        if (!interp_st_be(ctx, va, 4u, old_rd)) {
-            return ctx->exit_reason;
-        }
-        interp_wreg(ctx, rd, v);
         return SPARC32_EXIT_NONE;
     }
     if ((base & 0x10u) != 0u) {
@@ -385,16 +376,31 @@ static uint32_t sparc32_rt_mem(sparc32_ctx_t *ctx, uint32_t va, uint32_t op3,
         }
         interp_wreg(ctx, rd, v);
         return SPARC32_EXIT_NONE;
-    case 0x03U: /* LDD: even rd only (decoder guarantees). */
-        if (!interp_ld_be(ctx, va, 4u, &v)) {
+    case 0x03U: { /* LDD: even rd only (decoder guarantees). */
+        /* 8-byte alignment (addr & 7 faults, oracle SIGBUS).
+         * Validate-then-commit: span check first, then read both words
+         * before either rd commits (no partial LDD on second-word
+         * fault). */
+        uint32_t hi;
+        uint32_t lo;
+        if ((va & 7U) != 0U) {
+            ctx->exit_reason = SPARC32_EXIT_FAULT;
+            ctx->fault_addr = va;
             return ctx->exit_reason;
         }
-        interp_wreg(ctx, rd, v);
-        if (!interp_ld_be(ctx, va + 4u, 4u, &v)) {
+        if (!aot_span_ok(ctx, va, false)) {
             return ctx->exit_reason;
         }
-        interp_wreg(ctx, rd + 1u, v);
+        if (!interp_ld_be(ctx, va, 4u, &hi)) {
+            return ctx->exit_reason;
+        }
+        if (!interp_ld_be(ctx, va + 4u, 4u, &lo)) {
+            return ctx->exit_reason;
+        }
+        interp_wreg(ctx, rd, hi);
+        interp_wreg(ctx, rd + 1u, lo);
         return SPARC32_EXIT_NONE;
+    }
     case 0x04U: /* STW */
         if (!interp_st_be(ctx, va, 4u, ctx->r[rd & 31u])) {
             return ctx->exit_reason;
@@ -411,6 +417,17 @@ static uint32_t sparc32_rt_mem(sparc32_ctx_t *ctx, uint32_t va, uint32_t op3,
         }
         return SPARC32_EXIT_NONE;
     case 0x07U: /* STD: even rd only (decoder guarantees). */
+        /* 8-byte alignment (addr & 7 faults, oracle SIGBUS).
+         * Validate-then-commit: span check first, so no byte is stored
+         * on a second-word fault. */
+        if ((va & 7U) != 0U) {
+            ctx->exit_reason = SPARC32_EXIT_FAULT;
+            ctx->fault_addr = va;
+            return ctx->exit_reason;
+        }
+        if (!aot_span_ok(ctx, va, true)) {
+            return ctx->exit_reason;
+        }
         if (!interp_st_be(ctx, va, 4u, ctx->r[rd & 31u])) {
             return ctx->exit_reason;
         }
@@ -432,14 +449,10 @@ static uint32_t sparc32_rt_mem(sparc32_ctx_t *ctx, uint32_t va, uint32_t op3,
         v &= 0xFFFFu;
         interp_wreg(ctx, rd, ((v & 0x8000u) != 0u) ? v | 0xFFFF0000u : v);
         return SPARC32_EXIT_NONE;
-    case 0x0DU: /* LDSTUB: old byte to rd, 0xFF to memory. */
-        if (!interp_ld_be(ctx, va, 1u, &v)) {
+    case 0x0DU: /* LDSTUB: SEQ_CST byte exchange (Rev 4 4.4). */
+        if (!sparc32_atomic_ldstub(ctx, va, rd)) {
             return ctx->exit_reason;
         }
-        if (!interp_st_be(ctx, va, 1u, 0xFFu)) {
-            return ctx->exit_reason;
-        }
-        interp_wreg(ctx, rd, v);
         return SPARC32_EXIT_NONE;
     default:
         break;

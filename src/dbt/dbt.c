@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "sparc32rt.h"
+#include "dbt/aot/mem_site.h"
 #include "dbt/dbt.h"
 #include "dbt/emit_int.h"
 #include "interp/decode.h"
@@ -524,6 +525,21 @@ void dbt_patch_chain(sparc32_ctx_t *ctx, const dbt_block_t *from,
     ctx->last_exec_entry = (void *)to->host_code;
 }
 
+/* ---- JMPL delay-slot fault recovery (Rev 4 4.3.3) ----
+ * Emitted JMPL code calls dbt_jmpl_record_target before the delay slot;
+ * a stop inside the slot then resolves npc from aot_delay_target_get
+ * instead of dest + 4, matching interp_cti. The arm is per-execution
+ * (reset on block entry), so a stale table entry from an earlier JMPL
+ * can never leak into an unrelated stop. */
+
+static _Thread_local bool t_jmpl_delay_armed;
+
+void dbt_jmpl_record_target(sparc32_ctx_t *ctx, uint32_t target)
+{
+    aot_delay_target_set(ctx, target);
+    t_jmpl_delay_armed = true;
+}
+
 /* ---- Exit commit: w15/w16 -> pc/npc ----
  * The trampoline stored w16 to exit_reason and w15 to exit_dest. Fix up
  * pc/npc to the interp-visible state for each reason: BRANCH/TRAP/FAULT
@@ -536,12 +552,19 @@ static void dbt_commit(sparc32_ctx_t *ctx)
     uint32_t dest = ctx->exit_dest;
     switch (reason) {
     case SPARC32_EXIT_BRANCH:
-    case SPARC32_EXIT_TRAP:
-    case SPARC32_EXIT_FAULT:
     case SPARC32_EXIT_UNDEF:
     case SPARC32_EXIT_SINGLE_STEP:
         ctx->pc = dest;
         ctx->npc = dest + 4U;
+        break;
+    case SPARC32_EXIT_TRAP:
+    case SPARC32_EXIT_FAULT:
+        ctx->pc = dest;
+        /* JMPL delay-slot stop (emitted fault_pc is the delay address):
+         * npc is the recorded transfer target; any other stop resumes
+         * at dest + 4. */
+        ctx->npc = t_jmpl_delay_armed ? aot_delay_target_get(ctx) :
+            dest + 4U;
         break;
     case SPARC32_EXIT_SYSCALL:
         ctx->pc = dest - 4U;
@@ -604,6 +627,9 @@ static int dbt_exec_enter(sparc32_ctx_t *ctx, const dbt_block_t *b,
     bool allow_chain)
 {
     const void *chain;
+    /* Fresh execution: no JMPL delay recorded yet (fault recovery in
+     * dbt_commit arms only on a set inside this same execution). */
+    t_jmpl_delay_armed = false;
     if (b->host_code == NULL) {
         return dbt_exec_fallback(ctx, b);
     }

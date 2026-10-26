@@ -445,20 +445,25 @@ static bool interp_mem(sparc32_ctx_t *ctx, uint32_t pc,
     case 0x02U:
         if (!interp_ld_be(ctx, addr, 2U, &v)) return false;
         interp_wreg(ctx, d->rd, v); return true;
-    case 0x03U:
+    case 0x03U: {
+        /* LDD needs 8-byte alignment (addr & 7 faults, oracle SIGBUS).
+         * Validate-then-commit (Rev 4 4.3.3): both words must be mapped
+         * and read before either rd commits, so a second-word fault
+         * leaves zero partial state (no sp_rollback unwind on SPARC). */
+        uint32_t hi;
+        uint32_t lo;
         if ((d->rd & 1U) != 0U) return interp_undef(ctx, pc);
-        /* Validate-then-commit (Rev 4 4.3.3): both words must be mapped
-         * before rd is written, so a second-word fault leaves zero
-         * partial state (no sp_rollback unwind needed on SPARC). */
-        if ((addr & 3U) != 0U || !interp_range_ok(ctx, addr, 8U, 1U)) {
+        if ((addr & 7U) != 0U || !interp_range_ok(ctx, addr, 8U, 1U)) {
             ctx->exit_reason = SPARC32_EXIT_FAULT;
             ctx->fault_addr = addr;
             return false;
         }
-        if (!interp_ld_be(ctx, addr, 4U, &v)) return false;
-        interp_wreg(ctx, d->rd, v);
-        if (!interp_ld_be(ctx, addr + 4U, 4U, &v)) return false;
-        interp_wreg(ctx, d->rd + 1U, v); return true;
+        if (!interp_ld_be(ctx, addr, 4U, &hi)) return false;
+        if (!interp_ld_be(ctx, addr + 4U, 4U, &lo)) return false;
+        interp_wreg(ctx, d->rd, hi);
+        interp_wreg(ctx, d->rd + 1U, lo);
+        return true;
+    }
     case 0x04U: return interp_st_be(ctx, addr, 4U, ctx->r[d->rd]);
     case 0x05U: return interp_st_be(ctx, addr, 1U, ctx->r[d->rd]);
     case 0x06U: return interp_st_be(ctx, addr, 2U, ctx->r[d->rd]);
@@ -466,9 +471,10 @@ static bool interp_mem(sparc32_ctx_t *ctx, uint32_t pc,
         if ((d->rd & 1U) != 0U) {
             return interp_undef(ctx, pc);
         }
-        /* Validate-then-commit (Rev 4 4.3.3): both words must be mapped
+        /* STD needs 8-byte alignment (addr & 7 faults, oracle SIGBUS).
+         * Validate-then-commit (Rev 4 4.3.3): both words must be mapped
          * writable before any byte is stored (no partial STD). */
-        if ((addr & 3U) != 0U || !interp_range_ok(ctx, addr, 8U, 2U)) {
+        if ((addr & 7U) != 0U || !interp_range_ok(ctx, addr, 8U, 2U)) {
             ctx->exit_reason = SPARC32_EXIT_FAULT;
             ctx->fault_addr = addr;
             return false;
@@ -581,7 +587,8 @@ static void interp_cti(sparc32_ctx_t *ctx, uint32_t pc,
         uint32_t b = (d->is_imm != 0U) ? (uint32_t)d->simm
                                        : ctx->r[d->rs2];
         target = ctx->r[d->rs1] + b;
-        interp_wreg(ctx, d->rd, pc);
+        /* Link write deferred past the delay slot: a faulting delay
+         * leaves rd pristine (precise fault state, dbt parity). */
     }
 
     /* Delay runs unless annulled away (E02): taken BA,a always skips;
@@ -617,7 +624,17 @@ static void interp_cti(sparc32_ctx_t *ctx, uint32_t pc,
         return;
     }
     if (!interp_single(ctx, npc, &dd)) {
+        if (d->cls == (uint32_t)SPARC32_OP_JMPL) {
+            /* Faulting JMPL delay: resume at the delay insn with the
+             * recorded transfer target as npc (dbt recovers the same
+             * target via aot_delay_target_get). rd stays pristine. */
+            ctx->pc = npc;
+            ctx->npc = target;
+        }
         return;
+    }
+    if (d->cls == (uint32_t)SPARC32_OP_JMPL) {
+        interp_wreg(ctx, d->rd, pc);
     }
     if (taken) {
         ctx->pc = target;
