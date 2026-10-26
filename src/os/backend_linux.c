@@ -36,6 +36,7 @@
 #include <unistd.h>
 
 #if defined(__linux__)
+#include <sys/random.h>
 #include <sys/syscall.h>
 #endif
 
