@@ -13,6 +13,8 @@
 #define _GNU_SOURCE
 #include "vm_int.h"
 
+#include "os/backend.h"
+
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -28,7 +30,6 @@ static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
     int      host_prot;
     void    *host_target;
     off_t    host_off;
-    void    *res;
 
     if (!ctx || len == 0U || (flags & 0x03U) == 0U || (flags & 0x03U) == 0x03U) {
         return (uint32_t)(-EINVAL);
@@ -76,11 +77,26 @@ static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
     host_prot   = sparc32_host_prot(ctx, prot);
     host_target = sparc32_guest_ptr(ctx, target_va);
     host_off    = (off_t)pgoffset * (off_t)SPARC32_PAGE_SIZE;
-    res = mmap(host_target, (size_t)aligned_len, host_prot,
-               host_flags | MAP_FIXED, (host_flags & MAP_ANONYMOUS) ? -1 : fd,
-               (host_flags & MAP_ANONYMOUS) ? 0 : host_off);
-    if (res == MAP_FAILED) {
-        return (uint32_t)(-errno);
+    /* Host mapping through the backend hooks (Rev 4 section 6) with the
+     * exact Linux semantics above: MAP_FIXED placement (the NOREPLACE
+     * overlap pre-check already ran), anon vs file backing. */
+    {
+        void *hook_out = NULL;
+        int map_rc;
+        if ((host_flags & MAP_ANONYMOUS) != 0) {
+            map_rc = rt_host_map_anon(host_target, (size_t)aligned_len,
+                host_prot, 1, 0, &hook_out);
+        } else {
+            map_rc = rt_host_map_file(host_target, (size_t)aligned_len,
+                host_prot, (host_flags & MAP_SHARED) != 0, 1, fd,
+                (uint64_t)host_off, &hook_out);
+        }
+        if (map_rc != 0 || hook_out != host_target) {
+            if (map_rc == 0) {
+                (void)rt_host_unmap(hook_out, (size_t)aligned_len);
+            }
+            return (uint32_t)(map_rc != 0 ? map_rc : -EEXIST);
+        }
     }
 
     if (update_cursor) {
@@ -134,9 +150,12 @@ static int vm_mprotect_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
         return -ENOMEM;
     }
 
-    if (mprotect(sparc32_guest_ptr(ctx, addr), (size_t)aligned_len,
-                 sparc32_host_prot(ctx, prot)) != 0) {
-        return -errno;
+    {
+        int prot_rc = rt_host_protect(sparc32_guest_ptr(ctx, addr),
+            (size_t)aligned_len, sparc32_host_prot(ctx, prot));
+        if (prot_rc != 0) {
+            return prot_rc;
+        }
     }
 
     vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
@@ -336,7 +355,8 @@ uint32_t rt32_vm_mremap(sparc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         }
 
         if ((prot & 0x1U) == 0U) {
-            (void)mprotect(sparc32_guest_ptr(ctx, old_addr), (size_t)old_aligned, PROT_READ);
+            (void)rt_host_protect(sparc32_guest_ptr(ctx, old_addr),
+                (size_t)old_aligned, PROT_READ);
         }
         copy_bytes = (size_t)((old_aligned < new_aligned) ? old_aligned : new_aligned);
         memcpy(sparc32_guest_ptr(ctx, new_va), sparc32_guest_ptr(ctx, old_addr), copy_bytes);

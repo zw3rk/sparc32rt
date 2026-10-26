@@ -160,6 +160,10 @@ static void e_call_invoke_faultable(sparc32_emit_ctx_t *ec)
     a64_patch_b_cond(b, p_cont, b->count);
 }
 
+/* DBT dispatcher hook (dbt.c): records the JMPL target for delay-slot
+ * fault recovery and arms the commit-path npc lookup. */
+extern void dbt_jmpl_record_target(sparc32_ctx_t *ctx, uint32_t target);
+
 /* w0 = ctx (x19), preserving x20. */
 static void e_arg_ctx(a64_buf_t *b)
 {
@@ -604,16 +608,28 @@ int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     /* Target into the callee-saved keeper: delay-slot code (including
      * helper calls) cannot clobber it. */
     e_ea_into(b, EKEEP, d);
-    if (d->rd != 0u) {
-        a64_emit_mov_pc32(b, ES0, pc);
-        e_stgreg(b, d->rd, ES0);
-    }
+    /* Publish the dynamic target before the delay slot so fault recovery
+     * can resolve RT_NPC_DYNAMIC_CTX via aot_delay_target_get (Rev 4
+     * 4.3.3). EKEEP (w22) is callee-saved, so the call keeps it. */
+    e_arg_ctx(b);
+    a64_emit_mov_w(b, 1u, EKEEP);
+    e_call_prologue(b, (uint64_t)(uintptr_t)&dbt_jmpl_record_target);
+    a64_emit(b, A64_BLR_BASE | ((ES2 & 31u) << 5));
+    a64_emit(b, A64_LDR_X30_POST);
     if (d->rd == SPARC32_O7) {
         b->is_call = true;
     }
+    /* Delay-slot stops report the delay address; commit resolves npc
+     * from the recorded target. The link write stays deferred past the
+     * slot so a faulting delay leaves rd pristine (interp parity). */
+    ec->fault_pc = npc;
     rc = e_emit_delay(ec, npc);
     if (rc != 0) {
         return rc;
+    }
+    if (d->rd != 0u) {
+        a64_emit_mov_pc32(b, ES0, pc);
+        e_stgreg(b, d->rd, ES0);
     }
     a64_emit_exit_branch_reg(b, EKEEP);
     return b->overflow ? -1 : 0;

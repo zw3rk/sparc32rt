@@ -203,7 +203,12 @@ void *vm_tlb_miss_helper(sparc32_ctx_t *ctx, uint32_t gva, uint32_t width,
         return NULL;
     }
     idx = (vpn & (uint64_t)(RT_TLB_SIZE - 1u));
-    addend = (uintptr_t)g_vm32_base;
+    /* Per-entry addend is host_page_base - tag (mem_site.h): the arena
+     * is one contiguous reservation, so this page's host base is
+     * G + vpn * 4 KiB. A bare G under-subtracts by the page base and
+     * misplaces every A2 HVA by up to 4 GiB - 4 KiB. */
+    addend = (uintptr_t)g_vm32_base +
+        (uintptr_t)(vpn * (uint64_t)VM32_GUEST_PAGE);
     t_tlb[idx].read_tag = (uint64_t)(vpn * (uint64_t)VM32_GUEST_PAGE);
     t_tlb[idx].addend = addend - (uintptr_t)t_tlb[idx].read_tag;
     t_tlb[idx].write_tag = is_store ? t_tlb[idx].read_tag :
