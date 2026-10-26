@@ -76,7 +76,7 @@ static void vm32_tlb_reset_thread(const sparc32_ctx_t *ctx)
     t_tlb_owner = ctx;
 }
 
-/* Current regime (valid after vm32_reserve). */
+/* Current regime (valid after vm32_reserve/vm32_attach). */
 int vm32_regime(void)
 {
     return (int)g_vm32_regime;
@@ -86,6 +86,27 @@ int vm32_regime(void)
 bool vm32_ready(void)
 {
     return g_vm32_ready;
+}
+
+/* Allocate the per-4 KiB protection/state tables (shared by the fresh
+ * reserve path and the adopt path below). */
+static int vm32_alloc_tables(void)
+{
+    if (g_vm32_prot == NULL) {
+        g_vm32_prot = (uint8_t *)calloc((size_t)VM32_PAGE_COUNT, 1u);
+        if (g_vm32_prot == NULL) {
+            return -1;
+        }
+    }
+    if (g_vm32_state == NULL) {
+        g_vm32_state = (uint8_t *)calloc((size_t)VM32_PAGE_COUNT, 1u);
+        if (g_vm32_state == NULL) {
+            free(g_vm32_prot);
+            g_vm32_prot = NULL;
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /*
@@ -113,19 +134,44 @@ int vm32_reserve(sparc32_ctx_t *ctx)
     if (rc != 0 || base == NULL) {
         return -1;
     }
-    g_vm32_prot = (uint8_t *)calloc((size_t)VM32_PAGE_COUNT, 1u);
-    g_vm32_state = (uint8_t *)calloc((size_t)VM32_PAGE_COUNT, 1u);
-    if (g_vm32_prot == NULL || g_vm32_state == NULL) {
-        free(g_vm32_prot);
-        free(g_vm32_state);
-        g_vm32_prot = NULL;
-        g_vm32_state = NULL;
+    if (vm32_alloc_tables() != 0) {
         rt_host_unmap(base, (size_t)VM32_WINDOW_LEN);
         return -1;
     }
     g_vm32_base = (uint64_t)(uintptr_t)base;
     g_vm32_ready = true;
     ctx->guest_base = g_vm32_base;
+    vm32_tlb_reset_thread(ctx);
+    return 0;
+}
+
+/*
+ * Adopt the window the rt32 layer already reserved (RC-U3-r2 #4):
+ * rt32_vm_init runs first and binds ctx->guest_base, so the Regime VM
+ * must observe that same [G, G + 4 GiB) mapping instead of reserving a
+ * second window. Allocates the protection/state tables when missing,
+ * selects the regime from the live host page size, and marks the VM
+ * ready. Idempotent: re-attaching an already-ready process just
+ * rebinds ctx. Returns 0 on success, -1 on allocation failure.
+ */
+int vm32_attach(sparc32_ctx_t *ctx)
+{
+    size_t host_page;
+    if (ctx == NULL) {
+        return -1;
+    }
+    if (g_vm32_ready) {
+        ctx->guest_base = g_vm32_base;
+        return 0;
+    }
+    if (vm32_alloc_tables() != 0) {
+        return -1;
+    }
+    host_page = rt_host_page_size();
+    g_vm32_regime = (host_page == (size_t)VM32_GUEST_PAGE) ?
+        VM32_REGIME_A1 : VM32_REGIME_A2;
+    g_vm32_base = ctx->guest_base;
+    g_vm32_ready = true;
     vm32_tlb_reset_thread(ctx);
     return 0;
 }

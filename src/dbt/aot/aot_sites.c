@@ -5,12 +5,15 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Implements the C side of mem_site.h: a fixed side table of dynamic
- * delay-slot targets (sparc32rt.h is frozen, so no ctx field), the
- * NPC resolver for RT_NPC_SEQUENTIAL / STATIC_TARGET / DYNAMIC_CTX,
- * and the sp_rollback_delta applier. The signal-rewind anchor math
- * (seq_start_offset) is consumed by the DBT signal path; this unit only
- * records and resolves.
+ * Implements the C side of mem_site.h: the NPC resolver for
+ * RT_NPC_SEQUENTIAL / STATIC_TARGET / DYNAMIC_CTX, the
+ * sp_rollback_delta applier, and a legacy side table of dynamic
+ * delay-slot targets. Live JMPL delay-slot recovery no longer reads
+ * the table (RC-U3-r2 #3: the authoritative target is the per-context
+ * ctx->jmpl_target, which cannot be evicted by other live contexts);
+ * the table is retained as metadata for static-site consumers only.
+ * The signal-rewind anchor math (seq_start_offset) is consumed by the
+ * DBT signal path; this unit only records and resolves.
  */
 
 #include "dbt/aot/mem_site.h"
@@ -19,7 +22,8 @@
 
 #include "interp/interp_priv.h"
 
-/* Side table: latest dynamic JMPL target per live ctx (frozen ctx). */
+/* Legacy side table: latest dynamic JMPL target per live ctx. Kept as
+ * metadata only (RC-U3-r2 #3); fault recovery reads ctx->jmpl_target. */
 #define AOT_DELAY_SLOTS 64u
 
 typedef struct {

@@ -21,7 +21,9 @@
 
 #include "sparc32rt.h"
 #include "rt32/rt32.h"
+#include "interp/decode.h"
 #include "interp/interp.h"
+#include "interp/interp_priv.h"
 #include "os/syscalls_min.h"
 #include "dbt/dbt.h"
 #include "dbt/difftest.h"
@@ -162,6 +164,13 @@ static int load_guest(sparc32_ctx_t *ctx)
         fprintf(stderr, "sparc32rt: cannot reserve the [G, G + 4 GiB) window\n");
         return 1;
     }
+    /* Bind the Regime VM (src/vm/vm32.c) to the reserved window so the
+     * Soft-TLB tables, page publication, and Provider-A hooks observe
+     * the same [G, G + 4 GiB) mapping the rt32 layer just reserved. */
+    if (vm32_attach(ctx) != 0) {
+        fprintf(stderr, "sparc32rt: cannot attach the Regime VM tables\n");
+        return 1;
+    }
     if (rt32_elf_load(ctx, -1, ctx->exec_path, &info) != 0) {
         fprintf(stderr, "sparc32rt: cannot load '%s'\n", ctx->exec_path);
         return 1;
@@ -192,6 +201,72 @@ static int load_guest(sparc32_ctx_t *ctx)
         }
     }
     return 0;
+}
+
+/* Safe guest instruction-word fetch for fault classification: reads
+ * through the [G, G + 4 GiB) window only when [va, va + 4) is covered by
+ * a readable tracked region, and never touches exit state (unlike
+ * sparc32_fetch_decode, which would clobber the live fault record). */
+static bool sparc32_fault_insn_word(const sparc32_ctx_t *ctx, uint32_t va,
+    uint32_t *out)
+{
+    const uint8_t *p;
+    if (out == NULL || !interp_range_ok(ctx, va, 4U, 1U)) {
+        return false;
+    }
+    p = (const uint8_t *)sparc32_guest_ptr(ctx, va);
+    *out = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+    return true;
+}
+
+/*
+ * Fault -> signal classification (RC-U3-r2 #2). Both engines report
+ * alignment violations as EXIT_FAULT with fault_addr = VA, but
+ * (fault_addr & 3) alone cannot see a 4-byte-aligned, 8-byte-misaligned
+ * LDD/STD: that fault MUST deliver SIGBUS (10, BUS_ADRALN), never
+ * SIGSEGV (11). Decode the faulting instruction (resolving one CTI
+ * delay slot, since a faulting delay reports pc at the transfer for
+ * JMPL but at the CTI for the other CTI classes) and report SIGBUS
+ * only when a doubleword access (LDD/STD/LDDA/STDA) faulted on
+ * (va & 7). FP LDDF/STDF are excluded on purpose: the interpreter
+ * faults those only as 4-byte halves, so their 4-mod-8 faults are
+ * mapping faults (SIGSEGV). Undecodable PCs keep the old heuristic.
+ */
+static int sparc32_classify_fault(const sparc32_ctx_t *ctx)
+{
+    uint32_t va = ctx->fault_addr;
+    uint32_t pc = ctx->pc;
+    uint32_t word;
+    sparc32_decoded_t d;
+    unsigned depth;
+    if ((va & 3U) != 0U) {
+        return 10;
+    }
+    if ((va & 7U) == 0U) {
+        return 11;
+    }
+    for (depth = 0U; depth < 2U; depth++) {
+        if (!sparc32_fault_insn_word(ctx, pc, &word)) {
+            return 11;
+        }
+        sparc32_decode_word(word, &d);
+        if (d.cls == (uint32_t)SPARC32_OP_CALL ||
+            d.cls == (uint32_t)SPARC32_OP_BRANCH ||
+            d.cls == (uint32_t)SPARC32_OP_FBRANCH ||
+            d.cls == (uint32_t)SPARC32_OP_JMPL ||
+            d.cls == (uint32_t)SPARC32_OP_TRAP) {
+            pc += 4U;
+            continue;
+        }
+        if (d.op == 3U &&
+            (d.op3 == SPARC32_OP3_LDD || d.op3 == SPARC32_OP3_STD ||
+             d.op3 == SPARC32_OP3_LDDA || d.op3 == SPARC32_OP3_STDA)) {
+            return 10;
+        }
+        return 11;
+    }
+    return 11;
 }
 
 /* Engine run loop shared by --interp and --dbt: step until a stop, deliver
@@ -225,7 +300,7 @@ static int run_engine(sparc32_ctx_t *ctx, engine_step_fn step, const char *tag)
             if (ctx->exit_reason == SPARC32_EXIT_SINGLE_STEP) {
                 ctx->fault_addr = ctx->exit_dest;
             }
-            signo = (ctx->fault_addr & 3U) != 0U ? 10 : 11;
+            signo = sparc32_classify_fault(ctx);
             if (interp_try_deliver_sync(ctx, signo)) {
                 continue;
             }
