@@ -35,11 +35,13 @@ LDFLAGS ?= -static-pie
 # layer (src/os/), and AArch64 DBT (src/dbt/, Phase 2: no NO_DBT flag;
 # vm_invalidate_jit calls sparc32_dbt_invalidate_range).
 SRCS_C := src/main.c $(wildcard src/rt32/*.c) $(wildcard src/interp/*.c) \
-          $(wildcard src/os/*.c) $(wildcard src/dbt/*.c)
+          $(wildcard src/os/*.c) $(wildcard src/dbt/*.c) \
+          $(wildcard src/vm/*.c) $(wildcard src/dbt/aot/*.c)
 SRCS_S := $(wildcard src/rt32/*.S) $(wildcard src/dbt/*.S)
 HDRS   := src/sparc32rt.h include/a32host.h src/os/syscall_nr.h \
           $(wildcard src/rt32/*.h) $(wildcard src/interp/*.h) \
-          $(wildcard src/dbt/*.h) $(wildcard src/os/*.h)
+          $(wildcard src/dbt/*.h) $(wildcard src/os/*.h) \
+          $(wildcard src/vm/*.h) $(wildcard src/dbt/aot/*.h)
 
 OBJ_DIR      := $(BUILD_DIR)/obj
 OBJS         := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS_C)) \
