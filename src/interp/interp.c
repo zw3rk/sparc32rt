@@ -35,6 +35,7 @@
 
 #include "sparc32rt.h"
 
+#include "dbt/aot/aot_atomic.h"
 #include "interp/decode.h"
 #include "interp/fp.h"
 #include "interp/interp_priv.h"
@@ -391,42 +392,29 @@ static bool interp_rdwr(sparc32_ctx_t *ctx, const sparc32_decoded_t *d)
     return true;
 }
 
+/*
+ * Wave U3 atomic handlers (Rev 4 section 4.4): CASA/SWAP/LDSTUB execute
+ * C11 __atomic_* SEQ_CST RMWs on the canonical HVA (aot_atomic.h) so a
+ * concurrent writer racing between the access pair can never be lost.
+ * rd always receives the old memory contents (LEON match-swap rule).
+ */
 static bool interp_casa(sparc32_ctx_t *ctx, const sparc32_decoded_t *d)
 {
-    uint32_t cmp = ctx->r[d->rs2];
     uint32_t addr = ctx->r[d->rs1];
-    uint32_t old_rd = ctx->r[d->rd];
-    uint32_t mem;
     if (!interp_asi_ok(d->asi)) {
         return interp_trap_taken(ctx, SPARC32_TRAP_PRIV_INSN);
     }
-    if (!interp_ld_be(ctx, addr, 4U, &mem)) {
-        return false;
-    }
-    interp_wreg(ctx, d->rd, mem);
-    if (mem == cmp && !interp_st_be(ctx, addr, 4U, old_rd)) {
-        return false;
-    }
-    return true;
+    return sparc32_atomic_casa(ctx, addr, d->rs2, d->rd);
 }
 
 static bool interp_swap(sparc32_ctx_t *ctx, const sparc32_decoded_t *d)
 {
     uint32_t addr = ctx->r[d->rs1] +
         ((d->is_imm != 0U) ? (uint32_t)d->simm : ctx->r[d->rs2]);
-    uint32_t old_rd = ctx->r[d->rd];
-    uint32_t v;
     if (((d->op3 & 0x10U) != 0U) && !interp_asi_ok(d->asi)) {
         return interp_trap_taken(ctx, SPARC32_TRAP_PRIV_INSN);
     }
-    if (!interp_ld_be(ctx, addr, 4U, &v)) {
-        return false;
-    }
-    if (!interp_st_be(ctx, addr, 4U, old_rd)) {
-        return false;
-    }
-    interp_wreg(ctx, d->rd, v);
-    return true;
+    return sparc32_atomic_swap(ctx, addr, d->rd);
 }
 
 /* Loads/stores, plain and alternate-space (asi checked first). LDSTUB is
@@ -459,6 +447,14 @@ static bool interp_mem(sparc32_ctx_t *ctx, uint32_t pc,
         interp_wreg(ctx, d->rd, v); return true;
     case 0x03U:
         if ((d->rd & 1U) != 0U) return interp_undef(ctx, pc);
+        /* Validate-then-commit (Rev 4 4.3.3): both words must be mapped
+         * before rd is written, so a second-word fault leaves zero
+         * partial state (no sp_rollback unwind needed on SPARC). */
+        if ((addr & 3U) != 0U || !interp_range_ok(ctx, addr, 8U, 1U)) {
+            ctx->exit_reason = SPARC32_EXIT_FAULT;
+            ctx->fault_addr = addr;
+            return false;
+        }
         if (!interp_ld_be(ctx, addr, 4U, &v)) return false;
         interp_wreg(ctx, d->rd, v);
         if (!interp_ld_be(ctx, addr + 4U, 4U, &v)) return false;
@@ -469,6 +465,13 @@ static bool interp_mem(sparc32_ctx_t *ctx, uint32_t pc,
     case 0x07U:
         if ((d->rd & 1U) != 0U) {
             return interp_undef(ctx, pc);
+        }
+        /* Validate-then-commit (Rev 4 4.3.3): both words must be mapped
+         * writable before any byte is stored (no partial STD). */
+        if ((addr & 3U) != 0U || !interp_range_ok(ctx, addr, 8U, 2U)) {
+            ctx->exit_reason = SPARC32_EXIT_FAULT;
+            ctx->fault_addr = addr;
+            return false;
         }
         if (!interp_st_be(ctx, addr, 4U, ctx->r[d->rd])) {
             return false;
@@ -485,9 +488,9 @@ static bool interp_mem(sparc32_ctx_t *ctx, uint32_t pc,
         interp_wreg(ctx, d->rd, ((v & 0x8000U) != 0U) ? v | 0xFFFF0000U : v);
         return true;
     case 0x0DU:
-        if (!interp_ld_be(ctx, addr, 1U, &v)) return false;
-        if (!interp_st_be(ctx, addr, 1U, 0xFFU)) return false;
-        interp_wreg(ctx, d->rd, v); return true;
+        /* SEQ_CST byte exchange (Rev 4 4.4): old byte to rd, 0xFF to
+         * memory, atomically on the canonical HVA. */
+        return sparc32_atomic_ldstub(ctx, addr, d->rd);
     default: break;
     }
     return interp_undef(ctx, pc);

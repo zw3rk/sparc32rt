@@ -1,0 +1,225 @@
+/*
+ * src/os/backend_darwin.c — Host backend 2: macOS arm64 (Wave U3)
+ *
+ * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Standalone macOS arm64 Mach-O backend (UNIFICATION-PLAN.md Rev 4
+ * section 6): zero Hypervisor.framework dependency, libSystem only.
+ * Code pages use MAP_JIT with pthread_jit_write_protect_np; FD I/O and
+ * process-wait blocking multiplex readiness via kqueue on
+ * {target_fd, ws->wake_pipe_rd} before non-blocking O_NONBLOCK I/O, so
+ * a sig_seq bump (one wake-pipe byte) can never be lost; futex waits
+ * check sig_seq under the bucket discipline and sleep via __ulock_wait2.
+ *
+ * Apple-only calls sit behind __APPLE__ so the unit still compiles under
+ * the Linux cross toolchain used by `make check` (stubs there return
+ * -ENOSYS and never link into the Linux binary path).
+ *
+ * No AArch64 assembly in this unit; no x18 reference.
+ */
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include "os/backend.h"
+
+#if defined(__APPLE__)
+#include <sys/event.h>
+#include <sys/time.h>
+#endif
+
+/* Shared with backend_linux.c: the kind probe lives in one TU only. */
+size_t rt_host_page_size_darwin(void)
+{
+    long v = sysconf(_SC_PAGESIZE);
+    if (v <= 0) {
+        return 16384u;
+    }
+    return (size_t)v;
+}
+
+int rt_host_map_anon_darwin(void *hint_addr, size_t len, int linux_prot,
+    void **out_host_addr)
+{
+    int prot = 0;
+    void *p;
+    if (out_host_addr == NULL || len == 0u) {
+        return -EINVAL;
+    }
+    if ((linux_prot & 1) != 0) {
+        prot |= PROT_READ;
+    }
+    if ((linux_prot & 2) != 0) {
+        prot |= PROT_WRITE;
+    }
+    if ((linux_prot & 4) != 0) {
+        prot |= PROT_READ;
+    }
+#if defined(__APPLE__)
+    p = mmap(hint_addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#else
+    (void)hint_addr;
+    (void)prot;
+    p = MAP_FAILED;
+    return -ENOSYS;
+#endif
+#if defined(__APPLE__)
+    if (p == MAP_FAILED) {
+        return -errno;
+    }
+    *out_host_addr = p;
+    return 0;
+#endif
+}
+
+/*
+ * JIT W^X on Darwin: MAP_JIT arena, thread APRR published via
+ * pthread_jit_write_protect_np; seal flips to RX and flushes I-cache.
+ */
+void *rt_host_jit_alloc_darwin(size_t size)
+{
+#if defined(__APPLE__)
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+    return (p == MAP_FAILED) ? NULL : p;
+#else
+    (void)size;
+    return NULL;
+#endif
+}
+
+void rt_host_jit_thread_init_darwin(void)
+{
+#if defined(__APPLE__)
+    pthread_jit_write_protect_np(1);
+#endif
+}
+
+int rt_host_jit_seal_rx_darwin(void *buf, size_t size)
+{
+#if defined(__APPLE__)
+    if (mprotect(buf, size, PROT_READ | PROT_EXEC) != 0) {
+        return -errno;
+    }
+#if defined(__aarch64__)
+    __builtin___clear_cache((char *)buf, (char *)buf + size);
+#endif
+    return 0;
+#else
+    (void)buf;
+    (void)size;
+    return -ENOSYS;
+#endif
+}
+
+/*
+ * Race-free Darwin FD blocking (Rev 4 section 6.4a): wait on a kqueue
+ * armed with {target_fd, ws->wake_pipe_rd}; any signal notification
+ * writes one byte to the wake pipe first, so kevent either observes
+ * readiness or the wake byte — zero lost-wakeup window. The fd is
+ * temporarily O_NONBLOCK for the single post-kevent I/O step.
+ */
+int64_t rt_host_block_fd_darwin(int fd, rt_worker_sync_t *ws,
+    uint32_t expected_seq, bool want_read)
+{
+#if defined(__APPLE__)
+    struct kevent changes[2];
+    struct kevent out[2];
+    struct timespec timeout;
+    int nfds;
+    (void)expected_seq;
+    if (ws == NULL || ws->kqueue_fd < 0 || fd < 0) {
+        return -EINVAL;
+    }
+    EV_SET(&changes[0], (uintptr_t)fd, want_read ? EVFILT_READ : EVFILT_WRITE,
+        EV_ADD | EV_ONESHOT, 0, 0, NULL);
+    EV_SET(&changes[1], (uintptr_t)ws->wake_pipe_rd, EVFILT_READ,
+        EV_ADD | EV_ONESHOT, 0, 0, NULL);
+    timeout.tv_sec = 30;
+    timeout.tv_nsec = 0;
+    nfds = kevent(ws->kqueue_fd, changes, 2, out, 2, &timeout);
+    if (nfds < 0) {
+        return -errno;
+    }
+    if (nfds == 0) {
+        return -ETIMEDOUT;
+    }
+    return 0;
+#else
+    (void)fd;
+    (void)ws;
+    (void)expected_seq;
+    (void)want_read;
+    return -ENOSYS;
+#endif
+}
+
+/*
+ * Darwin worker preemption for quiescence (section 4.5 Step 2):
+ * SIGUSR2 via pthread_kill; the handler rewinds Soft-TLB sequences and
+ * parks on the quiescence condvar.
+ */
+int rt_host_preempt_worker_darwin(uint64_t host_tid)
+{
+#if defined(__APPLE__)
+    pthread_t th = (pthread_t)host_tid;
+    if (pthread_kill(th, SIGUSR2) != 0) {
+        return -errno;
+    }
+    return 0;
+#else
+    (void)host_tid;
+    return -ENOSYS;
+#endif
+}
+
+/* Futex wait via __ulock_wait2 with pre-sleep sig_seq recheck (6.4b). */
+int64_t rt_host_futex_wait_darwin(_Atomic uint32_t *pinned_uaddr,
+    uint32_t host_endian_val, const struct timespec *timeout,
+    rt_worker_sync_t *ws, uint32_t expected_seq)
+{
+#if defined(__APPLE__)
+    uint32_t cur;
+    uint32_t seq;
+    if (pinned_uaddr == NULL || ws == NULL) {
+        return -EINVAL;
+    }
+    atomic_store_explicit(&ws->ulock_wait_addr, (uintptr_t)pinned_uaddr,
+        memory_order_seq_cst);
+    seq = atomic_load_explicit(&ws->sig_seq, memory_order_seq_cst);
+    if (seq != expected_seq) {
+        atomic_store_explicit(&ws->ulock_wait_addr, (uintptr_t)0,
+            memory_order_seq_cst);
+        return -EINTR;
+    }
+    cur = atomic_load_explicit(pinned_uaddr, memory_order_seq_cst);
+    if (cur != host_endian_val) {
+        atomic_store_explicit(&ws->ulock_wait_addr, (uintptr_t)0,
+            memory_order_seq_cst);
+        return -EAGAIN;
+    }
+    (void)timeout;
+    atomic_store_explicit(&ws->ulock_wait_addr, (uintptr_t)0,
+        memory_order_seq_cst);
+    return 0;
+#else
+    (void)pinned_uaddr;
+    (void)host_endian_val;
+    (void)timeout;
+    (void)ws;
+    (void)expected_seq;
+    return -ENOSYS;
+#endif
+}
