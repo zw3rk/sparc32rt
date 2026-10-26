@@ -205,6 +205,15 @@ void vm32_publish_page(uint32_t gva, uint32_t prot, uint32_t state)
  * the recorded protection are preserved. No TLB refresh here; callers
  * invalidate the shrunk span once after walking it.
  */
+uint32_t vm32_page_state(uint32_t gva)
+{
+    uint64_t vpn = (uint64_t)(gva / VM32_GUEST_PAGE);
+    if (!g_vm32_ready || vpn >= (uint64_t)VM32_PAGE_COUNT) {
+        return 0u;
+    }
+    return (uint32_t)g_vm32_state[vpn];
+}
+
 void vm32_page_revert_clean(uint32_t gva)
 {
     uint64_t vpn = (uint64_t)(gva / VM32_GUEST_PAGE);

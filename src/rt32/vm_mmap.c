@@ -38,6 +38,9 @@ static void vm_mmap_ensure_regime(sparc32_ctx_t *ctx)
  * bump over the range so stale A2 tags cannot survive a remap. MAP_PRIVATE
  * file pages publish PAGE_COW_CLEAN so the write-miss promotion branch
  * is reachable; everything else publishes state 0. */
+static void vm_mmap_publish_keep_state(sparc32_ctx_t *ctx, uint32_t start,
+    uint32_t end, uint32_t prot);
+
 static void vm_mmap_publish(sparc32_ctx_t *ctx, uint32_t start, uint32_t end,
     uint32_t prot, uint32_t state)
 {
@@ -223,9 +226,27 @@ static int vm_mprotect_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len, u
     /* Regime VM lifecycle (RC-U3-r2 #4): publish the committed
      * protection and drop stale Soft-TLB tags over the range. */
     vm_mmap_ensure_regime(ctx);
-    vm_mmap_publish(ctx, addr, (uint32_t)end64, prot, 0U);
+    vm_mmap_publish_keep_state(ctx, addr, (uint32_t)end64, prot);
     vm_mprotect_regions_locked(addr, (uint32_t)end64, prot & 0x7U);
     return 0;
+}
+
+/*
+ * Publish a protection change while preserving per-page state (RC-U3-r5):
+ * mprotect must not reset PAGE_COW_CLEAN (or DIRTY/HAS_CODE bits), or
+ * later promotion and shrink-state handling observe state 0.
+ */
+static void vm_mmap_publish_keep_state(sparc32_ctx_t *ctx, uint32_t start,
+    uint32_t end, uint32_t prot)
+{
+    uint32_t va;
+    if (ctx == NULL || end <= start) {
+        return;
+    }
+    for (va = start; va < end; va += SPARC32_PAGE_SIZE) {
+        vm32_publish_page(va, prot & 0x7U, vm32_page_state(va));
+    }
+    vm32_tlb_invalidate(start, end - start);
 }
 
 int rt32_vm_mprotect(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot)

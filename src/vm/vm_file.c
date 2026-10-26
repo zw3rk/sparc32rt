@@ -83,11 +83,17 @@ static uint64_t vmf_key(uint64_t dev, uint64_t ino)
     return (dev * 1469598103934665603ULL) ^ (ino + 1099511628211ULL);
 }
 
-static vm_inode_shared_t *vmf_intern(uint64_t key, int host_fd)
+/* Intern by (inode key, mapped gva): a second mmap of the same file at a
+ * different gva allocates a separate entry rather than overwriting the
+ * earlier mapping's range (RC-U3-r5), so shrink handling reaches every
+ * mapping of the inode. */
+static vm_inode_shared_t *vmf_intern(uint64_t key, int host_fd,
+    uint32_t map_gva)
 {
     uint64_t i;
     for (i = 0u; i < g_inode_count; i++) {
-        if (g_inodes[i].live && g_inodes[i].inode_key == key) {
+        if (g_inodes[i].live && g_inodes[i].inode_key == key &&
+            g_inodes[i].map_gva == map_gva) {
             return &g_inodes[i];
         }
     }
@@ -97,6 +103,17 @@ static vm_inode_shared_t *vmf_intern(uint64_t key, int host_fd)
     g_inodes[g_inode_count].inode_key = key;
     g_inodes[g_inode_count].host_fd = host_fd;
     g_inodes[g_inode_count].live = true;
+    g_inodes[g_inode_count].map_gva = map_gva;
+    g_inodes[g_inode_count].map_pages = 0u;
+    g_inodes[g_inode_count].map_off = 0u;
+    atomic_store_explicit(&g_inodes[g_inode_count].file_size, 0u,
+        memory_order_relaxed);
+    atomic_store_explicit(&g_inodes[g_inode_count].resize_seq, 0u,
+        memory_order_relaxed);
+    atomic_store_explicit(&g_inodes[g_inode_count].min_shrunk, 0u,
+        memory_order_relaxed);
+    atomic_store_explicit(&g_inodes[g_inode_count].code_generation, 1u,
+        memory_order_relaxed);
     return &g_inodes[g_inode_count++];
 }
 
@@ -150,64 +167,84 @@ uint32_t vm_file_apply_shrink(vm_file_page_t *pages, uint32_t page_count,
  * inode resize/code-generation clocks only after the host call succeeds
  * (section 4.5 Step 3 -> Step 4). new_size == UINT64_MAX keeps size.
  */
-/* Record the canonical mapping range of an inode (called at mmap). */
+/* Record the canonical mapping range of an inode (called at mmap).
+ * RC-U3-r5: one entry per mapping, not per inode. A second mmap of the
+ * same (dev, ino) at a different gva allocates a separate entry instead
+ * of overwriting the earlier mapping, so shrink and generation handling
+ * reach every mapping. */
 void vm_file_note_mapping(uint64_t dev, uint64_t ino, int host_fd,
     uint32_t map_gva, uint32_t map_pages, uint64_t map_off)
 {
-    vm_inode_shared_t *e = vmf_intern(vmf_key(dev, ino), host_fd);
+    uint64_t key = vmf_key(dev, ino);
+    vm_inode_shared_t *e = vmf_intern(key, host_fd, map_gva);
 
     if (e == NULL) {
         return;
     }
-    e->map_gva = map_gva;
     e->map_pages = map_pages;
     e->map_off = map_off;
+}
+
+/* Apply a shrink to one mapping entry (RC-U3-r4 enforcement). */
+static void vmf_shrink_entry(vm_inode_shared_t *e, uint64_t new_size,
+    uint64_t old)
+{
+    uint64_t map_lo = e->map_off;
+    uint64_t map_hi = map_lo + (uint64_t)e->map_pages * 4096ULL;
+    uint64_t lo = (new_size > map_lo) ? new_size : map_lo;
+    uint64_t hi = (old < map_hi) ? old : map_hi;
+
+    if (hi <= lo || e->map_pages == 0u) {
+        return;
+    }
+    {
+        uint64_t f;
+        uint32_t glo = e->map_gva + (uint32_t)(lo - map_lo);
+        uint32_t ghi = e->map_gva + (uint32_t)(hi - map_lo);
+        glo &= ~(uint32_t)4095U;
+        ghi = (ghi + 4095U) & ~(uint32_t)4095U;
+        for (f = glo; f < ghi; f += 4096U) {
+            vm32_page_revert_clean((uint32_t)f);
+        }
+        if (ghi > glo) {
+            vm32_tlb_invalidate(glo, ghi - glo);
+        }
+    }
 }
 
 void vm_file_note_mutation(uint64_t dev, uint64_t ino, int host_fd,
     uint64_t new_size)
 {
-    vm_inode_shared_t *e = vmf_intern(vmf_key(dev, ino), host_fd);
-    if (e == NULL) {
-        return;
-    }
-    if (new_size != UINT64_MAX) {
-        uint64_t old = atomic_load_explicit(&e->file_size,
-            memory_order_relaxed);
+    uint64_t key = vmf_key(dev, ino);
+    uint64_t i;
+
+    /* RC-U3-r5: act on every mapping of the inode, not just the first
+     * intern hit, so no mapping keeps stale bytes past a shrink. */
+    (void)host_fd;
+    for (i = 0u; i < (uint64_t)VMF_MAX_INODES; i++) {
+        vm_inode_shared_t *e = &g_inodes[i];
+        uint64_t old;
+        if (!e->live || e->inode_key != key) {
+            continue;
+        }
+        if (new_size == UINT64_MAX) {
+            atomic_fetch_add_explicit(&e->code_generation, 1u,
+                memory_order_relaxed);
+            continue;
+        }
+        old = atomic_load_explicit(&e->file_size, memory_order_relaxed);
         atomic_store_explicit(&e->file_size, new_size,
             memory_order_relaxed);
         if (new_size < old) {
-            /* Shrink: revert pages fully beyond the new EOF to CLEAN
-             * (refill from the file on next fault) and drop their
-             * Soft-TLB tags so no stale DIRTY bytes survive. This is
-             * the shrink-helper enforcement for the regime page table
-             * (RC-U3-r4); the dense-table vm_file_apply_shrink covers
-             * the same transition once a page table is attached. */
-            uint64_t map_lo = e->map_off;
-            uint64_t map_hi = map_lo + (uint64_t)e->map_pages * 4096ULL;
-            uint64_t lo = (new_size > map_lo) ? new_size : map_lo;
-            uint64_t hi = (old < map_hi) ? old : map_hi;
-            if (hi > lo && e->map_pages != 0u) {
-                uint64_t f;
-                uint32_t glo = e->map_gva + (uint32_t)(lo - map_lo);
-                uint32_t ghi = e->map_gva + (uint32_t)(hi - map_lo);
-                glo &= ~(uint32_t)4095U;
-                ghi = (ghi + 4095U) & ~(uint32_t)4095U;
-                for (f = glo; f < ghi; f += 4096U) {
-                    vm32_page_revert_clean((uint32_t)f);
-                }
-                if (ghi > glo) {
-                    vm32_tlb_invalidate(glo, ghi - glo);
-                }
-            }
+            vmf_shrink_entry(e, new_size, old);
             atomic_store_explicit(&e->min_shrunk, new_size,
                 memory_order_relaxed);
         }
         atomic_fetch_add_explicit(&e->resize_seq, 1u,
             memory_order_relaxed);
+        atomic_fetch_add_explicit(&e->code_generation, 1u,
+            memory_order_relaxed);
     }
-    atomic_fetch_add_explicit(&e->code_generation, 1u,
-        memory_order_relaxed);
 }
 
 /* Current code generation for an inode (SMC/mutation invalidation). */
