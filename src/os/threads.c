@@ -43,6 +43,17 @@ extern uint64_t sparc32_l2a_blocked_mask(void);
 
 #define THR_MAX_LIVE 64U
 
+static int thr_gettid(void)
+{
+#if defined(__APPLE__)
+    uint64_t tid = 0;
+    (void)pthread_threadid_np(NULL, &tid);
+    return (tid != 0ULL) ? (int)(tid & 0x7FFFFFFFULL) : (int)getpid();
+#else
+    return (int)gettid();
+#endif
+}
+
 /* Live contexts for host-signal notes (lock-free reads in handler). */
 static sparc32_ctx_t *thr_live[THR_MAX_LIVE];
 static pthread_mutex_t thr_live_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -247,9 +258,29 @@ long sparc32_thr_pipe2(sparc32_ctx_t *ctx, uint32_t fds_va, uint32_t flags)
     if ((flags & 0x4000U) != 0U) {
         oflags |= O_NONBLOCK;
     }
+#if defined(__linux__)
     if (pipe2(fds, oflags) != 0) {
         return -(long)errno;
     }
+#else
+    if (pipe(fds) != 0) {
+        return -(long)errno;
+    }
+    if ((oflags & O_CLOEXEC) != 0) {
+        (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    }
+    if ((oflags & O_NONBLOCK) != 0) {
+        int fl0 = fcntl(fds[0], F_GETFL);
+        int fl1 = fcntl(fds[1], F_GETFL);
+        if (fl0 >= 0) {
+            (void)fcntl(fds[0], F_SETFL, fl0 | O_NONBLOCK);
+        }
+        if (fl1 >= 0) {
+            (void)fcntl(fds[1], F_SETFL, fl1 | O_NONBLOCK);
+        }
+    }
+#endif
     if (thr_st(ctx, fds_va, (uint32_t)fds[0]) != 0 ||
         thr_st(ctx, fds_va + 4U, (uint32_t)fds[1]) != 0) {
         close(fds[0]);
@@ -365,7 +396,7 @@ static void *thr_thread_entry(void *arg)
      * per-thread state lands; the child continues the quiescent
      * parent's window images, so the parent must not execute guest
      * code concurrently (futex rendezvous before it resumes). */
-    ctx->host_tid = (int)gettid();
+    ctx->host_tid = thr_gettid();
     pthread_mutex_lock(&st->lock);
     st->child_tid = (long)ctx->host_tid;
     st->tid_ready = true;
@@ -584,11 +615,15 @@ static long thr_kill_tid(sparc32_ctx_t *ctx, uint32_t tgid,
 #if defined(__linux__) && defined(SYS_tgkill)
     rc = syscall(SYS_tgkill, (pid_t)(int32_t)tgid, (pid_t)(int32_t)tid,
         (int)sig);
-#else
+#elif defined(__linux__) && defined(SYS_tkill)
     (void)tgid;
     rc = syscall(SYS_tkill, (pid_t)(int32_t)tid, (int)sig);
+#else
+    (void)tgid;
+    rc = ((int32_t)tid == thr_gettid() || (pid_t)(int32_t)tid == getpid())
+        ? 0 : (long)kill((pid_t)(int32_t)tid, (int)sig);
 #endif
-    if (sig != 0U && rc == 0 && (int32_t)tid == gettid()) {
+    if (sig != 0U && rc == 0 && (int32_t)tid == thr_gettid()) {
         return thr_kill_self(ctx, (int)sig);
     }
     return (rc == 0) ? 0 : -(long)errno;
@@ -624,7 +659,7 @@ long sparc32_thr_set_tid_address(sparc32_ctx_t *ctx, uint32_t tidptr_va)
     }
     ctx->clear_child_tid = tidptr_va;
     if (ctx->host_tid <= 0) {
-        ctx->host_tid = (int)gettid();
+        ctx->host_tid = thr_gettid();
     }
     return (long)ctx->host_tid;
 }

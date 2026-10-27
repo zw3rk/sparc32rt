@@ -20,7 +20,7 @@
 
 #include "sparc32rt.h"
 
-static void put_be16(uint8_t *p, uint16_t v)
+static inline void put_be16(uint8_t *p, uint16_t v)
 {
     p[0] = (uint8_t)(v >> 8);
     p[1] = (uint8_t)v;

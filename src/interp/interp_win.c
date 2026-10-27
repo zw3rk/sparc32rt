@@ -21,8 +21,11 @@ V8 window backing store + WIM + SAVE/RESTORE executor (E01 model).
  * traffic ONLY on WIM overflow/underflow traps (never on plain SAVE).
  * Single global file = one guest thread (Phase 4 needs a side table). */
 static uint32_t interp_winfile[SPARC32_NWINDOWS][16];
-/* V8 WIM (frozen ctx has V9 counters only). Fresh: (CWP=0, WIM=0x01). */
-static uint32_t interp_wim = 0x01U;
+/* V8 window count tracker: ctx->canrestore counts valid caller windows
+ * currently cached in interp_winfile[1..SPARC32_WIN_MAXSAVE]. SAVE spills
+ * the oldest cached caller window (tgt) to its own %sp (stored in
+ * winfile[(tgt - 1) mod 8][I6]) iff canrestore == SPARC32_WIN_MAXSAVE;
+ * RESTORE fills tgt from post-restore %sp (old_i[6]) iff canrestore == 0. */
 
 /* Reset window state for a fresh guest (main calls this once per run). */
 void interp_window_reset(void)
@@ -34,7 +37,6 @@ void interp_window_reset(void)
             interp_winfile[w][i] = 0U;
         }
     }
-    interp_wim = 0x01U;
 }
 
 /* Spill winfile[w] (16 l/i words) to guest [va, va + 64). */
@@ -93,13 +95,16 @@ bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
         uint32_t new_sp = a + b;
         uint32_t tgt =
             (ctx->cwp + SPARC32_NWINDOWS - 1U) % SPARC32_NWINDOWS;
-        if ((interp_wim & (1U << tgt)) != 0U) {
-            if (!interp_spill_to(ctx, tgt, new_sp)) {
+        if (ctx->canrestore >= SPARC32_WIN_MAXSAVE) {
+            uint32_t prev_w =
+                (tgt + SPARC32_NWINDOWS - 1U) % SPARC32_NWINDOWS;
+            uint32_t spill_sp = interp_winfile[prev_w][8U + 6U];
+            if (spill_sp == 0U) {
+                spill_sp = new_sp;
+            }
+            if (!interp_spill_to(ctx, tgt, spill_sp)) {
                 return false;
             }
-            interp_wim &= ~(1U << tgt);
-            interp_wim |= 1U << ((tgt + SPARC32_NWINDOWS - 1U) %
-                SPARC32_NWINDOWS);
         }
         for (i = 0; i < 8U; i++) {
             old_o[i] = ctx->r[SPARC32_O0 + i];
@@ -136,15 +141,14 @@ bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
             interp_winfile[ctx->cwp][i] = ctx->r[SPARC32_L0 + i];
             interp_winfile[ctx->cwp][8U + i] = ctx->r[SPARC32_I0 + i];
         }
-        if ((interp_wim & (1U << tgt)) != 0U) {
+        if (ctx->canrestore == 0U) {
             if (ctx->trace_enabled) {
-                fprintf(stderr, "T underfill tgt=%u wim=%08x post_sp=%08x\n",
-                        tgt, interp_wim, post_sp);
+                fprintf(stderr, "T underfill tgt=%u post_sp=%08x\n",
+                        tgt, post_sp);
             }
             if (!interp_fill_from(ctx, tgt, post_sp)) {
                 return false;
             }
-            interp_wim &= ~(1U << tgt);
         }
         for (i = 0; i < 8U; i++) {
             ctx->r[SPARC32_O0 + i] = old_i[i];

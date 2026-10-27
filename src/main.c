@@ -66,7 +66,13 @@ static int parse_args(sparc32_ctx_t *ctx, int argc, char **argv)
 {
     int i = 1;
 
-    while (i < argc && strcmp(argv[i], "--") != 0) {
+    while (i < argc) {
+        if (strcmp(argv[i], "--") == 0) {
+            return (i + 1 < argc) ? (i + 1) : -1;
+        }
+        if (argv[i][0] != '-') {
+            return i;
+        }
         if (strcmp(argv[i], "--help") == 0) {
             usage(stdout);
             exit(0);
@@ -119,10 +125,7 @@ static int parse_args(sparc32_ctx_t *ctx, int argc, char **argv)
         i += 2;
     }
 
-    if (i >= argc) {
-        return -1; /* missing "-- PATH" */
-    }
-    return i + 1; /* first token after "--" */
+    return -1;
 }
 
 static void apply_env(sparc32_ctx_t *ctx)
@@ -346,7 +349,7 @@ int main(int argc, char **argv)
     ctx.host_envp = environ;
 
     if (ctx.engine < 0) {
-        ctx.engine = SPARC32_ENGINE_INTERP; /* default oracle engine */
+        ctx.engine = SPARC32_ENGINE_DBT; /* default DBT engine */
     }
     if (ctx.difftest) {
         if (load_guest(&ctx) != 0) {

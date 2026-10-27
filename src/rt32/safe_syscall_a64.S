@@ -35,8 +35,13 @@
 
     .text
     .align 2
+#ifdef __APPLE__
+    .globl _rt32_safe_syscall
+_rt32_safe_syscall:
+#else
     .globl rt32_safe_syscall
     .type rt32_safe_syscall, %function
+#endif
 rt32_safe_syscall:
     mov     x8, x0
     mov     x0, x1
@@ -47,6 +52,13 @@ rt32_safe_syscall:
     mov     x5, x6
     svc     #0
     ret
-rt32_safe_syscall_end:
+#ifdef __APPLE__
+    .globl _rt32_safe_syscall_end
+_rt32_safe_syscall_end:
+#else
     .globl rt32_safe_syscall_end
+#endif
+rt32_safe_syscall_end:
+#ifndef __APPLE__
     .size rt32_safe_syscall, . - rt32_safe_syscall
+#endif

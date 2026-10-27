@@ -227,7 +227,7 @@ static long sys_openat(sparc32_ctx_t *ctx, int32_t dirfd, uint32_t path_va,
     if (rc != 0) {
         return rc;
     }
-    /* L5a hook: /proc/self/* served from translator state, all else host. */
+    /* L5a hook: /proc/self/<name> served from translator state, all else host. */
     rc = rt32_procfs_openat(ctx, (dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)dirfd,
         path, host_flags, (mode_t)(mode & 0777U));
     return rc;

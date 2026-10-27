@@ -453,22 +453,16 @@ static int fp_emit_convert(sparc32_emit_ctx_t *ec, uint32_t opf,
         fp_fpcr_restore(b);
         fp_st_d(b, rd, FVD);
         return b->overflow ? -1 : 0;
-    case 0x0D1U: /* FsTOi: single -> int bits (RD-rounded) */
+    case 0x0D1U: /* FsTOi: single -> int bits (always RZ per V8 B.28) */
         fp_ld_s(b, FVA, rs2);
-        fp_rd_load(b);
-        fp_fpcr_set_rmode(b, FS0, FS1);
-        fp2(b, 0x1E28C000U, 0, FVA, FVA);
         a64_emit_fcvtzs_s_to_w(b, FS0, FVA);
-        fp_fpcr_restore(b);
+        fp_flags_commit(b);
         a64_emit_str_imm_w(b, FS0, A64_XCTX, fp_s_off(rd));
         return b->overflow ? -1 : 0;
-    case 0x0D2U: /* FdTOi: double -> int bits (RD-rounded) */
+    case 0x0D2U: /* FdTOi: double -> int bits (always RZ per V8 B.28) */
         fp_ld_d(b, FVA, rs2);
-        fp_rd_load(b);
-        fp_fpcr_set_rmode(b, FS0, FS1);
-        fp2(b, 0x1E28C000U, 1, FVA, FVA);
         a64_emit_fcvtzs_d_to_w(b, FS0, FVA);
-        fp_fpcr_restore(b);
+        fp_flags_commit(b);
         a64_emit_str_imm_w(b, FS0, A64_XCTX, fp_s_off(rd));
         return b->overflow ? -1 : 0;
     case 0x0C9U: /* FsTOd: single -> double */

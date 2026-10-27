@@ -26,6 +26,10 @@
 #include <sys/random.h>
 #endif
 
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
 #define RT32_STACK_SIZE (8U * 1024U * 1024U)
 
 /* SPARC Linux AT_* tags used by the Phase-0 initial stack. */

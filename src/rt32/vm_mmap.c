@@ -23,6 +23,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
 /* Ensure the Regime VM observes the rt32 window (RC-U3-r2 #4):
  * vm32_attach is idempotent, so mapping operations call it
  * unconditionally before publishing. */

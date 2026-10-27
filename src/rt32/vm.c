@@ -23,9 +23,19 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
+
+static size_t vm_host_page_size(void)
+{
+    long p = sysconf(_SC_PAGESIZE);
+    return (p > (long)SPARC32_PAGE_SIZE) ? (size_t)p : (size_t)SPARC32_PAGE_SIZE;
+}
 
 static _Atomic uint32_t g_vm_lock = 0U;
 static sparc32_ctx_t   *g_vm_root_ctx = NULL;
@@ -52,8 +62,20 @@ uint64_t vm_page_align_up(uint64_t v)
 
 int vm_reserve_prot_none(sparc32_ctx_t *ctx, uint32_t start, uint32_t len)
 {
-    void *res = mmap(sparc32_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    size_t hp = vm_host_page_size();
+    void *res;
+    if (hp > (size_t)SPARC32_PAGE_SIZE) {
+        uint32_t mask = (uint32_t)hp - 1U;
+        uint32_t in_start = (start + mask) & ~mask;
+        uint32_t in_end   = (start + len) & ~mask;
+        if (in_end > in_start) {
+            (void)mprotect(sparc32_guest_ptr(ctx, in_start),
+                           (size_t)(in_end - in_start), PROT_NONE);
+        }
+        return 0;
+    }
+    res = mmap(sparc32_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (res == MAP_FAILED) {
         return -errno;
     }
@@ -422,12 +444,17 @@ static int try_reserve_window(uint64_t base)
     map_len   = (base == 0ULL) ? (RT32_WINDOW_SIZE - (uint64_t)SPARC32_LOW_GUARD_SIZE)
                                : RT32_WINDOW_SIZE;
 
+#ifdef __linux__
     res = mmap((void *)(uintptr_t)map_start, (size_t)map_len, PROT_NONE,
                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (res == MAP_FAILED && (errno == EINVAL || errno == EOPNOTSUPP)) {
         res = mmap((void *)(uintptr_t)map_start, (size_t)map_len, PROT_NONE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     }
+#else
+    res = mmap((void *)(uintptr_t)map_start, (size_t)map_len, PROT_NONE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
     if (res == MAP_FAILED) {
         return -1;
     }
@@ -589,14 +616,30 @@ uint32_t rt32_vm_brk(sparc32_ctx_t *ctx, uint32_t new_brk)
         }
         {
             uint32_t len = new_page - old_page;
-            void *host_addr = sparc32_guest_ptr(ctx, old_page);
-            void *res = mmap(host_addr, len, PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-            if (res == MAP_FAILED) {
-                uint32_t curr = g_vm_brk_curr;
-                vm_sync_brk_to_ctx(ctx);
-                vm_lock_release();
-                return curr;
+            size_t hp = vm_host_page_size();
+            if (hp > (size_t)SPARC32_PAGE_SIZE) {
+                uint32_t mask = (uint32_t)hp - 1U;
+                uint32_t hp_start = old_page & ~mask;
+                uint32_t hp_end   = (new_page + mask) & ~mask;
+                if (mprotect(sparc32_guest_ptr(ctx, hp_start),
+                             (size_t)(hp_end - hp_start),
+                             PROT_READ | PROT_WRITE) != 0) {
+                    uint32_t curr = g_vm_brk_curr;
+                    vm_sync_brk_to_ctx(ctx);
+                    vm_lock_release();
+                    return curr;
+                }
+                memset(sparc32_guest_ptr(ctx, old_page), 0, (size_t)len);
+            } else {
+                void *host_addr = sparc32_guest_ptr(ctx, old_page);
+                void *res = mmap(host_addr, len, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if (res == MAP_FAILED) {
+                    uint32_t curr = g_vm_brk_curr;
+                    vm_sync_brk_to_ctx(ctx);
+                    vm_lock_release();
+                    return curr;
+                }
             }
         }
         (void)vm_record_region_locked(old_page, new_page,

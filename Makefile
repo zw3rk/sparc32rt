@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 .DEFAULT_GOAL := help
-.PHONY: help all build check check-line-limits check-abi-invariants clean
+.PHONY: help all build build-darwin check check-line-limits check-abi-invariants clean
 
 BUILD_DIR := _build
 
@@ -25,8 +25,11 @@ HOST_CC ?= cc
 # POSIX feature-test macro is visible; expose exactly that on Linux (keeps
 # -pedantic and every prescribed warning intact). On macOS the macro would
 # hide MAP_ANONYMOUS, so it stays Linux-only.
+U3_PROBE_CC := $(or $(CC),cc)
 CFLAGS  ?= -std=c11 -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
-ifeq ($(shell uname -s),Linux)
+ifeq ($(findstring darwin,$(shell $(U3_PROBE_CC) -dumpmachine 2>/dev/null)),darwin)
+  CFLAGS += -D_DARWIN_C_SOURCE
+else
   CFLAGS += -D_POSIX_C_SOURCE=200809L
 endif
 LDFLAGS ?= -static-pie
@@ -37,7 +40,6 @@ LDFLAGS ?= -static-pie
 # Wave U3: exactly one host backend joins the build (both define the same
 # rt_host_* symbols). Selected from the compiler target triple so
 # cross-builds get backend_linux even when the build host is Darwin.
-U3_PROBE_CC := $(or $(CC),cc)
 ifeq ($(findstring darwin,$(shell $(U3_PROBE_CC) -dumpmachine 2>/dev/null)),darwin)
 U3_BACKEND_SRC := src/os/backend_darwin.c
 else
@@ -73,6 +75,12 @@ help: ## Show available build and verification targets
 all: build ## Build everything (currently just the sparc32rt binary)
 
 build: $(SPARC32RT_BIN) ## Build static-PIE sparc32rt binary (cross: aarch64-unknown-linux-musl-gcc)
+
+build-darwin: ## Build native darwin-arm64 binary (Backend 2) with host cc
+	@$(MAKE) $(BUILD_DIR)/sparc32rt-darwin CC=cc OBJ_DIR=$(BUILD_DIR)/darwin-obj \
+		SPARC32RT_BIN=$(BUILD_DIR)/sparc32rt-darwin \
+		CFLAGS="-std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32" \
+		LDFLAGS=""
 
 $(SPARC32RT_BIN): $(OBJS)
 	@printf "\033[32m▸ Linking\033[0m $@ (CC=$(CC))\n"

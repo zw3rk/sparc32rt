@@ -35,6 +35,10 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <libkern/OSCacheControl.h>
+#include <pthread.h>
+#endif
 
 #include "sparc32rt.h"
 #include "dbt/aot/mem_site.h"
@@ -93,6 +97,7 @@ static uint8_t *g_arena_base;
 static size_t g_arena_used;
 static bool g_arena_published;
 
+#ifndef __APPLE__
 static size_t dbt_page_span(void)
 {
     long page = sysconf(_SC_PAGESIZE);
@@ -103,6 +108,7 @@ static size_t dbt_page_span(void)
     p = (size_t)page;
     return (g_arena_used + p - 1U) & ~(p - 1U);
 }
+#endif
 
 static void dbt_arena_reset(void)
 {
@@ -119,21 +125,34 @@ static void dbt_arena_reset(void)
 static bool dbt_arena_ensure_rw(sparc32_ctx_t *ctx)
 {
     if (g_arena_base == NULL) {
+#ifdef __APPLE__
+        void *p = mmap(NULL, DBT_CODE_ARENA_SIZE,
+            PROT_READ | PROT_WRITE | PROT_EXEC,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+#else
         void *p = mmap(NULL, DBT_CODE_ARENA_SIZE,
             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
         if (p == MAP_FAILED) {
             return false;
         }
+#ifdef __APPLE__
+        pthread_jit_write_protect_np(0);
+#endif
         g_arena_base = (uint8_t *)p;
         g_arena_used = 0;
         g_arena_published = false;
         return true;
     }
     if (g_arena_published) {
+#ifdef __APPLE__
+        pthread_jit_write_protect_np(0);
+#else
         if (mprotect((void *)g_arena_base, dbt_page_span(),
                 PROT_READ | PROT_WRITE) != 0) {
             return false;
         }
+#endif
         g_arena_published = false;
         if (ctx != NULL) {
             ctx->wx_transitions += 1U;
@@ -163,19 +182,25 @@ uint32_t *dbt_code_reserve(sparc32_ctx_t *ctx, size_t n_words)
 
 int dbt_code_publish(sparc32_ctx_t *ctx)
 {
-    size_t span;
     if (g_arena_base == NULL || g_arena_used == 0U) {
         return 0;
     }
     if (g_arena_published) {
         return 0;
     }
-    span = dbt_page_span();
-    if (mprotect((void *)g_arena_base, span, PROT_READ | PROT_EXEC) != 0) {
-        return -1;
+#ifdef __APPLE__
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate((void *)g_arena_base, g_arena_used);
+#else
+    {
+        size_t span = dbt_page_span();
+        if (mprotect((void *)g_arena_base, span, PROT_READ | PROT_EXEC) != 0) {
+            return -1;
+        }
+        __builtin___clear_cache((char *)g_arena_base,
+            (char *)g_arena_base + g_arena_used);
     }
-    __builtin___clear_cache((char *)g_arena_base,
-        (char *)g_arena_base + g_arena_used);
+#endif
     g_arena_published = true;
     if (ctx != NULL) {
         ctx->wx_transitions += 1U;
@@ -477,7 +502,7 @@ static void dbt_ibtc_fill(sparc32_ctx_t *ctx, uint32_t pc, const void *code)
     e->key = pc;
     e->epoch = g_cache_epoch;
     e->host_code = code;
-    e->entry = (void *)e;
+    e->entry = (void *)&g_chain[dbt_cache_index(pc)];
 }
 
 static void dbt_ras_push(sparc32_ctx_t *ctx, uint32_t ret_pc,
@@ -492,7 +517,7 @@ static void dbt_ras_push(sparc32_ctx_t *ctx, uint32_t ret_pc,
     slot->key = ret_pc;
     slot->epoch = g_cache_epoch;
     slot->host_code = ret_code;
-    slot->entry = (void *)slot;
+    slot->entry = (void *)&g_chain[dbt_cache_index(ret_pc)];
 }
 
 static const void *dbt_ras_peek(const sparc32_ctx_t *ctx, uint32_t pc)

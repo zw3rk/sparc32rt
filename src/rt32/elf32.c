@@ -24,6 +24,16 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
+static size_t elf_host_page(void)
+{
+    long p = sysconf(_SC_PAGESIZE);
+    return (p > (long)SPARC32_PAGE_SIZE) ? (size_t)p : (size_t)SPARC32_PAGE_SIZE;
+}
+
 #define EI_NIDENT   16U
 #define ELFCLASS32  1U
 #define ELFDATA2MSB 2U
@@ -154,8 +164,20 @@ static int pread_full(int fd, void *buf, size_t count, off_t offset)
 static int protect_and_record_seg(sparc32_ctx_t *ctx, uint32_t start, uint32_t end,
                                   uint32_t guest_prot, const char *label)
 {
-    if (mprotect(sparc32_guest_ptr(ctx, start), end - start,
-                 sparc32_host_prot(ctx, guest_prot)) != 0) {
+    size_t hp = elf_host_page();
+    if (hp > (size_t)SPARC32_PAGE_SIZE) {
+        uint32_t mask = (uint32_t)hp - 1U;
+        uint32_t hp_start = start & ~mask;
+        uint32_t hp_end   = (end + mask) & ~mask;
+        int hprot = (guest_prot == 0U) ? PROT_NONE : (PROT_READ | PROT_WRITE);
+        if (mprotect(sparc32_guest_ptr(ctx, hp_start), hp_end - hp_start,
+                     hprot) != 0) {
+            fprintf(stderr, "sparc32rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
+                    label, start, end, strerror(errno));
+            return -1;
+        }
+    } else if (mprotect(sparc32_guest_ptr(ctx, start), end - start,
+                        sparc32_host_prot(ctx, guest_prot)) != 0) {
         fprintf(stderr, "sparc32rt: %s: mprotect failed on [0x%x, 0x%x): %s\n",
                 label, start, end, strerror(errno));
         return -1;
@@ -373,7 +395,11 @@ static int load_elf32_image(sparc32_ctx_t *ctx, int fd, uint32_t default_pie_bas
         shared_end  = (map_end < map_start) ? map_end : map_start;
         merged_prot = highest_mapped_prot | guest_prot;
         if (page_start < map_start) {
-            if (mprotect(sparc32_guest_ptr(ctx, page_start), shared_end - page_start,
+            size_t hp = elf_host_page();
+            uint32_t mask = (uint32_t)hp - 1U;
+            uint32_t hp_start = page_start & ~mask;
+            uint32_t hp_end   = (shared_end + mask) & ~mask;
+            if (mprotect(sparc32_guest_ptr(ctx, hp_start), hp_end - hp_start,
                          PROT_READ | PROT_WRITE) != 0) {
                 fprintf(stderr, "sparc32rt: %s: mprotect RW failed on shared page [0x%x, 0x%x): %s\n",
                         label, page_start, shared_end, strerror(errno));
@@ -382,13 +408,27 @@ static int load_elf32_image(sparc32_ctx_t *ctx, int fd, uint32_t default_pie_bas
         }
 
         if (map_end > map_start) {
-            void *res = mmap(sparc32_guest_ptr(ctx, map_start), map_end - map_start,
-                             PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-            if (res == MAP_FAILED) {
-                fprintf(stderr, "sparc32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
-                        label, map_start, map_end, strerror(errno));
-                return -1;
+            size_t hp = elf_host_page();
+            if (hp > (size_t)SPARC32_PAGE_SIZE) {
+                uint32_t mask = (uint32_t)hp - 1U;
+                uint32_t hp_start = map_start & ~mask;
+                uint32_t hp_end   = (map_end + mask) & ~mask;
+                if (mprotect(sparc32_guest_ptr(ctx, hp_start), hp_end - hp_start,
+                             PROT_READ | PROT_WRITE) != 0) {
+                    fprintf(stderr, "sparc32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
+                            label, map_start, map_end, strerror(errno));
+                    return -1;
+                }
+                memset(sparc32_guest_ptr(ctx, map_start), 0, map_end - map_start);
+            } else {
+                void *res = mmap(sparc32_guest_ptr(ctx, map_start), map_end - map_start,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if (res == MAP_FAILED) {
+                    fprintf(stderr, "sparc32rt: %s: failed to map segment [0x%x, 0x%x): %s\n",
+                            label, map_start, map_end, strerror(errno));
+                    return -1;
+                }
             }
         }
 

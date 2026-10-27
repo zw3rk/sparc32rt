@@ -183,13 +183,14 @@ bool sparc32_fp_step(sparc32_ctx_t *ctx, uint32_t pc,
         return true;
     case FP_OPF_FSTOI:
         /* The converted integer lands in the FP register file (the V8
-         * FPop format names %f registers on both sides). */
+         * FPop format names %f registers on both sides); V8 B.28 fixes
+         * rounding toward zero (FP_RD_RZ), ignoring FSR.RD. */
         fp_put_s(ctx, rd, fp_to_i32(ctx,
-            (double)fp_u32_to_f32(fp_get_s(ctx, rs2)), fp_rd(ctx)));
+            (double)fp_u32_to_f32(fp_get_s(ctx, rs2)), FP_RD_RZ));
         return true;
     case FP_OPF_FDTOI:
         fp_put_s(ctx, rd, fp_to_i32(ctx,
-            fp_u64_to_f64(fp_get_d(ctx, rs2)), fp_rd(ctx)));
+            fp_u64_to_f64(fp_get_d(ctx, rs2)), FP_RD_RZ));
         return true;
     case FP_OPF_FSTOD:
         fp_put_d(ctx, rd, fp_f32_to_f64(ctx, fp_get_s(ctx, rs2)));

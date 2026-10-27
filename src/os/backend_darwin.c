@@ -41,6 +41,14 @@
 #include <sys/time.h>
 #endif
 
+#ifndef MAP_ANONYMOUS
+#ifdef MAP_ANON
+#define MAP_ANONYMOUS MAP_ANON
+#else
+#define MAP_ANONYMOUS 0x1000
+#endif
+#endif
+
 /* Shared with backend_linux.c: the kind probe lives in one TU only. */
 size_t rt_host_page_size_darwin(void)
 {
@@ -217,8 +225,21 @@ int rt_host_map_anon(void *hint_addr, size_t len, int linux_prot,
     if ((linux_prot & 4) != 0) {
         prot |= PROT_READ;
     }
-    if (fixed != 0) {
-        flags |= MAP_FIXED;
+    if (fixed != 0 && hint_addr != NULL) {
+        size_t hp = rt_host_page_size_darwin();
+        uintptr_t start = (uintptr_t)hint_addr;
+        uintptr_t end = start + len;
+        uintptr_t hp_start = start & ~(uintptr_t)(hp - 1u);
+        uintptr_t hp_end = (end + (uintptr_t)(hp - 1u)) & ~(uintptr_t)(hp - 1u);
+        int hprot = (prot == 0) ? PROT_NONE : (PROT_READ | PROT_WRITE);
+        if (mprotect((void *)hp_start, hp_end - hp_start, hprot) != 0) {
+            return -errno;
+        }
+        if (hprot != PROT_NONE) {
+            memset(hint_addr, 0, len);
+        }
+        *out_host_addr = hint_addr;
+        return 0;
     }
     p = mmap(hint_addr, len, prot, flags, -1, 0);
     if (p == MAP_FAILED) {
@@ -262,23 +283,21 @@ int rt_host_unmap(void *host_addr, size_t len)
  * unsuffixed name the Linux backend exports, so the Darwin link closes).
  * PROT translation mirrors rt_host_map_anon above: PROT_EXEC never
  * becomes host-exec (W^X; guest data pages stay data, JIT code lives in
- * its own MAP_JIT arena). The caller guarantees a host-page-aligned
- * file offset; anything else fails instead of silently rounding.
+ * its own MAP_JIT arena).
  */
 int rt_host_map_file(void *hint_addr, size_t len, int linux_prot, int shared,
     int fixed, int host_fd, uint64_t aligned_file_offset,
     void **out_host_addr)
 {
 #if defined(__APPLE__)
-    long host_page = sysconf(_SC_PAGESIZE);
+    size_t hp = rt_host_page_size_darwin();
     int prot = 0;
     int flags = (shared != 0) ? MAP_SHARED : MAP_PRIVATE;
     void *p;
     if (out_host_addr == NULL || len == 0u || host_fd < 0) {
         return -EINVAL;
     }
-    if (host_page <= 0 ||
-        (aligned_file_offset % (uint64_t)host_page) != 0u) {
+    if ((aligned_file_offset % 4096u) != 0u) {
         return -EINVAL;
     }
     if ((linux_prot & 1) != 0) {
@@ -289,6 +308,26 @@ int rt_host_map_file(void *hint_addr, size_t len, int linux_prot, int shared,
     }
     if ((linux_prot & 4) != 0) {
         prot |= PROT_READ;
+    }
+    if (fixed != 0 && hint_addr != NULL &&
+        (((uintptr_t)hint_addr % hp) != 0u || (len % hp) != 0u ||
+         (aligned_file_offset % (uint64_t)hp) != 0u)) {
+        uintptr_t start = (uintptr_t)hint_addr;
+        uintptr_t end = start + len;
+        uintptr_t hp_start = start & ~(uintptr_t)(hp - 1u);
+        uintptr_t hp_end = (end + (uintptr_t)(hp - 1u)) & ~(uintptr_t)(hp - 1u);
+        ssize_t n;
+        if (mprotect((void *)hp_start, hp_end - hp_start,
+                PROT_READ | PROT_WRITE) != 0) {
+            return -errno;
+        }
+        memset(hint_addr, 0, len);
+        n = pread(host_fd, hint_addr, len, (off_t)aligned_file_offset);
+        if (n < 0) {
+            return -errno;
+        }
+        *out_host_addr = hint_addr;
+        return 0;
     }
     if (fixed != 0) {
         flags |= MAP_FIXED;
@@ -316,17 +355,16 @@ int rt_host_map_file(void *hint_addr, size_t len, int linux_prot, int shared,
 /*
  * Host protection change for src/rt32/vm_mmap.c (RC-U3-r2 #4: unsuffixed
  * name matching the Linux backend). Same PROT translation as the map
- * primitives above (no host-exec). The caller passes page-aligned
- * address/length; anything else fails.
+ * primitives above (no host-exec).
  */
 int rt_host_protect(void *host_addr, size_t len, int linux_prot)
 {
 #if defined(__APPLE__)
-    long host_page = sysconf(_SC_PAGESIZE);
+    size_t hp = rt_host_page_size_darwin();
     int prot = 0;
-    if (host_addr == NULL || len == 0u || host_page <= 0 ||
-        ((uintptr_t)host_addr % (uintptr_t)host_page) != 0u ||
-        (len % (size_t)host_page) != 0u) {
+    if (host_addr == NULL || len == 0u ||
+        ((uintptr_t)host_addr % 4096u) != 0u ||
+        (len % 4096u) != 0u) {
         return -EINVAL;
     }
     if ((linux_prot & 1) != 0) {
@@ -337,6 +375,17 @@ int rt_host_protect(void *host_addr, size_t len, int linux_prot)
     }
     if ((linux_prot & 4) != 0) {
         prot |= PROT_READ;
+    }
+    if (hp > 4096u) {
+        uintptr_t start = (uintptr_t)host_addr;
+        uintptr_t end = start + len;
+        uintptr_t hp_start = start & ~(uintptr_t)(hp - 1u);
+        uintptr_t hp_end = (end + (uintptr_t)(hp - 1u)) & ~(uintptr_t)(hp - 1u);
+        int hprot = (prot == 0) ? PROT_NONE : (PROT_READ | PROT_WRITE);
+        if (mprotect((void *)hp_start, hp_end - hp_start, hprot) != 0) {
+            return -errno;
+        }
+        return 0;
     }
     if (mprotect(host_addr, len, prot) != 0) {
         return -errno;

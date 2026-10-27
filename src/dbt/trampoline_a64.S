@@ -80,33 +80,44 @@
     stp d14, d15, [sp, #-16]!
     .endm
 
+#ifdef __APPLE__
+    .globl _dbt_enter_block
+_dbt_enter_block:
+#else
     .globl dbt_enter_block
     .type dbt_enter_block, %function
+#endif
 dbt_enter_block:
     DBT_ENTER_PROLOGUE
     /* x27 = chaining entry, x28 = live epoch word (chaining allowed). */
     mov x27, x2
     mov x28, x3
     b .Ldbt_enter_go
+#ifndef __APPLE__
     .size dbt_enter_block, .-dbt_enter_block
+#endif
 
+#ifdef __APPLE__
+    .globl _dbt_enter_step
+_dbt_enter_step:
+#else
     .globl dbt_enter_step
     .type dbt_enter_step, %function
+#endif
 dbt_enter_step:
     DBT_ENTER_PROLOGUE
     /* x27 = chaining entry (slots NULL, probes bail); x28 = zero epoch
      * word so every epoch-gated chain probe bails: single execution. */
     mov x27, x2
-    adrp x28, .Ldbt_zero_epoch
-    add x28, x28, :lo12:.Ldbt_zero_epoch
+    adr x28, .Ldbt_zero_epoch
     b .Ldbt_enter_go
+#ifndef __APPLE__
     .size dbt_enter_step, .-dbt_enter_step
+#endif
 
-    .section .rodata
     .align 2
 .Ldbt_zero_epoch:
     .word 0
-    .text
 
 /*
  * Chain-tail helper for emitted indirect exits: x0 = ctx, x1 = guest
@@ -117,8 +128,13 @@ dbt_enter_step:
  * temporaries (x2-x5); x18 untouched.
  */
     .align 2
+#ifdef __APPLE__
+    .globl _dbt_ibtc_tail
+_dbt_ibtc_tail:
+#else
     .globl dbt_ibtc_tail
     .type dbt_ibtc_tail, %function
+#endif
 dbt_ibtc_tail:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
@@ -142,4 +158,6 @@ dbt_ibtc_tail:
     str w1, [x0, #0x144]
     ldp x29, x30, [sp], #16
     ret
+#ifndef __APPLE__
     .size dbt_ibtc_tail, .-dbt_ibtc_tail
+#endif

@@ -7,7 +7,7 @@
  * Lane L5a (Phase 5): absolute /proc/self/{exe,maps,cmdline,stat,auxv}
  * paths are served from translator state (guest mappings, argv, auxv
  * snapshot) — never the host's. Everything else (including other
- * /proc/self/* such as oom_score_adj) falls through to the host.
+ * /proc/self/<name> such as oom_score_adj) falls through to the host.
  * All entry points return host-style results (>= 0 value, negative
  * host errno); the openat path argument is a NUL-terminated host copy.
  */

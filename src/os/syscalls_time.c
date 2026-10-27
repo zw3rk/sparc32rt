@@ -92,8 +92,29 @@ long sparc32_l2a_clock_nanosleep(sparc32_ctx_t *ctx, uint32_t clk_id,
     }
     req.tv_sec = (time_t)sec;
     req.tv_nsec = (long)nsec;
+#if defined(__APPLE__)
+    if (flags == 1U) {
+        struct timespec now;
+        if (clock_gettime(host_clk, &now) != 0) {
+            return -(long)errno;
+        }
+        if (req.tv_sec < now.tv_sec ||
+            (req.tv_sec == now.tv_sec && req.tv_nsec <= now.tv_nsec)) {
+            return 0;
+        }
+        req.tv_sec -= now.tv_sec;
+        if (req.tv_nsec < now.tv_nsec) {
+            req.tv_sec -= 1;
+            req.tv_nsec += 1000000000L - now.tv_nsec;
+        } else {
+            req.tv_nsec -= now.tv_nsec;
+        }
+    }
+    rc = (nanosleep(&req, (rem_va != 0U) ? &rem : NULL) == 0) ? 0 : errno;
+#else
     rc = clock_nanosleep(host_clk, (int)flags, &req,
         (rem_va != 0U) ? &rem : NULL);
+#endif
     if (rc != 0) {
         long erc = -(long)rc;
         if (rc == EINTR && rem_va != 0U) {
@@ -114,8 +135,36 @@ long sparc32_l2a_clock_nanosleep(sparc32_ctx_t *ctx, uint32_t clk_id,
     return 0;
 }
 
-/* Guest buffer is __kernel_timespec: BE u64 tv_sec, BE u32 tv_nsec, 4 B pad. */
+/* Guest buffer for clock_gettime (257) is 32-bit old_timespec32:
+ * BE u32 tv_sec, BE u32 tv_nsec (8 bytes). */
 long sparc32_l2a_clock_gettime(sparc32_ctx_t *ctx, uint32_t clk_id,
+    uint32_t tp_va)
+{
+    struct timespec ts;
+    uint8_t b[8];
+    clockid_t host_clk;
+    switch (clk_id) {
+    case SP_CLOCK_REALTIME: host_clk = CLOCK_REALTIME; break;
+    case SP_CLOCK_MONOTONIC: host_clk = CLOCK_MONOTONIC; break;
+    default: return -EINVAL;
+    }
+    if (l2a_range_ok(tp_va, sizeof(b)) != 0) {
+        return -EFAULT;
+    }
+    if (clock_gettime(host_clk, &ts) != 0) {
+        return -(long)errno;
+    }
+    if (ts.tv_sec < 0) {
+        return -EOVERFLOW;
+    }
+    put_be32(b, (uint32_t)ts.tv_sec);
+    put_be32(b + 4, (uint32_t)ts.tv_nsec);
+    return l2a_store(ctx, tp_va, b, sizeof(b));
+}
+
+/* Guest buffer for clock_gettime64 (403) is __kernel_timespec:
+ * BE u64 tv_sec, BE u64 tv_nsec (16 bytes). */
+long sparc32_l2a_clock_gettime64(sparc32_ctx_t *ctx, uint32_t clk_id,
     uint32_t tp_va)
 {
     struct timespec ts;
@@ -137,7 +186,7 @@ long sparc32_l2a_clock_gettime(sparc32_ctx_t *ctx, uint32_t clk_id,
     }
     memset(b, 0, sizeof(b));
     put_be64(b, (uint64_t)ts.tv_sec);
-    put_be32(b + 8, (uint32_t)ts.tv_nsec);
+    put_be64(b + 8, (uint64_t)ts.tv_nsec);
     return l2a_store(ctx, tp_va, b, sizeof(b));
 }
 

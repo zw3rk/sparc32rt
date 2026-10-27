@@ -7,7 +7,7 @@
  * Absolute /proc/self/{exe,maps,cmdline,stat,auxv} paths are served
  * from translator state (guest region table, argv, auxv snapshot, exec
  * path) — never the host's. Everything else (including other
- * /proc/self/* entries such as oom_score_adj) falls through to the
+ * /proc/self/<name> entries such as oom_score_adj) falls through to the
  * host untouched. Synthetic files are presented through a pipe whose
  * read end is handed to the guest; reads are sequential.
  */
@@ -109,9 +109,19 @@ static long procfs_serve_bytes(const void *data, size_t len, int host_flags)
     int fds[2];
     size_t done = 0;
     int rw_flags;
+#if defined(__linux__)
     if (pipe2(fds, (host_flags & O_CLOEXEC) != 0 ? O_CLOEXEC : 0) != 0) {
         return -(long)errno;
     }
+#else
+    if (pipe(fds) != 0) {
+        return -(long)errno;
+    }
+    if ((host_flags & O_CLOEXEC) != 0) {
+        (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    }
+#endif
     rw_flags = fcntl(fds[0], F_GETFL);
     if (rw_flags >= 0 && (host_flags & O_NONBLOCK) != 0) {
         (void)fcntl(fds[0], F_SETFL, rw_flags | O_NONBLOCK);

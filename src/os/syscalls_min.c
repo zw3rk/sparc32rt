@@ -80,6 +80,8 @@ long sparc32_l2a_statx(sparc32_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
 long sparc32_l2a_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg);
 long sparc32_l2a_clock_gettime(sparc32_ctx_t *ctx, uint32_t clk_id,
     uint32_t tp_va);
+long sparc32_l2a_clock_gettime64(sparc32_ctx_t *ctx, uint32_t clk_id,
+    uint32_t tp_va);
 long sparc32_l2a_gettimeofday(sparc32_ctx_t *ctx, uint32_t tv_va,
     uint32_t tz_va);
 long sparc32_l2a_clock_nanosleep(sparc32_ctx_t *ctx, uint32_t clk_id,
@@ -442,16 +444,6 @@ static long sys_uname(sparc32_ctx_t *ctx, uint32_t buf_va)
     return 0;
 }
 
-/* set_tid_address(166): records clear_child_tid (used at thread exit
- * by Phase 4 clone/exit) and returns the caller's own tid, which musl
- * stores as the main thread's tid. The kernel writes nothing to
- * *tidptr here; the clear+wake happens at thread teardown. */
-static long sys_set_tid_address(sparc32_ctx_t *ctx, uint32_t tidptr_va)
-{
-    ctx->clear_child_tid = tidptr_va;
-    return (ctx->host_tid > 0) ? (long)ctx->host_tid : 1000L;
-}
-
 /* Big-endian guest word stores (guest is BE, host may be LE). */
 static int sys_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
 {
@@ -764,6 +756,9 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         break;
     case (long)SPARC32__NR_clock_gettime:
         ret = sparc32_l2a_clock_gettime(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_clock_gettime64:
+        ret = sparc32_l2a_clock_gettime64(ctx, o0, o1);
         break;
     case (long)SPARC32__NR_gettimeofday:
         ret = sparc32_l2a_gettimeofday(ctx, o0, o1);
