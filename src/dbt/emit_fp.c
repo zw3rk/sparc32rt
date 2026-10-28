@@ -54,14 +54,14 @@ static int fp_guard_fast(sparc32_emit_ctx_t *ec)
     size_t p_tem;
     a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
     a64_emit_ubfm_w(b, FS1, FS0, 30U, 31U);
-    p_rd = a64_emit_cbz_w_placeholder(b, true, FS1);
+    p_rd = a64_emit_cbz_w_placeholder(b, false, FS1);
     a64_emit_exit_undef(b, ec->fault_pc);
     if (b->overflow) {
         return -1;
     }
     a64_patch_cbz_w(b, p_rd, b->count);
     a64_emit_ubfm_w(b, FS1, FS0, 23U, 27U);
-    p_tem = a64_emit_cbz_w_placeholder(b, true, FS1);
+    p_tem = a64_emit_cbz_w_placeholder(b, false, FS1);
     a64_emit_exit_undef(b, ec->fault_pc);
     if (b->overflow) {
         return -1;
@@ -284,19 +284,21 @@ static void fp_cexc_clear(a64_buf_t *b)
 
 /* Merge fresh FPSR cumulative flags into guest FSR (NZCV already
  * consumed): cexc = permuted fresh bits (h4->b0, h1->b1, h3->b2,
- * h2->b3, h0->b4), aexc accrues. Uses w22 as the MRS target so the
- * convert result in FS0 stays live (header scratch contract). */
+ * h2->b3, h0->b4), aexc accrues. Uses FS3 (w21) as the MRS target so
+ * the convert result in FS0 stays live and EKEEP (w22, the JMPL
+ * delay-slot keeper in emit_int.c) is never touched: FP lowering in
+ * a JMPL delay slot must preserve the jump target. */
 static void fp_flags_commit(a64_buf_t *b)
 {
-    a64_emit(b, 0xD53B4420U | 22U); /* MRS w22, FPSR */
-    a64_emit_ubfm_w(b, FS1, 22U, 4U, 4U);
-    a64_emit_ubfm_w(b, FS2, 22U, 1U, 1U);
+    a64_emit(b, 0xD53B4420U | FS3); /* MRS w21, FPSR */
+    a64_emit_ubfm_w(b, FS1, FS3, 4U, 4U);
+    a64_emit_ubfm_w(b, FS2, FS3, 1U, 1U);
     a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 1U);
-    a64_emit_ubfm_w(b, FS2, 22U, 3U, 3U);
+    a64_emit_ubfm_w(b, FS2, FS3, 3U, 3U);
     a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 2U);
-    a64_emit_ubfm_w(b, FS2, 22U, 2U, 2U);
+    a64_emit_ubfm_w(b, FS2, FS3, 2U, 2U);
     a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 3U);
-    a64_emit_ubfm_w(b, FS2, 22U, 0U, 0U);
+    a64_emit_ubfm_w(b, FS2, FS3, 0U, 0U);
     a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 4U);
     /* fsr = (fsr & ~0x1F) | cexc | (cexc << 5). */
     a64_emit_ldr_imm_w(b, FS2, A64_XCTX, FP_FSR_OFF);

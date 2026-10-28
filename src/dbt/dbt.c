@@ -383,6 +383,23 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
         }
     }
     buf.guest_end_pc = end;
+    /* Direct-map collision: this bucket already holds another block.
+     * In-fragment chain probes validate the target epoch only, so a
+     * stale slot could otherwise chain into the new occupant without
+     * re-validation. Rotate the epoch (every stale slot/entry bails
+     * at its next probe) and install the new block under the fresh
+     * epoch. On counter wrap, drop all valid flags so no ancient
+     * block can re-validate against epoch 0. */
+    if (b->valid && b->start_pc != pc) {
+        g_cache_epoch++;
+        if (g_cache_epoch == 0U) {
+            size_t ci;
+            for (ci = 0U; ci < DBT_CACHE_SIZE; ci++) {
+                g_blocks[ci].valid = false;
+                memset(&g_chain[ci], 0, sizeof(g_chain[ci]));
+            }
+        }
+    }
     if (!have_insn) {
         /* Overflow on the very first insn: keep a needs_interp stub so
          * execution falls back to interp_step with identical protocol. */
@@ -530,6 +547,10 @@ static void dbt_ibtc_fill(sparc32_ctx_t *ctx, uint32_t pc, const void *code)
     e->entry = (void *)&g_chain[dbt_cache_index(pc)];
 }
 
+/* Next-free convention, matching the asm push/pop in
+ * a64_emit_fp.c (emit_ras_push_inline writes ras[old_top] then sets
+ * ras_top = (old_top + 1) & 63; the exit_branch_reg pop inspects
+ * ras[(ras_top - 1) & 63] and consumes on hit). */
 static void dbt_ras_push(sparc32_ctx_t *ctx, uint32_t ret_pc,
     const void *ret_code)
 {
@@ -537,17 +558,19 @@ static void dbt_ras_push(sparc32_ctx_t *ctx, uint32_t ret_pc,
     if (ret_code == NULL) {
         return;
     }
-    ctx->ras_top = (ctx->ras_top + 1U) % SPARC32_RAS_SIZE;
     slot = &ctx->ras[ctx->ras_top];
     slot->key = ret_pc;
     slot->epoch = g_cache_epoch;
     slot->host_code = ret_code;
     slot->entry = (void *)&g_chain[dbt_cache_index(ret_pc)];
+    ctx->ras_top = (ctx->ras_top + 1U) % SPARC32_RAS_SIZE;
 }
 
 static const void *dbt_ras_peek(const sparc32_ctx_t *ctx, uint32_t pc)
 {
-    const sparc32_ibtc_entry_t *top = &ctx->ras[ctx->ras_top];
+    const sparc32_ibtc_entry_t *top =
+        &ctx->ras[(ctx->ras_top + SPARC32_RAS_SIZE - 1U) %
+            SPARC32_RAS_SIZE];
     if (top->key == pc && top->epoch == g_cache_epoch &&
         top->host_code != NULL) {
         return top->host_code;

@@ -287,7 +287,7 @@ static void emit_ras_push_inline(a64_buf_t *b)
     a64_emit(b, 0x110006B0U);
     /* [4] and w16, w16, #0x3f */
     a64_emit(b, 0x12001610U);
-    /* [5] str w16, [x19, #480] (ctx->ras_top = (ras_top + 1) & 63) */
+    /* [5] str w16, [x19, #392] (ctx->ras_top = (ras_top + 1) & 63) */
     a64_emit(b, 0xB9000000U |
             ((((uint32_t)offsetof(sparc32_ctx_t, ras_top)) / 4U) << 10) |
             (A64_XCTX << 5) | 16U);
