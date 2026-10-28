@@ -13,6 +13,7 @@ V8 window backing store + WIM + SAVE/RESTORE executor (E01 model).
 #include "interp/interp_priv.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #define SPARC32_WIN_MAXSAVE 7U
 
@@ -44,17 +45,9 @@ bool interp_spill_to(sparc32_ctx_t *ctx, uint32_t w, uint32_t va)
 {
     uint8_t buf[SPARC32_RWINDOW_SIZE];
     uint32_t i;
-    for (i = 0; i < 8U; i++) {
-        uint32_t l = interp_winfile[w][i];
-        uint32_t k = interp_winfile[w][8U + i];
-        buf[4U * i] = (uint8_t)(l >> 24);
-        buf[4U * i + 1U] = (uint8_t)(l >> 16);
-        buf[4U * i + 2U] = (uint8_t)(l >> 8);
-        buf[4U * i + 3U] = (uint8_t)l;
-        buf[32U + 4U * i] = (uint8_t)(k >> 24);
-        buf[32U + 4U * i + 1U] = (uint8_t)(k >> 16);
-        buf[32U + 4U * i + 2U] = (uint8_t)(k >> 8);
-        buf[32U + 4U * i + 3U] = (uint8_t)k;
+    for (i = 0; i < 16U; i++) {
+        uint32_t be = __builtin_bswap32(interp_winfile[w][i]);
+        memcpy(&buf[4U * i], &be, 4U);
     }
     return interp_mem_wr(ctx, va, buf, SPARC32_RWINDOW_SIZE);
 }
@@ -68,15 +61,10 @@ bool interp_fill_from(sparc32_ctx_t *ctx, uint32_t w, uint32_t va)
     if (!interp_mem_rd(ctx, va, buf, SPARC32_RWINDOW_SIZE)) {
         return false;
     }
-    for (i = 0; i < 8U; i++) {
-        interp_winfile[w][i] = ((uint32_t)buf[4U * i] << 24) |
-            ((uint32_t)buf[4U * i + 1U] << 16) |
-            ((uint32_t)buf[4U * i + 2U] << 8) |
-            (uint32_t)buf[4U * i + 3U];
-        interp_winfile[w][8U + i] = ((uint32_t)buf[32U + 4U * i] << 24) |
-            ((uint32_t)buf[32U + 4U * i + 1U] << 16) |
-            ((uint32_t)buf[32U + 4U * i + 2U] << 8) |
-            (uint32_t)buf[32U + 4U * i + 3U];
+    for (i = 0; i < 16U; i++) {
+        uint32_t be;
+        memcpy(&be, &buf[4U * i], 4U);
+        interp_winfile[w][i] = __builtin_bswap32(be);
     }
     return true;
 }

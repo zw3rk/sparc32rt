@@ -23,6 +23,8 @@
 
 /*
  * Host AArch64 register allocation inside translated fragments (SPARC DBT):
+ *   w6..w13    : Direct-mapped write-through GPR cache (slot (r&31)&7);
+ *                caller-saved, dead across helper BLRs (tracked in a64_buf_t)
  *   w-regs     : Guest r[] window-view slots when live in registers;
  *                callee-saved w19..w26 hold them across the trampoline
  *   w15/x15    : Scratch 0 / exit guest PC
@@ -81,6 +83,8 @@ typedef struct a64_buf {
     unsigned  cond_branch_depth;
     uint32_t  guest_start_pc;
     uint32_t  guest_end_pc;
+    uint8_t   gpr_cache_valid;
+    uint8_t   gpr_cache_reg[8];
     bool      is_call;
     bool      lr_written_from_pc;
     bool      has_self_loop;
@@ -96,6 +100,7 @@ static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
     memset(b, 0, sizeof(*b));
     b->words = storage;
     b->cap   = cap;
+    b->gpr_cache_valid = 0;
     b->fp_fast_checked = false;
     b->fpsr_dirty = false;
 }
@@ -226,6 +231,83 @@ void a64_emit_ldrh_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte
 void a64_emit_strh_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
 void a64_emit_ldr_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
 void a64_emit_str_imm_w(a64_buf_t *b, unsigned rt, unsigned rn_x, uint32_t byte_offset);
+
+/* Direct-mapped write-through GPR cache in w6..w13 (slot (r&31)&7).
+ * r==0 reads zero / writes nop; stores write ctx first so faults see
+ * exact r[]; callers invalidate valid on helper BLRs and forked delays. */
+static inline void a64_gpr_load(a64_buf_t *b, unsigned wd, uint32_t rs)
+{
+    uint32_t r = rs & 31u;
+    unsigned sl = r & 7u;
+    unsigned cg = 6u + sl;
+    if (r == 0u) {
+        a64_emit_mov_imm32(b, wd, 0u);
+        return;
+    }
+    if ((((b->gpr_cache_valid >> sl) & 1u) != 0u) &&
+        b->gpr_cache_reg[sl] == (uint8_t)r) {
+        if (wd != cg) {
+            a64_emit_mov_w(b, wd, cg);
+        }
+        return;
+    }
+    a64_emit_ldr_imm_w(b, cg, A64_XCTX, r * 4u);
+    b->gpr_cache_valid |= (uint8_t)(1u << sl);
+    b->gpr_cache_reg[sl] = (uint8_t)r;
+    if (wd != cg) {
+        a64_emit_mov_w(b, wd, cg);
+    }
+}
+
+static inline void a64_gpr_store(a64_buf_t *b, uint32_t rd, unsigned ws)
+{
+    uint32_t r = rd & 31u;
+    unsigned sl = r & 7u;
+    unsigned cg = 6u + sl;
+    if (r == 0u) {
+        return;
+    }
+    a64_emit_str_imm_w(b, ws, A64_XCTX, r * 4u);
+    if (ws != cg) {
+        a64_emit_mov_w(b, cg, ws);
+    }
+    b->gpr_cache_valid |= (uint8_t)(1u << sl);
+    b->gpr_cache_reg[sl] = (uint8_t)r;
+}
+
+/* Inline JMPL target record (no helper BLR): STR ctx->jmpl_target + STRB
+ * ctx->jmpl_delay_armed=1. Far tail offsets use ADD+STR via tmp_x. */
+static inline void a64_jmpl_record(a64_buf_t *b, unsigned src_w,
+    unsigned tmp_x, unsigned val_w)
+{
+    uint32_t off_t = (uint32_t)offsetof(sparc32_ctx_t, jmpl_target);
+    uint32_t off_a = (uint32_t)offsetof(sparc32_ctx_t, jmpl_delay_armed);
+    uint32_t hi_t = off_t & ~0xFFFu;
+    uint32_t lo_t = off_t & 0xFFFu;
+    uint32_t hi_a = off_a & ~0xFFFu;
+    uint32_t lo_a = off_a & 0xFFFu;
+    if (hi_t == 0u) {
+        a64_emit_str_imm_w(b, src_w, A64_XCTX, off_t);
+    } else {
+        a64_emit(b, 0x91400000u | ((hi_t >> 12) << 10) |
+            ((A64_XCTX & 31u) << 5) | (tmp_x & 31u));
+        a64_emit_str_imm_w(b, src_w, tmp_x, lo_t);
+    }
+    a64_emit_mov_imm32(b, val_w, 1u);
+    if (hi_a == hi_t) {
+        if (hi_t == 0u) {
+            a64_emit_strb_imm_w(b, val_w, A64_XCTX, off_a);
+        } else {
+            a64_emit_strb_imm_w(b, val_w, tmp_x, lo_a);
+        }
+    } else if (hi_a == 0u) {
+        a64_emit_strb_imm_w(b, val_w, A64_XCTX, off_a);
+    } else {
+        a64_emit(b, 0x91400000u | ((hi_a >> 12) << 10) |
+            ((A64_XCTX & 31u) << 5) | (tmp_x & 31u));
+        a64_emit_strb_imm_w(b, val_w, tmp_x, lo_a);
+    }
+}
 
 /* Guest memory FP loads/stores via [xG, wAddr, uxtw] (SPARC is big-endian:
  * the Phase 2 DBT byte-swaps guest FP payloads around these primitives) */

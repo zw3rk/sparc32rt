@@ -590,17 +590,8 @@ void dbt_patch_chain(sparc32_ctx_t *ctx, const dbt_block_t *from,
     ctx->last_exec_entry = (void *)to->host_code;
 }
 
-/* ---- JMPL delay-slot fault recovery (Rev 4 4.3.3, RC-U3-r2 #3) ----
- * Emitted JMPL code calls dbt_jmpl_record_target before the delay slot;
- * a stop inside the slot then resolves npc from the per-context
- * ctx->jmpl_target instead of dest + 4, matching interp_cti. The target
- * lives on the context (not in the aot_sites.c global table, whose
- * 64 entries can be evicted by other live contexts); the table write is
- * retained only as metadata for static-site consumers. The arm is
- * per-execution (reset on block entry), so a stale target from an
- * earlier JMPL can never leak into an unrelated stop. */
-
-static _Thread_local bool t_jmpl_delay_armed;
+/* JMPL fault recovery: inline STRs record target+armed in ctx;
+ * commit resolves npc from ctx->jmpl_target; table kept as metadata. */
 
 void dbt_jmpl_record_target(sparc32_ctx_t *ctx, uint32_t target)
 {
@@ -608,8 +599,8 @@ void dbt_jmpl_record_target(sparc32_ctx_t *ctx, uint32_t target)
         return;
     }
     ctx->jmpl_target = target;
+    ctx->jmpl_delay_armed = 1u;
     aot_delay_target_set(ctx, target);
-    t_jmpl_delay_armed = true;
 }
 
 /* ---- Exit commit: w15/w16 -> pc/npc ----
@@ -632,10 +623,12 @@ static void dbt_commit(sparc32_ctx_t *ctx)
     case SPARC32_EXIT_TRAP:
     case SPARC32_EXIT_FAULT:
         ctx->pc = dest;
-        /* JMPL delay-slot stop (emitted fault_pc is the delay address):
-         * npc is the per-context recorded transfer target; any other
-         * stop resumes at dest + 4. */
-        ctx->npc = t_jmpl_delay_armed ? ctx->jmpl_target : dest + 4U;
+        if (ctx->jmpl_delay_armed != 0u) {
+            ctx->npc = ctx->jmpl_target;
+            aot_delay_target_set(ctx, ctx->jmpl_target);
+        } else {
+            ctx->npc = dest + 4U;
+        }
         break;
     case SPARC32_EXIT_SYSCALL:
         ctx->pc = dest - 4U;
@@ -698,9 +691,7 @@ static int dbt_exec_enter(sparc32_ctx_t *ctx, const dbt_block_t *b,
     bool allow_chain)
 {
     const void *chain;
-    /* Fresh execution: no JMPL delay recorded yet (fault recovery in
-     * dbt_commit arms only on a set inside this same execution). */
-    t_jmpl_delay_armed = false;
+    ctx->jmpl_delay_armed = 0u;
     if (b->host_code == NULL) {
         return dbt_exec_fallback(ctx, b);
     }

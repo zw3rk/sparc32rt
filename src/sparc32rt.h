@@ -222,6 +222,8 @@ typedef struct sparc32_ctx {
      * field (never the aot_sites.c global table, whose entries can be
      * evicted by other live contexts). */
     uint32_t jmpl_target;
+    uint8_t jmpl_delay_armed;
+    uint8_t jmpl_pad[3];
 } sparc32_ctx_t;
 
 /* ABI-locked offsets (Phase 2 trampoline + a64 emitter must agree). */

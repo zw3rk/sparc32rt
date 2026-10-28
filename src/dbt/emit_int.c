@@ -79,14 +79,12 @@ static uint32_t e_reg_off(uint32_t r)
 
 static void e_ldgreg(a64_buf_t *b, unsigned wd, uint32_t rs)
 {
-    a64_emit_ldr_imm_w(b, wd, A64_XCTX, e_reg_off(rs));
+    a64_gpr_load(b, wd, rs);
 }
 
 static void e_stgreg(a64_buf_t *b, uint32_t rd, unsigned ws)
 {
-    if (rd != 0u) {
-        a64_emit_str_imm_w(b, ws, A64_XCTX, e_reg_off(rd));
-    }
+    a64_gpr_store(b, rd, ws);
 }
 
 /* Materialize the ALU second operand (register value or sign-extended
@@ -140,6 +138,7 @@ static void e_mov64(a64_buf_t *b, unsigned rd, uint64_t v)
  * fault/trap PC (ec->fault_pc) in w15 and the reason in w16. */
 static void e_call_prologue(a64_buf_t *b, uint64_t addr)
 {
+    b->gpr_cache_valid = 0;
     a64_emit(b, A64_STR_X30_PRE);
     e_mov64(b, ES2, addr);
 }
@@ -161,9 +160,7 @@ static void e_call_invoke_faultable(sparc32_emit_ctx_t *ec)
     a64_patch_b_cond(b, p_cont, b->count);
 }
 
-/* DBT dispatcher hook (dbt.c): records the JMPL target for delay-slot
- * fault recovery and arms the commit-path npc lookup. */
-extern void dbt_jmpl_record_target(sparc32_ctx_t *ctx, uint32_t target);
+/* JMPL record is inline (a64_jmpl_record); dbt_commit reads ctx fields. */
 
 /* w0 = ctx (x19), preserving x20. */
 static void e_arg_ctx(a64_buf_t *b)
@@ -509,6 +506,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
          * (NONE after commit), never SINGLE_STEP. */
         sparc32_emit_cond_setup(b, cond);
         p_taken = a64_emit_b_cond_placeholder(b, s_a64_cond[cond & 15u]);
+        b->gpr_cache_valid = 0;
         if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
             rc = e_emit_delay(ec, npc);
             if (rc != 0) {
@@ -523,6 +521,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
             return rc;
         }
         a64_patch_b_cond(b, p_taken, b->count);
+        b->gpr_cache_valid = 0;
         if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
             rc = e_emit_delay(ec, npc);
             if (rc != 0) {
@@ -533,6 +532,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     sparc32_emit_cond_setup(b, cond);
     p_taken = a64_emit_b_cond_placeholder(b, s_a64_cond[cond & 15u]);
+    b->gpr_cache_valid = 0;
     if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
         rc = e_emit_delay(ec, npc);
         if (rc != 0) {
@@ -541,6 +541,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     a64_patch_b_cond(b, p_taken, b->count);
+    b->gpr_cache_valid = 0;
     if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
         rc = e_emit_delay(ec, npc);
         if (rc != 0) {
@@ -592,12 +593,8 @@ int sparc32_emit_call(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     return b->overflow ? -1 : 0;
 }
 
-/* Delay slots that can never stop with TRAP or FAULT need no
- * recorded JMPL target: inline SETHI/SHIFT, FLUSH/STBAR nops, and
- * plain ALU ops (op3 < 0x0E excludes UDIV/SDIV/tagged/MULScc) always
- * leave exit_reason NONE, so the dbt_commit recovery arm can never
- * observe them. SAVE/RESTORE keep the record: spill/fill through
- * interp_window can fault (interp_cti then resumes at npc/target). */
+/* Delays that cannot stop (SETHI/SHIFT/FLUSH/STBAR, ALU op3<0x0E) skip
+ * the record; SAVE/RESTORE keep it (spill/fill can fault). */
 static int e_delay_needs_jmpl_record(const sparc32_decoded_t *dl)
 {
     if (dl == NULL) {
@@ -637,20 +634,10 @@ int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         ec->delay->cls == (uint32_t)SPARC32_OP_TRAP) {
         return sparc32_emit_exit_singlestep(ec, pc);
     }
-    /* Target into the callee-saved keeper: delay-slot code (including
-     * helper calls) cannot clobber it. */
+    /* Target into keeper w22; inline STRs record it (no BLR, cache live). */
     e_ea_into(b, EKEEP, d);
-    /* Publish the dynamic target before the delay slot so fault recovery
-     * can resolve RT_NPC_DYNAMIC_CTX from the per-context ctx->jmpl_target
-     * (Rev 4 4.3.3, RC-U3-r2 #3). EKEEP (w22) is callee-saved, so the
-     * call keeps it. Delay slots that cannot stop with TRAP or FAULT
-     * skip the call (P4: most JMPL delays are SETHI/ALU/SHIFT). */
     if (e_delay_needs_jmpl_record(ec->delay) != 0) {
-        e_arg_ctx(b);
-        a64_emit_mov_w(b, 1u, EKEEP);
-        e_call_prologue(b, (uint64_t)(uintptr_t)&dbt_jmpl_record_target);
-        a64_emit(b, A64_BLR_BASE | ((ES2 & 31u) << 5));
-        a64_emit(b, A64_LDR_X30_POST);
+        a64_jmpl_record(b, EKEEP, ES2, ES0);
     }
     if (d->rd == SPARC32_O7) {
         b->is_call = true;

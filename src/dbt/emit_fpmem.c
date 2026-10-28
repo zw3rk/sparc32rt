@@ -164,6 +164,7 @@ static void fp_slowcall(a64_buf_t *b, uint32_t op3, uint32_t rd,
     size_t p_cont;
     sparc32_emit_fp_flush(b);
     b->fp_fast_checked = false;
+    b->gpr_cache_valid = 0;
     a64_emit_add_uxtw_x(b, 0U, A64_XCTX, A64_ZR);
     a64_emit_mov_w(b, 1U, FPMS0);
     a64_emit_mov_imm32(b, 2U, op3);

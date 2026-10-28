@@ -49,14 +49,12 @@ static void f_mov64(a64_buf_t *b, unsigned rd, uint64_t v)
 
 static void f_ldgreg(a64_buf_t *b, unsigned wd, uint32_t rs)
 {
-    a64_emit_ldr_imm_w(b, wd, A64_XCTX, (rs & 31u) * 4u);
+    a64_gpr_load(b, wd, rs);
 }
 
 static void f_stgreg(a64_buf_t *b, uint32_t rd, unsigned ws)
 {
-    if (rd != 0u) {
-        a64_emit_str_imm_w(b, ws, A64_XCTX, (rd & 31u) * 4u);
-    }
+    a64_gpr_store(b, rd, ws);
 }
 
 static void f_src2(a64_buf_t *b, unsigned wd, const sparc32_decoded_t *d)
@@ -87,6 +85,9 @@ static void f_emit_slowcall(a64_buf_t *b, const sparc32_decoded_t *d,
 {
     size_t p_fault;
     size_t p_cont;
+    uint32_t op3 = d->op3 & 0x3Fu;
+    bool is_store = (op3 == 0x04u || op3 == 0x05u || op3 == 0x06u ||
+        op3 == 0x07u);
     a64_emit_add_uxtw_x(b, 0u, A64_XCTX, A64_ZR);
     a64_emit_mov_w(b, 1u, F_ES0);
     a64_emit_mov_imm32(b, 2u, d->op3);
@@ -94,9 +95,27 @@ static void f_emit_slowcall(a64_buf_t *b, const sparc32_decoded_t *d,
     a64_emit_mov_imm32(b, 4u, d->rs2);
     a64_emit_mov_imm32(b, 5u, d->asi);
     f_mov64(b, F_ES2, (uint64_t)(uintptr_t)&sparc32_rt_mem);
+    a64_emit(b, 0xA9BF1FE6u);
+    a64_emit(b, 0xA9BF27E8u);
+    a64_emit(b, 0xA9BF2FEAu);
+    a64_emit(b, 0xA9BF37ECu);
     a64_emit(b, F_STR_X30_PRE);
     a64_emit(b, F_BLR_BASE | ((F_ES2 & 31u) << 5));
     a64_emit(b, F_LDR_X30_POST);
+    a64_emit(b, 0xA8C137ECu);
+    a64_emit(b, 0xA8C12FEAu);
+    a64_emit(b, 0xA8C127E8u);
+    a64_emit(b, 0xA8C11FE6u);
+    if (!is_store) {
+        uint32_t rd = d->rd & 31u;
+        if (rd != 0u) {
+            a64_emit_ldr_imm_w(b, 6u + (rd & 7u), A64_XCTX, rd * 4u);
+        }
+        if (op3 == 0x03u) {
+            uint32_t rd2 = (d->rd + 1u) & 31u;
+            a64_emit_ldr_imm_w(b, 6u + (rd2 & 7u), A64_XCTX, rd2 * 4u);
+        }
+    }
     p_fault = a64_emit_cbz_w_placeholder(b, true, 0u);
     p_cont = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     a64_patch_cbz_w(b, p_fault, b->count);
