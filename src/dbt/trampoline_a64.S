@@ -42,6 +42,7 @@
 
     /* Enter translated code; fragments return here via `ret`. */
     blr x1
+    str x27, [x19, #0x170]
 
     /* Commit the exit: w16 -> exit_reason, w15 -> exit_dest. */
     str w16, [x19, #0x138]

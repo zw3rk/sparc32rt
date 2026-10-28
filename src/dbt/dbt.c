@@ -4,27 +4,17 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Phase 2 lane L2b (SPEC sections 2-3, docs/lanes/phase-2.md). The block
- * cache, W^X code arena, direct-chaining dispatcher, IBTC, and RAS live
- * here; integer lowering is L2c's src/dbt/emit_int.h, wired here through
- * its real interface (sparc32_emit_ctx_t + sparc32_emit_insn, with
- * sparc32_emit_exit_singlestep for the page-final rule). Emitted BLR
- * helpers run the shared interp window/memory model (interp_priv.h via
- * L2c's emit_priv.h); this unit carries no translator-local duplicate of
- * that model, so interp and dbt observe one window/history for difftest.
+ * Phase 2 lane L2b (SPEC sections 2-3). Block cache, W^X arena,
+ * chaining dispatcher, IBTC, and RAS live here; integer lowering via
+ * L2c's emit_int.h. BLR helpers share interp's window/memory model,
+ * so interp and dbt observe one window/history for difftest.
  *
- * Exit reporting: every emitted exit carries the resume/fault guest PC in
- * w15 and the SPARC32_EXIT_* reason in w16; the trampoline stores them to
- * ctx->exit_dest/ctx->exit_reason and dbt_commit fixes up pc/npc from
- * them. EXIT_UNDEF / EXIT_SINGLE_STEP from emitted code are pristine
- * (exit_dest is the faulting insn, no guest state changed, except for
- * idempotent link writes), so the dispatcher replays one interp_step at
- * the exit PC. IBTC stays at the frozen SPARC32_IBTC_SIZE (1024).
+ * Exits carry resume PC in w15 and SPARC32_EXIT_* in w16; the
+ * trampoline stores them to exit_dest/exit_reason and dbt_commit
+ * fixes pc/npc. UNDEF/SINGLE_STEP replay one interp_step.
  *
  * Invariants: every file <= 900 lines; curated C11 (no VLAs); guest
- * memory only through sparc32_fetch_decode region checks; guest data
- * pages never PROT_EXEC (the arena is anonymous host memory outside
- * [G, G + 4 GiB)); no x18 anywhere (no inline asm at all).
+ * memory only via region checks; guest data never PROT_EXEC; no x18.
  */
 
 #include <stdbool.h>
@@ -717,6 +707,7 @@ static int dbt_exec_enter(sparc32_ctx_t *ctx, const dbt_block_t *b,
     }
     chain = (const void *)&g_chain[dbt_cache_index(b->start_pc)];
     ctx->exit_reason = SPARC32_EXIT_NONE;
+    ctx->last_exec_entry = (void *)chain;
     if (allow_chain) {
         dbt_enter_block(ctx, b->host_code, chain, &g_cache_epoch);
     } else {
@@ -730,6 +721,15 @@ static int dbt_exec_enter(sparc32_ctx_t *ctx, const dbt_block_t *b,
 
 static void dbt_on_branch(sparc32_ctx_t *ctx, const dbt_block_t *b)
 {
+    if (ctx->last_exec_entry != NULL) {
+        const dbt_chain_t *lch = (const dbt_chain_t *)ctx->last_exec_entry;
+        if (lch >= &g_chain[0] && lch < &g_chain[DBT_CACHE_SIZE]) {
+            const dbt_block_t *lb = &g_blocks[lch - &g_chain[0]];
+            if (lb->valid && lb->epoch == g_cache_epoch) {
+                b = lb;
+            }
+        }
+    }
     /* Snapshot the live exit before speculative lookups (a faulting
      * target must not clobber this block's BRANCH exit). */
     uint32_t reason = ctx->exit_reason;

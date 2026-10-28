@@ -52,6 +52,9 @@ static int fp_guard_fast(sparc32_emit_ctx_t *ec)
     a64_buf_t *b = ec->buf;
     size_t p_rd;
     size_t p_tem;
+    if (b->fp_fast_checked) {
+        return 0;
+    }
     a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
     a64_emit_ubfm_w(b, FS1, FS0, 30U, 31U);
     p_rd = a64_emit_cbz_w_placeholder(b, false, FS1);
@@ -67,6 +70,9 @@ static int fp_guard_fast(sparc32_emit_ctx_t *ec)
         return -1;
     }
     a64_patch_cbz_w(b, p_tem, b->count);
+    if (!b->overflow) {
+        b->fp_fast_checked = true;
+    }
     return b->overflow ? -1 : 0;
 }
 
@@ -148,14 +154,16 @@ static uint32_t fp_d_off(uint32_t r)
 
 static void fp_ld_s(a64_buf_t *b, unsigned vt, uint32_t r)
 {
-    a64_emit_ldr_imm_w(b, FS0, A64_XCTX, fp_s_off(r));
-    a64_emit_fmov_w_to_s(b, vt, FS0);
+    uint32_t off = fp_s_off(r);
+    a64_emit(b, 0xBD400000U | (((off >> 2U) & 0xFFFU) << 10) |
+        (A64_XCTX << 5) | (vt & 31U));
 }
 
 static void fp_st_s(a64_buf_t *b, uint32_t r, unsigned vn)
 {
-    a64_emit_fmov_s_to_w(b, FS0, vn);
-    a64_emit_str_imm_w(b, FS0, A64_XCTX, fp_s_off(r));
+    uint32_t off = fp_s_off(r);
+    a64_emit(b, 0xBD000000U | (((off >> 2U) & 0xFFFU) << 10) |
+        (A64_XCTX << 5) | (vn & 31U));
 }
 
 static void fp_ld_d(a64_buf_t *b, unsigned vt, uint32_t r)
@@ -233,20 +241,14 @@ static void fp_canon(a64_buf_t *b, int is_d, unsigned vd, unsigned va,
 
     /* Fast path first (result not NaN -> done); every exit lands
      * past the canonicalize block. */
-    /* MRS leaves NZCV in bits 31:28, so the V flag is bit 28. */
+    /* FCMP sets V when unordered (NaN); branch directly on NZCV. */
     fp_cmp(b, is_d, vd, vd);
-    a64_emit_mrs_nzcv(b, FS0);
-    a64_emit_ubfm_w(b, FS0, FS0, 28U, 28U);
-    p_done = a64_emit_cbz_w_placeholder(b, false, FS0);
+    p_done = a64_emit_b_cond_placeholder(b, A64_COND_VC);
     fp_cmp(b, is_d, va, va);
-    a64_emit_mrs_nzcv(b, FS0);
-    a64_emit_ubfm_w(b, FS0, FS0, 28U, 28U);
-    p_keep = a64_emit_cbz_w_placeholder(b, true, FS0);
+    p_keep = a64_emit_b_cond_placeholder(b, A64_COND_VS);
     if (has_b != 0) {
         fp_cmp(b, is_d, vb, vb);
-        a64_emit_mrs_nzcv(b, FS0);
-        a64_emit_ubfm_w(b, FS0, FS0, 28U, 28U);
-        p_keep2 = a64_emit_cbz_w_placeholder(b, true, FS0);
+        p_keep2 = a64_emit_b_cond_placeholder(b, A64_COND_VS);
     }
     if (is_d == 0) {
         a64_emit_mov_imm32(b, FS0, 0x7FFFFFFFU);
@@ -255,11 +257,11 @@ static void fp_canon(a64_buf_t *b, int is_d, unsigned vd, unsigned va,
         fp_mov64x(b, FS0, 0x7FFFFFFFFFFFFFFFULL);
         fp_mov_d_from_x(b, vd, FS0);
     }
-    a64_patch_cbz_w(b, p_keep, b->count);
+    a64_patch_b_cond(b, p_keep, b->count);
     if (has_b != 0) {
-        a64_patch_cbz_w(b, p_keep2, b->count);
+        a64_patch_b_cond(b, p_keep2, b->count);
     }
-    a64_patch_cbz_w(b, p_done, b->count);
+    a64_patch_b_cond(b, p_done, b->count);
 }
 
 /* FPSR cumulative flags (AArch64): IXC=bit4, UFC=bit3, OFC=bit2,
