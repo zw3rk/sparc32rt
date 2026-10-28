@@ -325,6 +325,7 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
         ec.pc = cur;
         ec.fault_pc = cur;
         ec.delay = delayp;
+        if (cti || dbt_block_ends(&d)) sparc32_emit_fp_flush(&buf);
         if (cti && (cur & 0xFFFU) == 0xFFCU) {
             /* Page-final CTI: pristine SINGLE_STEP at the CTI address
              * (conservative superset of the branch-only contract rule:
@@ -367,6 +368,7 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
      * insns (incl. inline FPU/FPMEM) need one here. Without it execution
      * falls off the arena tail into a host SIGILL. */
     if (have_insn && !overflow && dbt_falls_through(&last)) {
+        sparc32_emit_fp_flush(&buf);
         a64_emit_exit_branch(&buf, end);
         if (buf.overflow) {
             overflow = true;

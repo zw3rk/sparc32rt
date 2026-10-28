@@ -88,6 +88,7 @@ typedef struct a64_buf {
     uint32_t  exit_slot_pcs[A64_MAX_EXIT_SLOTS];
     unsigned  exit_slot_count;
     bool      fp_fast_checked;
+    bool      fpsr_dirty;
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
@@ -96,6 +97,7 @@ static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
     b->words = storage;
     b->cap   = cap;
     b->fp_fast_checked = false;
+    b->fpsr_dirty = false;
 }
 
 static inline void a64_emit(a64_buf_t *b, uint32_t insn)

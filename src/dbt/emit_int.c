@@ -149,7 +149,7 @@ static void e_call_invoke_faultable(sparc32_emit_ctx_t *ec)
     a64_buf_t *b = ec->buf;
     size_t p_fault;
     size_t p_cont;
-
+    sparc32_emit_fp_flush(b);
     a64_emit(b, A64_BLR_BASE | ((ES2 & 31u) << 5));
     a64_emit(b, A64_LDR_X30_POST);
     p_fault = a64_emit_cbz_w_placeholder(b, true, 0u);
@@ -217,11 +217,13 @@ static int e_emit_delay(sparc32_emit_ctx_t *ec, uint32_t npc)
         ec->pc = npc;
         rc = sparc32_emit_fpu(ec, d);
         ec->pc = saved_pc;
+        sparc32_emit_fp_flush(ec->buf);
         return rc;
     case SPARC32_OP_FPMEM:
         ec->pc = npc;
         rc = sparc32_emit_fpmem(ec, d);
         ec->pc = saved_pc;
+        sparc32_emit_fp_flush(ec->buf);
         return rc;
     case SPARC32_OP_FBRANCH:
     case SPARC32_OP_ILLEGAL:

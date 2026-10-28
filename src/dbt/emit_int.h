@@ -55,6 +55,11 @@ typedef struct sparc32_emit_ctx {
  * overflows (ec->buf->overflow is set; L2b terminates the block). */
 int sparc32_emit_insn(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d);
 
+/* Commit pending batched FPSR flags to guest FSR (P5b). No-op unless
+ * buf->fpsr_dirty; defined in emit_fp.c, called at every point that
+ * observes FSR or clobbers host FPSR (CTI, traps, exits, helpers). */
+void sparc32_emit_fp_flush(a64_buf_t *b);
+
 /* Per-class translate functions (L2b may call these directly instead of
  * sparc32_emit_insn when it structures blocks itself). Same contract. */
 int sparc32_emit_sethi(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d);

@@ -353,8 +353,20 @@ static void fp_fcc_commit(a64_buf_t *b, int signal)
 
 /* ---- FPop1/FPop2 lowering -------------------------------------------- */
 
+/* P5b: commit batched FPSR flags once per run of fp_emit_arith ops.
+ * Consecutive arith ops share one MSR FPSR + one MRS/commit pair;
+ * every FSR observer or host-FPSR clobberer flushes first. */
+void sparc32_emit_fp_flush(a64_buf_t *b)
+{
+    if (b != NULL && b->fpsr_dirty) {
+        fp_flags_commit(b);
+        b->fpsr_dirty = false;
+    }
+}
+
 static int fp_undef(sparc32_emit_ctx_t *ec)
 {
+    sparc32_emit_fp_flush(ec->buf);
     a64_emit_exit_undef(ec->buf, ec->pc);
     return ec->buf->overflow ? -1 : 0;
 }
@@ -366,6 +378,7 @@ static int fp_emit_bitwise(sparc32_emit_ctx_t *ec, uint32_t opf,
 {
     a64_buf_t *b = ec->buf;
     uint32_t off;
+    sparc32_emit_fp_flush(b);
 
     /* V8 FPop parity: odd opf = single, even opf = double. */
     if ((opf & 1U) != 0U) {
@@ -402,7 +415,10 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
     if (fp_guard_fast(ec) != 0) {
         return -1;
     }
-    fp_fpsr_clear(b);
+    if (!b->fpsr_dirty) {
+        fp_fpsr_clear(b);
+        b->fpsr_dirty = true;
+    }
 
     switch (opf) {
     case 0x041U: case 0x042U: base = 0x1E202800U; break;
@@ -421,7 +437,6 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
         fp3(b, 0x1E200800U, 1, FVD, FVA, FVB);
         fp_canon(b, 1, FVD, FVA, 1, FVB);
         fp_st_d(b, rd, FVD);
-        fp_flags_commit(b);
         return b->overflow ? -1 : 0;
     }
     /* FSQRT is unary (source in rs2); the rest are binary. */
@@ -449,7 +464,6 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
     } else {
         fp_st_s(b, rd, FVD);
     }
-    fp_flags_commit(b);
     return b->overflow ? -1 : 0;
 }
 
@@ -467,7 +481,7 @@ static int fp_emit_convert(sparc32_emit_ctx_t *ec, uint32_t opf,
     uint32_t rd, uint32_t rs2)
 {
     a64_buf_t *b = ec->buf;
-
+    sparc32_emit_fp_flush(b);
     fp_fpsr_clear(b);
     /* FP operands first (double loads use xFS1), then RD/FPCR. */
     switch (opf) {
@@ -527,7 +541,7 @@ static int fp_emit_cmp(sparc32_emit_ctx_t *ec, uint32_t opf,
 {
     a64_buf_t *b = ec->buf;
     int is_d = (opf == 0x052U || opf == 0x056U) ? 1 : 0;
-
+    sparc32_emit_fp_flush(b);
     if (fp_guard_fast(ec) != 0) {
         return -1;
     }
@@ -768,11 +782,13 @@ static int fp_emit_delay(sparc32_emit_ctx_t *ec, uint32_t npc)
         ec->pc = npc;
         rc = sparc32_emit_fpu(ec, d);
         ec->pc = saved_pc;
+        sparc32_emit_fp_flush(ec->buf);
         return rc;
     case SPARC32_OP_FPMEM:
         ec->pc = npc;
         rc = sparc32_emit_fpmem(ec, d);
         ec->pc = saved_pc;
+        sparc32_emit_fp_flush(ec->buf);
         return rc;
     case SPARC32_OP_ILLEGAL:
         a64_emit_exit_undef(ec->buf, npc);
