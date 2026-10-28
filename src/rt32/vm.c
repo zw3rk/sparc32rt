@@ -279,6 +279,13 @@ int vm_record_region_locked(uint32_t start, uint32_t end,
         rc = vm_insert_region_raw(start, end, prot, clean_flags, name_copy);
     }
     vm_coalesce_regions_locked();
+    if (rc == 0) {
+        uint32_t va;
+        for (va = start & ~(uint32_t)0xFFFU; va < end; va += SPARC32_PAGE_SIZE) {
+            vm32_publish_page(va, prot & 0x7U, vm32_page_state(va));
+        }
+        vm32_tlb_invalidate(start, end - start);
+    }
     return rc;
 }
 
@@ -542,6 +549,7 @@ int rt32_vm_record_region(sparc32_ctx_t *ctx, uint32_t start, uint32_t end,
     if (!ctx || start >= end) {
         return -1;
     }
+    (void)vm32_attach(ctx);
     vm_lock_acquire();
     vm_sync_from_ctx(ctx);
     rc = vm_record_region_locked(start, end, prot, flags, name);
@@ -649,6 +657,13 @@ uint32_t rt32_vm_brk(sparc32_ctx_t *ctx, uint32_t new_brk)
         /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
         (void)vm_reserve_prot_none(ctx, new_page, len);
         vm_unmap_regions_pub(new_page, old_page);
+        {
+            uint32_t va;
+            for (va = new_page; va < old_page; va += SPARC32_PAGE_SIZE) {
+                vm32_publish_page(va, 0U, 0U);
+            }
+            vm32_tlb_invalidate(new_page, len);
+        }
     }
 
     g_vm_brk_curr = new_brk;
