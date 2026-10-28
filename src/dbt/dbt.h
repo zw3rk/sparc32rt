@@ -64,6 +64,8 @@ typedef struct {
     bool        ends_trap;    /* Final insn is a taken TA gate. */
     bool        is_link;      /* ends_cti with linkage (CALL, JMPL %o7). */
     bool        indirect;     /* ends_cti with register target. */
+    uint32_t    slot_pcs[8];  /* exit_slot_pcs snapshot for chain patching. */
+    uint32_t    slot_count;   /* entries used in slot_pcs. */
     const void *host_code;   /* RX entry point, NULL when needs_interp. */
 } dbt_block_t;
 
@@ -130,9 +132,8 @@ void dbt_enter_step(sparc32_ctx_t *ctx, const void *entry,
     const void *chain_entry);
 
 /* Chaining hook: record the pairing of block `from` to block `to` for
- * stats. Slot back-patching stays disabled in Phase 2 (slots are NULL so
- * every in-fragment chain probe bails to the C dispatcher, which chains
- * in software); this only records the pairing. */
+ * stats and back-patch the direct-chaining slots (plus ret_entry on
+ * linked calls) so in-fragment probes can chain without trapping. */
 void dbt_patch_chain(sparc32_ctx_t *ctx, const dbt_block_t *from,
     const dbt_block_t *to);
 

@@ -64,19 +64,25 @@ extern void vm32_note_code_page(uint32_t gva, uint32_t len);
 /* ---- Chaining entries (asm layout contract with a64_emit_fp.c) ----
  * exit_branch slot probes read [x27, #(152 + s*8)] and chain targets as
  * {key|epoch @ +0, host_code @ +8} pairs (the same 16-byte prefix the
- * RAS-pop/IBTC-hit paths load from ctx entries). Slots stay NULL in
- * Phase 2, so every probe bails to the C dispatcher, which chains in
- * software; x27 must nonetheless point at a readable entry because the
- * probes dereference it unconditionally. One entry per cache slot. */
+ * RAS-pop/IBTC-hit paths load from ctx entries). The call fast path
+ * also reads [x27, #96] for ret_entry (patched on linked calls).
+ * dbt_on_branch back-patches slots/ret_entry after translation, so
+ * hot probes chain in-fragment; x27 must point at a readable entry
+ * because the probes dereference it unconditionally. One entry per
+ * cache slot. */
 typedef struct {
     uint64_t    key_epoch;   /* +0: guest key | (uint64_t)epoch << 32 */
     const void *host_code;   /* +8 */
-    uint8_t     pad[136];    /* +16..+151 */
-    const void *slots[8];    /* +152..+215, always NULL in Phase 2 */
+    uint8_t     pad0[80];    /* +16..+95 */
+    const void *ret_entry;   /* +96, NULL until a linked call patches it */
+    uint8_t     pad1[48];    /* +104..+151 */
+    const void *slots[8];    /* +152..+215 */
 } dbt_chain_t;
 
 _Static_assert(sizeof(dbt_chain_t) == 216,
     "dbt_chain_t must be 216 bytes");
+_Static_assert(offsetof(dbt_chain_t, ret_entry) == 96,
+    "dbt_chain_t ret_entry must start at +96");
 _Static_assert(offsetof(dbt_chain_t, slots) == 152,
     "dbt_chain_t slots must start at +152");
 
@@ -391,6 +397,7 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
         b->ends_trap = false;
         b->is_link = false;
         b->indirect = false;
+        b->slot_count = 0U;
     } else if (overflow) {
         /* Truncated fragments never execute: identical interp fallback. */
         b->start_pc = pc;
@@ -404,6 +411,7 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
         b->ends_trap = false;
         b->is_link = false;
         b->indirect = false;
+        b->slot_count = 0U;
     } else {
         bool was_valid = b->valid && b->epoch == g_cache_epoch;
         b->start_pc = pc;
@@ -424,6 +432,17 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
                 last.rd == SPARC32_O7) {
                 b->is_link = true;
             }
+        }
+        {
+            unsigned si;
+            unsigned sc = buf.exit_slot_count;
+            if (sc > 8U) {
+                sc = 8U;
+            }
+            for (si = 0U; si < sc; si++) {
+                b->slot_pcs[si] = buf.exit_slot_pcs[si];
+            }
+            b->slot_count = sc;
         }
         if (!was_valid && g_cached_count < DBT_CACHE_SIZE) {
             g_cached_count += 1U;
@@ -550,8 +569,8 @@ void dbt_patch_chain(sparc32_ctx_t *ctx, const dbt_block_t *from,
     if (ctx == NULL || from == NULL || to == NULL) {
         return;
     }
-    /* Phase 2 chains in the C dispatcher (slots stay NULL so every
-     * in-fragment probe bails); only the pairing is recorded here. */
+    /* Direct slots are patched in dbt_on_branch; this records the
+     * pairing for stats and keeps the last-executed entry fresh. */
     ctx->chain_hits += 1U;
     ctx->last_exec_entry = (void *)to->host_code;
 }
@@ -699,10 +718,32 @@ static void dbt_on_branch(sparc32_ctx_t *ctx, const dbt_block_t *b)
     bool is_link = b->is_link;
     bool indirect = b->indirect;
     uint32_t end_pc = b->end_pc;
+    uint32_t from_pc = b->start_pc;
+    uint32_t from_slots[8];
+    uint32_t from_count = b->slot_count;
+    {
+        uint32_t si;
+        if (from_count > 8U) {
+            from_count = 8U;
+        }
+        for (si = 0U; si < from_count; si++) {
+            from_slots[si] = b->slot_pcs[si];
+        }
+    }
 
     if (is_link) {
         const dbt_block_t *ret = dbt_lookup(ctx, end_pc);
         dbt_ras_push(ctx, end_pc, ret != NULL ? ret->host_code : NULL);
+        if (ret != NULL && ret->host_code != NULL) {
+            uint32_t from_idx = dbt_cache_index(from_pc);
+            const dbt_block_t *cur =
+                &g_blocks[from_idx];
+            if (cur->valid && cur->epoch == g_cache_epoch &&
+                cur->start_pc == from_pc) {
+                g_chain[from_idx].ret_entry =
+                    &g_chain[dbt_cache_index(end_pc)];
+            }
+        }
     }
     if (indirect) {
         if (dbt_ras_peek(ctx, dest) != NULL) {
@@ -713,7 +754,23 @@ static void dbt_on_branch(sparc32_ctx_t *ctx, const dbt_block_t *b)
     }
     {
         const dbt_block_t *next = dbt_lookup(ctx, dest);
+        uint32_t si;
         dbt_ibtc_fill(ctx, dest, next != NULL ? next->host_code : NULL);
+        if (next != NULL && next->host_code != NULL) {
+            uint32_t from_idx = dbt_cache_index(from_pc);
+            const dbt_block_t *cur =
+                &g_blocks[from_idx];
+            if (cur->valid && cur->epoch == g_cache_epoch &&
+                cur->start_pc == from_pc) {
+                for (si = 0U; si < from_count; si++) {
+                    if (from_slots[si] == dest) {
+                        g_chain[from_idx].slots[si] =
+                            &g_chain[dbt_cache_index(dest)];
+                        break;
+                    }
+                }
+            }
+        }
     }
     ctx->exit_reason = reason;
     ctx->exit_dest = dest;

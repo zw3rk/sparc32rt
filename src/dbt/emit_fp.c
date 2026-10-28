@@ -613,8 +613,8 @@ int sparc32_emit_fpu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     if (fp_double_source(op3, opf, 2) != 0 && ((rs2 & 1U) != 0U)) {
         return fp_undef(ec);
     }
-    /* Straight-line FPop ends its block with no L2b exit, so the
-     * emitter carries its own (skipped in delay slots). */
+    /* Straight-line FPop lowers inline like FPMEM: it falls through and
+     * L2b emits the single fallthrough exit at the end of the block. */
     if (op3 == (uint32_t)SPARC32_OP3_FPOP1) {
         switch (opf) {
         case 0x001U: case 0x002U:
@@ -661,10 +661,6 @@ int sparc32_emit_fpu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     if (rc != 0) {
         return rc;
-    }
-    if (ec->pc == ec->fault_pc) {
-        a64_emit_exit_branch(ec->buf, ec->pc + 4U);
-        return ec->buf->overflow ? -1 : 0;
     }
     return 0;
 }
