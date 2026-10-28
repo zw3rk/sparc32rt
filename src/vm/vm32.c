@@ -349,3 +349,15 @@ void vm32_note_code_page(uint32_t gva, uint32_t len)
     g_vm32_state[vpn] |= (uint8_t)RT_PAGE_HAS_CODE;
     vm32_tlb_invalidate(gva, len);
 }
+
+/* Lane P5 inline fast-path tables (emit_priv.h): per-4K prot/state bases
+ * for the JIT to check alignment-mapped permissions inline. */
+const uint8_t *sparc32_vm_prot_base(void)
+{
+    return g_vm32_prot;
+}
+
+const uint8_t *sparc32_vm_state_base(void)
+{
+    return g_vm32_state;
+}

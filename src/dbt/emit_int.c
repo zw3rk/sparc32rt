@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "dbt/emit_cc.h"
+#include "dbt/emit_fast.h"
 #include "dbt/emit_fp.h"
 #include "dbt/emit_priv.h"
 #include "interp/decode.h"
@@ -264,6 +265,10 @@ int sparc32_emit_alu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     switch (op3) {
     case 0x0AU:
     case 0x0BU:
+        if (sparc32_emit_mul_fast(ec, d) != 0) {
+            return b->overflow ? -1 : 0;
+        }
+        /* fall through */
     case 0x1AU:
     case 0x1BU:
     case 0x0EU:
@@ -727,11 +732,19 @@ static int e_emit_memcall(sparc32_emit_ctx_t *ec,
 
 int sparc32_emit_load(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
+    int fast = sparc32_emit_mem_fast(ec, d);
+    if (fast != 0) {
+        return fast > 0 ? (ec->buf->overflow ? -1 : 0) : -1;
+    }
     return e_emit_memcall(ec, d, (uint64_t)(uintptr_t)&sparc32_rt_mem, 0);
 }
 
 int sparc32_emit_store(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
+    int fast = sparc32_emit_mem_fast(ec, d);
+    if (fast != 0) {
+        return fast > 0 ? (ec->buf->overflow ? -1 : 0) : -1;
+    }
     return e_emit_memcall(ec, d, (uint64_t)(uintptr_t)&sparc32_rt_mem, 0);
 }
 

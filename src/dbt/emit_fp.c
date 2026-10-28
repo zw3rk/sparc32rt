@@ -43,6 +43,33 @@ static void fp_fpsr_clear(a64_buf_t *b);
 static void fp_cexc_clear(a64_buf_t *b);
 static void fp_flags_commit(a64_buf_t *b);
 
+/* Lane P5: fast-path FSR status. The inline FP sequence is valid only
+ * when FSR.TEM == 0 (bits 27:23, no trapped exception) and FSR.RD == 0
+ * (bits 31:30, round-to-nearest matches the host FPCR default);
+ * otherwise exit UNDEF so the dispatcher replays via interp. */
+static int fp_guard_fast(sparc32_emit_ctx_t *ec)
+{
+    a64_buf_t *b = ec->buf;
+    size_t p_rd;
+    size_t p_tem;
+    a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
+    a64_emit_ubfm_w(b, FS1, FS0, 30U, 31U);
+    p_rd = a64_emit_cbz_w_placeholder(b, true, FS1);
+    a64_emit_exit_undef(b, ec->fault_pc);
+    if (b->overflow) {
+        return -1;
+    }
+    a64_patch_cbz_w(b, p_rd, b->count);
+    a64_emit_ubfm_w(b, FS1, FS0, 23U, 27U);
+    p_tem = a64_emit_cbz_w_placeholder(b, true, FS1);
+    a64_emit_exit_undef(b, ec->fault_pc);
+    if (b->overflow) {
+        return -1;
+    }
+    a64_patch_cbz_w(b, p_tem, b->count);
+    return b->overflow ? -1 : 0;
+}
+
 /* Raw encodings verified against clang on AArch64 (lane notes). */
 #define FP_DBIT 0x00400000U /* S->D selector in FP encodings */
 
@@ -368,6 +395,9 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
     int is_d = (opf == 0x042U || opf == 0x046U || opf == 0x04AU ||
         opf == 0x04EU || opf == 0x02AU || opf == 0x069U) ? 1 : 0;
     uint32_t base = 0U;
+    if (fp_guard_fast(ec) != 0) {
+        return -1;
+    }
     fp_fpsr_clear(b);
 
     switch (opf) {
@@ -494,6 +524,9 @@ static int fp_emit_cmp(sparc32_emit_ctx_t *ec, uint32_t opf,
     a64_buf_t *b = ec->buf;
     int is_d = (opf == 0x052U || opf == 0x056U) ? 1 : 0;
 
+    if (fp_guard_fast(ec) != 0) {
+        return -1;
+    }
     if (is_d != 0) {
         fp_ld_d(b, FVA, rs1);
         fp_ld_d(b, FVB, rs2);

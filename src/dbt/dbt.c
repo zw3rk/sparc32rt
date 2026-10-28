@@ -49,6 +49,10 @@
 #include "os/threads.h"
 #include "rt32/a64_emit.h"
 
+/* Lane P5: mark translated pages code-bearing (vm32.c) so inline
+ * stores can check the bitmap. */
+extern void vm32_note_code_page(uint32_t gva, uint32_t len);
+
 #ifndef MAP_ANONYMOUS
 #ifdef MAP_ANON
 #define MAP_ANONYMOUS MAP_ANON
@@ -227,7 +231,8 @@ static bool dbt_is_cti(const sparc32_decoded_t *d)
  * block ends on them (insn cap, page edge, single-insn dbt_step). CTI and
  * conditional-trap emitters terminate their own taken/not-taken paths;
  * unconditional transfers (BA/CALL/JMPL/TA) never fall through; PRIV
- * always exits via trap; FPU/ILL never execute (interp fallback). */
+ * always exits via trap; ILL never executes (interp fallback). FPU/FPMEM
+ * lower inline (Lane P5) so they fall through like plain ALU. */
 static bool dbt_falls_through(const sparc32_decoded_t *d)
 {
     switch (d->cls) {
@@ -236,7 +241,6 @@ static bool dbt_falls_through(const sparc32_decoded_t *d)
     case SPARC32_OP_BRANCH:
     case SPARC32_OP_TRAP:
     case SPARC32_OP_PRIV:
-    case SPARC32_OP_FPU:
     case SPARC32_OP_ILLEGAL:
         return false;
     default:
@@ -250,7 +254,6 @@ static bool dbt_block_ends(const sparc32_decoded_t *d)
     case SPARC32_OP_CALL:
     case SPARC32_OP_JMPL:
     case SPARC32_OP_PRIV:
-    case SPARC32_OP_FPU:
     case SPARC32_OP_ILLEGAL:
         return true;
     case SPARC32_OP_BRANCH:
@@ -364,9 +367,9 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
 
     /* Fallthrough exit for straight-line endings (64-insn cap, page edge,
      * single-insn dbt_step fragments): CTI/trap emitters terminate their
-     * own transfer paths, and PRIV/FPU/ILL never execute, so only plain
-     * insns need one here. Without it execution falls off the arena tail
-     * into a host SIGILL (observed on the first difftest step). */
+     * own transfer paths, and PRIV/ILL never execute, so only plain
+     * insns (incl. inline FPU/FPMEM) need one here. Without it execution
+     * falls off the arena tail into a host SIGILL. */
     if (have_insn && !overflow && dbt_falls_through(&last)) {
         a64_emit_exit_branch(&buf, end);
         if (buf.overflow) {
@@ -429,6 +432,9 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
     memset(ch, 0, sizeof(*ch));
     ch->key_epoch = (uint64_t)b->start_pc | ((uint64_t)b->epoch << 32);
     ch->host_code = b->host_code;
+    if (b->host_code != NULL && end > pc) {
+        vm32_note_code_page(pc, end - pc);
+    }
     ctx->blocks_compiled += 1U;
     if (ctx->trace_enabled && have_insn && !overflow && b->host_code != NULL) {
         size_t wi;

@@ -321,8 +321,9 @@ static uint32_t sparc32_rt_window(sparc32_ctx_t *ctx, uint32_t rs1,
 
 /* Memory op: va effective address, op3 raw decoder op3 (alternate-space
  * bit 0x10 included), rd destination/source index, rs2 compare-register
- * index for CASA, asi alternate address-space id. */
-static uint32_t sparc32_rt_mem(sparc32_ctx_t *ctx, uint32_t va, uint32_t op3,
+ * index for CASA, asi alternate address-space id. Non-static: the Lane
+ * P5 inline fast path (emit_fast.c) funnels its slow path here. */
+uint32_t sparc32_rt_mem(sparc32_ctx_t *ctx, uint32_t va, uint32_t op3,
     uint32_t rd, uint32_t rs2, uint32_t asi)
 {
     uint32_t v;
