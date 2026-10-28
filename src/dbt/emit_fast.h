@@ -11,10 +11,11 @@
 #include "dbt/emit_int.h"
 #include "interp/decode.h"
 
-/* Emit an inline aligned load/store (LDUW/LDUB/LDUH/STW/STB/STH) with
- * REV and prot/code-page checks. Returns 1 when emitted (fast path
- * with precise slow fallback inside), 0 when the op is out of scope
- * (caller uses the shared helper), -1 on buffer overflow. */
+/* Emit an inline aligned load/store (LDUW/LDUB/LDUH/LDD/LDSW/LDSB/
+ * LDSH/STW/STB/STH/STD) with REV and prot/code-page checks. Returns 1
+ * when emitted (fast path with precise slow fallback inside), 0 when
+ * the op is out of scope (caller uses the shared helper), -1 on
+ * buffer overflow. */
 int sparc32_emit_mem_fast(sparc32_emit_ctx_t *ec,
     const sparc32_decoded_t *d);
 

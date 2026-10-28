@@ -4,7 +4,8 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Inline aligned LD/ST/LDUB/STB/LDUH/STH plus SMUL/UMUL. Loads/stores
+ * Inline aligned LD/ST/LDUB/STB/LDUH/STH, LDSW/LDSB/LDSH, LDD/STD
+ * plus SMUL/UMUL. Loads/stores
  * check alignment, per-4K prot (READ/WRITE) and, for stores, the
  * code-page bitmap (RT_PAGE_HAS_CODE); any miss emits a precise
  * EXIT_FAULT or a slow SMC store, never a host SIGSEGV.
@@ -141,6 +142,7 @@ int sparc32_emit_mem_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     a64_buf_t *b;
     uint32_t op3;
     bool is_store;
+    bool is_signed = false;
     unsigned width;
     size_t p_a = (size_t)-1;
     size_t p_p = (size_t)-1;
@@ -158,6 +160,7 @@ int sparc32_emit_mem_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     switch (op3) {
     case 0x00u:
+    case 0x08u: /* LDSW: sign extension is identity on words. */
         is_store = false;
         width = 4u;
         break;
@@ -168,6 +171,20 @@ int sparc32_emit_mem_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     case 0x02u:
         is_store = false;
         width = 2u;
+        break;
+    case 0x09u: /* LDSB */
+        is_store = false;
+        width = 1u;
+        is_signed = true;
+        break;
+    case 0x0Au: /* LDSH */
+        is_store = false;
+        width = 2u;
+        is_signed = true;
+        break;
+    case 0x03u: /* LDD: even rd only (decoder guarantees). */
+        is_store = false;
+        width = 8u;
         break;
     case 0x04u:
         is_store = true;
@@ -181,13 +198,19 @@ int sparc32_emit_mem_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         is_store = true;
         width = 2u;
         break;
+    case 0x07u: /* STD: even rd only (decoder guarantees). */
+        is_store = true;
+        width = 8u;
+        break;
     default:
         return 0;
     }
     prot = sparc32_vm_prot_base();
     state = sparc32_vm_state_base();
     f_ea_into(b, F_ES0, d);
-    if (width == 4u) {
+    if (width == 8u) {
+        p_a = f_check_align(b, F_ES0, 2u);
+    } else if (width == 4u) {
         p_a = f_check_align(b, F_ES0, 1u);
     } else if (width == 2u) {
         p_a = f_check_align(b, F_ES0, 0u);
@@ -202,19 +225,45 @@ int sparc32_emit_mem_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         p_c = a64_emit_cbz_w_placeholder(b, true, F_ES2);
     }
     if (!is_store) {
-        if (width == 4u) {
+        if (width == 8u) {
+            /* LDD: 8-alignment keeps both words in one 4K page, so
+             * one prot check covers the pair. */
             a64_emit_guest_ldr_w(b, F_ES1, F_ES0);
             a64_emit_rev_w(b, F_ES1, F_ES1);
+            f_stgreg(b, d->rd, F_ES1);
+            a64_emit_add_imm_w(b, false, F_ES2, F_ES0, 4u, 0u);
+            a64_emit_guest_ldr_w(b, F_ES1, F_ES2);
+            a64_emit_rev_w(b, F_ES1, F_ES1);
+            f_stgreg(b, d->rd + 1u, F_ES1);
+        } else if (width == 4u) {
+            a64_emit_guest_ldr_w(b, F_ES1, F_ES0);
+            a64_emit_rev_w(b, F_ES1, F_ES1);
+            f_stgreg(b, d->rd, F_ES1);
         } else if (width == 2u) {
             a64_emit_guest_ldrh_w(b, F_ES1, F_ES0);
             a64_emit_rev16_w(b, F_ES1, F_ES1);
+            if (is_signed) {
+                a64_emit_sbfm_w(b, F_ES1, F_ES1, 0u, 15u);
+            }
+            f_stgreg(b, d->rd, F_ES1);
         } else {
             a64_emit_guest_ldrb_w(b, F_ES1, F_ES0);
+            if (is_signed) {
+                a64_emit_sbfm_w(b, F_ES1, F_ES1, 0u, 7u);
+            }
+            f_stgreg(b, d->rd, F_ES1);
         }
-        f_stgreg(b, d->rd, F_ES1);
     } else {
         f_ldgreg(b, F_ES1, d->rd);
-        if (width == 4u) {
+        if (width == 8u) {
+            /* STD: same single-page guarantee as LDD. */
+            a64_emit_rev_w(b, F_ES1, F_ES1);
+            a64_emit_guest_str_w(b, F_ES1, F_ES0);
+            f_ldgreg(b, F_ES1, d->rd + 1u);
+            a64_emit_rev_w(b, F_ES1, F_ES1);
+            a64_emit_add_imm_w(b, false, F_ES2, F_ES0, 4u, 0u);
+            a64_emit_guest_str_w(b, F_ES1, F_ES2);
+        } else if (width == 4u) {
             a64_emit_rev_w(b, F_ES1, F_ES1);
             a64_emit_guest_str_w(b, F_ES1, F_ES0);
         } else if (width == 2u) {

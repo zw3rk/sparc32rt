@@ -21,12 +21,26 @@ void interp_wreg(sparc32_ctx_t *ctx, uint32_t rd, uint32_t v)
     }
 }
 
+const uint8_t *sparc32_vm_prot_base(void);
+
 /* Region coverage: every byte of [va, va+len) must be mapped with the
  * needed PROT bits. PROT_NONE/unmapped areas carry no record and fail. */
 bool interp_range_ok(const sparc32_ctx_t *ctx, uint32_t va,
     uint32_t len, uint32_t need)
 {
     uint64_t end = (uint64_t)va + (uint64_t)len;
+    /* O(1) fast path: a short span inside one 4K page consults the
+     * published per-page prot table (kept in sync with regions[] by
+     * every vm_mmap commit/unmap/mprotect). A miss falls through to
+     * the region walk below. */
+    if (len != 0U && len <= 64U &&
+        (((va ^ (va + len - 1U)) >> 12) == 0U)) {
+        const uint8_t *prot = sparc32_vm_prot_base();
+        if (prot != NULL &&
+            (((uint32_t)prot[va >> 12] & need) == need)) {
+            return true;
+        }
+    }
     uint32_t cur = va;
     size_t i;
     if (len == 0U || end > (uint64_t)SPARC32_TASK_SIZE_TOP) {

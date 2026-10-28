@@ -590,6 +590,31 @@ int sparc32_emit_call(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     return b->overflow ? -1 : 0;
 }
 
+/* Delay slots that can never stop with TRAP or FAULT need no
+ * recorded JMPL target: inline SETHI/SHIFT, FLUSH/STBAR nops, and
+ * plain ALU ops (op3 < 0x0E excludes UDIV/SDIV/tagged/MULScc) always
+ * leave exit_reason NONE, so the dbt_commit recovery arm can never
+ * observe them. SAVE/RESTORE keep the record: spill/fill through
+ * interp_window can fault (interp_cti then resumes at npc/target). */
+static int e_delay_needs_jmpl_record(const sparc32_decoded_t *dl)
+{
+    if (dl == NULL) {
+        return 1;
+    }
+    switch (dl->cls) {
+    case SPARC32_OP_SETHI:
+    case SPARC32_OP_SHIFT:
+    case SPARC32_OP_FLUSH:
+    case SPARC32_OP_STBAR:
+        return 0;
+    case SPARC32_OP_ALU:
+        return ((dl->op3 & 0x3Fu) < 0x0Eu) ? 0 : 1;
+    default:
+        break;
+    }
+    return 1;
+}
+
 int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
     a64_buf_t *b = ec->buf;
@@ -616,12 +641,15 @@ int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     /* Publish the dynamic target before the delay slot so fault recovery
      * can resolve RT_NPC_DYNAMIC_CTX from the per-context ctx->jmpl_target
      * (Rev 4 4.3.3, RC-U3-r2 #3). EKEEP (w22) is callee-saved, so the
-     * call keeps it. */
-    e_arg_ctx(b);
-    a64_emit_mov_w(b, 1u, EKEEP);
-    e_call_prologue(b, (uint64_t)(uintptr_t)&dbt_jmpl_record_target);
-    a64_emit(b, A64_BLR_BASE | ((ES2 & 31u) << 5));
-    a64_emit(b, A64_LDR_X30_POST);
+     * call keeps it. Delay slots that cannot stop with TRAP or FAULT
+     * skip the call (P4: most JMPL delays are SETHI/ALU/SHIFT). */
+    if (e_delay_needs_jmpl_record(ec->delay) != 0) {
+        e_arg_ctx(b);
+        a64_emit_mov_w(b, 1u, EKEEP);
+        e_call_prologue(b, (uint64_t)(uintptr_t)&dbt_jmpl_record_target);
+        a64_emit(b, A64_BLR_BASE | ((ES2 & 31u) << 5));
+        a64_emit(b, A64_LDR_X30_POST);
+    }
     if (d->rd == SPARC32_O7) {
         b->is_call = true;
     }
