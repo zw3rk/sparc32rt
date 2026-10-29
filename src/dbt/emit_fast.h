@@ -24,4 +24,14 @@ int sparc32_emit_mem_fast(sparc32_emit_ctx_t *ec,
 int sparc32_emit_mul_fast(sparc32_emit_ctx_t *ec,
     const sparc32_decoded_t *d);
 
+/* Emit the inline SAVE/RESTORE fast path (P13-4). Computes rd = rs1 +
+ * op2 in the old window, checks fast-path eligibility (canrestore
+ * bounds, no spill/fill needed), rotates ctx->r[8..31] against the
+ * interp window file with 64-bit LDP/STP, and funnels the spill/fill
+ * case to the sparc32_rt_window slow label. Returns 1 when emitted,
+ * 0 when the prot table is unavailable (caller uses the C helper),
+ * -1 on buffer overflow. */
+int sparc32_emit_win_fast(sparc32_emit_ctx_t *ec,
+    const sparc32_decoded_t *d, int is_save);
+
 #endif /* SPARC32RT_DBT_EMIT_FAST_H */

@@ -37,6 +37,17 @@
     mov x19, x0
     ldr x20, [x0, #0x130]
 
+    /* P13-4: x25 = g_vm32_prot base (callee-saved, preserved by every
+     * C helper per AAPCS64), so inline loads/stores probe the per-4K
+     * prot table with one LDRB [x25, wVpn, uxtw] (never x18). */
+#ifdef __APPLE__
+    adrp x25, _g_vm32_prot_jit@PAGE
+    ldr x25, [x25, _g_vm32_prot_jit@PAGEOFF]
+#else
+    adrp x25, g_vm32_prot_jit
+    ldr x25, [x25, #:lo12:g_vm32_prot_jit]
+#endif
+
     /* Zero the in-trampoline chain_hits delta (x24 per a64_emit.h). */
     mov x24, xzr
 

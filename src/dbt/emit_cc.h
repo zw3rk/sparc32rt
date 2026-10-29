@@ -32,4 +32,18 @@ void sparc32_emit_seed_carry(a64_buf_t *b, bool sbc);
  * is the complement of the stored borrow (R1). */
 void sparc32_emit_cond_setup(a64_buf_t *b, uint32_t cond);
 
+/* Stored-icc SPARC cond -> AArch64 cond (the s_a64_cond table). */
+unsigned sparc32_emit_icc_cond(uint32_t cond);
+
+/* Resolve a Bicc condition against live host NZCV (P13-4): returns 1
+ * with the direct AArch64 condition in *a64_out when b->nzcv_valid
+ * already evaluates cond (0 setup instructions); 0 when the caller
+ * must run sparc32_emit_cond_setup first. */
+int sparc32_emit_live_cond(const a64_buf_t *b, uint32_t cond,
+    unsigned *a64_out);
+
+/* Record the live-NZCV kind for a cc-setting ALU op (1 = ADDcc,
+ * 2 = SUBcc, 3 = Logic cc, 0 = invalid/other). */
+void sparc32_emit_track_cc(a64_buf_t *b, uint32_t op3);
+
 #endif /* SPARC32RT_DBT_EMIT_CC_H */

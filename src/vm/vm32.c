@@ -60,6 +60,30 @@ static uint64_t g_vm32_base = 0u;
 static uint8_t *g_vm32_prot = NULL;
 static uint8_t *g_vm32_state = NULL;
 
+/* P13-4 JIT-visible alias of g_vm32_prot. trampoline_a64.S loads this
+ * pointer into callee-saved x25 once per block entry, so every inline
+ * load/store probes the table with a single LDRB (no MOVZ/MOVK). */
+uint8_t *g_vm32_prot_jit = NULL;
+
+/* P13-4 bit 3 (VM32_PROT_FAST_WRITE): 1 iff the page is writable
+ * ((prot & 2) != 0) and holds no translated code
+ * ((state & RT_PAGE_HAS_CODE) == 0), so an inline store needs one
+ * TBZ instead of a prot check plus a code-bitmap check. */
+#define VM32_PROT_FAST_WRITE 0x08u
+
+/* Centralize every g_vm32_prot/g_vm32_state mutation through this
+ * helper so bit 3 never goes stale (P13-4 invariant 8). */
+static inline void vm32_sync_fast_write(uint32_t vpn)
+{
+    uint8_t p = g_vm32_prot[vpn];
+    uint8_t s = g_vm32_state[vpn];
+    if (((p & 2u) != 0u) && ((s & (uint8_t)RT_PAGE_HAS_CODE) == 0u)) {
+        g_vm32_prot[vpn] = (uint8_t)(p | VM32_PROT_FAST_WRITE);
+    } else {
+        g_vm32_prot[vpn] = (uint8_t)(p & (uint8_t)~VM32_PROT_FAST_WRITE);
+    }
+}
+
 /* Per-thread Soft-TLB (128 KiB): owner ctx + entries, see mem_site.h. */
 static _Thread_local rt_tlb_entry_t t_tlb[RT_TLB_SIZE];
 static _Thread_local const sparc32_ctx_t *t_tlb_owner = NULL;
@@ -138,6 +162,7 @@ int vm32_reserve(sparc32_ctx_t *ctx)
         rt_host_unmap(base, (size_t)VM32_WINDOW_LEN);
         return -1;
     }
+    g_vm32_prot_jit = g_vm32_prot;
     g_vm32_base = (uint64_t)(uintptr_t)base;
     g_vm32_ready = true;
     ctx->guest_base = g_vm32_base;
@@ -167,6 +192,7 @@ int vm32_attach(sparc32_ctx_t *ctx)
     if (vm32_alloc_tables() != 0) {
         return -1;
     }
+    g_vm32_prot_jit = g_vm32_prot;
     host_page = rt_host_page_size();
     g_vm32_regime = (host_page == (size_t)VM32_GUEST_PAGE) ?
         VM32_REGIME_A1 : VM32_REGIME_A2;
@@ -196,6 +222,7 @@ void vm32_publish_page(uint32_t gva, uint32_t prot, uint32_t state)
     }
     g_vm32_prot[vpn] = (uint8_t)(prot & 7u);
     g_vm32_state[vpn] = (uint8_t)(state & 0xFFu);
+    vm32_sync_fast_write((uint32_t)vpn);
 }
 
 /*
@@ -228,6 +255,7 @@ void vm32_page_revert_clean(uint32_t gva)
     state &= (uint8_t)~RT_PAGE_COW_DIRTY;
     state |= (uint8_t)RT_PAGE_COW_CLEAN;
     g_vm32_state[vpn] = state;
+    vm32_sync_fast_write((uint32_t)vpn);
 }
 
 /*
@@ -283,6 +311,7 @@ void *vm_tlb_miss_helper(sparc32_ctx_t *ctx, uint32_t gva, uint32_t width,
         state = (uint8_t)((state & (uint8_t)~RT_PAGE_COW_CLEAN) |
             (uint8_t)RT_PAGE_COW_DIRTY);
         g_vm32_state[vpn] = state;
+        vm32_sync_fast_write((uint32_t)vpn);
     }
     if (is_store && !rt_write_tag_allowed((uint32_t)state, (uint32_t)prot)) {
         ctx->exit_reason = SPARC32_EXIT_FAULT;
@@ -347,6 +376,7 @@ void vm32_note_code_page(uint32_t gva, uint32_t len)
         return;
     }
     g_vm32_state[vpn] |= (uint8_t)RT_PAGE_HAS_CODE;
+    vm32_sync_fast_write((uint32_t)vpn);
     vm32_tlb_invalidate(gva, len);
 }
 

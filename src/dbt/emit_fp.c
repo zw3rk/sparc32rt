@@ -1,15 +1,17 @@
 /*
- * src/dbt/emit_fp.c — AArch64 FPU/FBfcc/FPMEM emitter (Phase 3, L3b)
+ * src/dbt/emit_fp.c — AArch64 FPU emitter (Phase 3, L3b)
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Lowers every FPop/FPMEM op to AArch64 scalar FP/NEON (guest state
- * in ctx memory, v0-v7 scratch, never x18; raw encodings verified
- * against clang-assembled AArch64 reference bytes). NaN discipline
- * (E06): payload-preserving propagation; Invalid-Operation results
- * with no NaN input canonicalize to the oracle default. Converts
- * honor FSR.RD via FPCR.RMode (saved/restored around convert ops).
+ * Lowers every FPop op to AArch64 scalar FP/NEON (guest state
+ * in ctx memory, v0-v7 scratch, d8-d15 write-through double cache,
+ * never x18; raw encodings verified against clang-assembled AArch64
+ * reference bytes). NaN discipline (E06): payload-preserving
+ * propagation; Invalid-Operation results with no NaN input
+ * canonicalize to the oracle default. Converts honor FSR.RD via
+ * FPCR.RMode (saved/restored around convert ops). FPMEM lives in
+ * emit_fpmem.c, FBfcc in emit_fpbranch.c (900-line discipline).
  */
 
 #include "dbt/emit_fp.h"
@@ -100,6 +102,8 @@ static void fp_cmp(a64_buf_t *b, int is_d, unsigned vn, unsigned vm)
     uint32_t w = 0x1E202000U | (is_d ? FP_DBIT : 0U);
 
     a64_emit(b, w | ((vm & 31U) << 16) | ((vn & 31U) << 5));
+    /* FCMP sets host NZCV, but fcc (not icc) consumes it. */
+    b->nzcv_valid = 0;
 }
 
 static void fp_mov_d_from_x(a64_buf_t *b, unsigned vd, unsigned rn_x)
@@ -164,27 +168,48 @@ static void fp_st_s(a64_buf_t *b, uint32_t r, unsigned vn)
     uint32_t off = fp_s_off(r);
     a64_emit(b, 0xBD000000U | (((off >> 2U) & 0xFFFU) << 10) |
         (A64_XCTX << 5) | (vn & 31U));
+    /* Single-precision write aliases the even pair: drop the slot so
+     * a later double read refills from coherent ctx memory. */
+    a64_fpr_invalidate(b, r);
 }
 
+/* P13-4 write-through double cache in d8..d15: hits become one FMOV,
+ * misses refill from ctx and populate the slot (guest doubles are
+ * pair-indexed, slot = pair & 7, with tag check). */
 static void fp_ld_d(a64_buf_t *b, unsigned vt, uint32_t r)
 {
     uint32_t off = fp_d_off(r);
+    unsigned pair = (r >> 1) & 15U;
+    unsigned slot = pair & 7U;
 
+    if ((((b->fpr_valid >> slot) & 1U) != 0U) &&
+        b->fpr_tag[slot] == (uint8_t)pair) {
+        a64_emit_fmov_d_d(b, vt, 8U + slot);
+        return;
+    }
     a64_emit_ldr_imm_w(b, FS0, A64_XCTX, off);
     a64_emit_ldr_imm_w(b, FS1, A64_XCTX, off + 4U);
     fp_lsl_x32(b, FS0, FS0);
     fp_orr_x(b, FS0, FS0, FS1);
     fp_mov_d_from_x(b, vt, FS0);
+    a64_emit_fmov_d_d(b, 8U + slot, vt);
+    b->fpr_valid |= (uint8_t)(1U << slot);
+    b->fpr_tag[slot] = (uint8_t)pair;
 }
 
 static void fp_st_d(a64_buf_t *b, uint32_t r, unsigned vn)
 {
     uint32_t off = fp_d_off(r);
+    unsigned pair = (r >> 1) & 15U;
+    unsigned slot = pair & 7U;
 
     fp_mov_x_from_d(b, FS0, vn);
     fp_lsr_x32(b, FS1, FS0);
     a64_emit_str_imm_w(b, FS1, A64_XCTX, off);
     a64_emit_str_imm_w(b, FS0, A64_XCTX, off + 4U);
+    a64_emit_fmov_d_d(b, 8U + slot, vn);
+    b->fpr_valid |= (uint8_t)(1U << slot);
+    b->fpr_tag[slot] = (uint8_t)pair;
 }
 
 /* FSR.RD -> FPCR.RMode (SPARC 0=RN,1=RZ,2=RP,3=RM; AArch64
@@ -205,6 +230,8 @@ static void fp_rd_to_rmode(a64_buf_t *b, unsigned w_rd, unsigned w_rm)
     a64_emit_mov_imm32(b, FS2, 2U);
     a64_emit_sub_imm_w(b, true, A64_ZR, w_rd, 3U, 0U);
     a64_emit_csel_w(b, w_rm, FS2, w_rm, A64_COND_EQ);
+    /* The SUBS comparisons above are not live cc results. */
+    b->nzcv_valid = 0;
 }
 
 /* Load RD into FPCR.RMode; the previous FPCR is kept in xFS2. */
@@ -333,6 +360,8 @@ static void fp_fcc_commit(a64_buf_t *b, int signal)
     a64_emit_sub_imm_w(b, true, A64_ZR, FS1, 1U, 0U);
     a64_emit_mov_imm32(b, FS3, 3U);
     a64_emit_csel_w(b, FS0, FS3, FS0, A64_COND_EQ);
+    /* The SUBS comparisons above are not live cc results. */
+    b->nzcv_valid = 0;
     /* Merge: clear fcc + cexc, OR fcc << 10 and unordered << 9. */
     a64_emit_ldr_imm_w(b, FS2, A64_XCTX, FP_FSR_OFF);
     a64_emit_mov_imm32(b, FS3, 0xFFFFF3E0U);
@@ -399,6 +428,9 @@ static int fp_emit_bitwise(sparc32_emit_ctx_t *ec, uint32_t opf,
     } else {
         a64_emit_str_imm_w(b, FS0, A64_XCTX, fp_d_off(rd));
     }
+    /* The word store may alias a cached double pair (the double
+     * bitwise forms only rewrite the high word): drop the slot. */
+    a64_fpr_invalidate(b, rd);
     /* Moves never raise (matching fp.c); clear stale cexc. */
     fp_cexc_clear(b);
     return b->overflow ? -1 : 0;
@@ -506,12 +538,14 @@ static int fp_emit_convert(sparc32_emit_ctx_t *ec, uint32_t opf,
         a64_emit_fcvtzs_s_to_w(b, FS0, FVA);
         fp_flags_commit(b);
         a64_emit_str_imm_w(b, FS0, A64_XCTX, fp_s_off(rd));
+        a64_fpr_invalidate(b, rd);
         return b->overflow ? -1 : 0;
     case 0x0D2U: /* FdTOi: double -> int bits (always RZ per V8 B.28) */
         fp_ld_d(b, FVA, rs2);
         a64_emit_fcvtzs_d_to_w(b, FS0, FVA);
         fp_flags_commit(b);
         a64_emit_str_imm_w(b, FS0, A64_XCTX, fp_s_off(rd));
+        a64_fpr_invalidate(b, rd);
         return b->overflow ? -1 : 0;
     case 0x0C9U: /* FsTOd: single -> double */
         fp_ld_s(b, FVA, rs2);
@@ -683,197 +717,3 @@ int sparc32_emit_fpu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     return 0;
 }
 
-/* FBfcc transfer (mirrors Bicc on FSR.fcc: 0 equal, 1 less,
- * 2 greater, 3 unordered; cond numbering mirrors Bicc). */
-
-/* Taken predicate: 4-bit mask over fcc (GAS-verified numbering). */
-static const uint32_t fp_taken_mask[16] = {
-    0x0U, 0xEU, 0x6U, 0xAU, 0x2U, 0xCU, 0x4U, 0x8U,
-    0xFU, 0x1U, 0x9U, 0x5U, 0xDU, 0x3U, 0xBU, 0x8U
-};
-
-static void fp_taken_compute(a64_buf_t *b, uint32_t cond)
-{
-    a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
-    a64_emit_ubfm_w(b, FS0, FS0, 10U, 11U);
-    a64_emit_mov_imm32(b, FS1, fp_taken_mask[cond & 15U]);
-    a64_emit_shift_reg_w(b, FS1, FS1, FS0, A64_SHIFT_LSR);
-    a64_emit_ubfm_w(b, FS1, FS1, 0U, 0U);
-}
-
-/* Delay policy (E02 annul): taken BA/FBA skips the delay;
- * annulled not-taken never fetches. */
-static int fp_emit_delay(sparc32_emit_ctx_t *ec, uint32_t npc);
-static int fp_delay_runs(uint32_t cond, int taken, int annul)
-{
-    if (taken != 0) {
-        return (cond == 0x8U && annul != 0) ? 0 : 1;
-    }
-    return annul != 0 ? 0 : 1;
-}
-
-/* Emit the delay slot when it runs, then leave the fragment. A
- * page-final delay that ran exits via SINGLE_STEP (interp_cti tail);
- * every other path exits plainly to post. */
-static int fp_delay_tail(sparc32_emit_ctx_t *ec, uint32_t npc,
-    uint32_t post, int runs, int page_final)
-{
-    int rc;
-
-    if (runs != 0) {
-        rc = fp_emit_delay(ec, npc);
-        if (rc != 0) {
-            return rc;
-        }
-        if (page_final != 0) {
-            return sparc32_emit_exit_singlestep(ec, post);
-        }
-    }
-    a64_emit_exit_branch(ec->buf, post);
-    return ec->buf->overflow ? -1 : 0;
-}
-
-/* Integer delay-slot classes route to the public L2c emitters (the
- * delay address is in ec->pc, the CTI address stays in ec->fault_pc,
- * exactly like the integer e_emit_delay). One case per line to hold
- * the 900-line file budget. */
-static int fp_emit_int_delay(sparc32_emit_ctx_t *ec,
-    const sparc32_decoded_t *d)
-{
-    switch (d->cls) {
-    case SPARC32_OP_SETHI: return sparc32_emit_sethi(ec, d);
-    case SPARC32_OP_ALU: return sparc32_emit_alu(ec, d);
-    case SPARC32_OP_SHIFT: return sparc32_emit_shift(ec, d);
-    case SPARC32_OP_RDASR: return sparc32_emit_rdasr(ec, d);
-    case SPARC32_OP_WRASR: return sparc32_emit_wrasr(ec, d);
-    case SPARC32_OP_PRIV: return sparc32_emit_priv(ec, d);
-    case SPARC32_OP_SAVE: return sparc32_emit_save(ec, d);
-    case SPARC32_OP_RESTORE: return sparc32_emit_restore(ec, d);
-    case SPARC32_OP_FLUSH: return sparc32_emit_flush(ec, d);
-    case SPARC32_OP_STBAR: return sparc32_emit_stbar(ec, d);
-    case SPARC32_OP_LOAD: return sparc32_emit_load(ec, d);
-    case SPARC32_OP_STORE: return sparc32_emit_store(ec, d);
-    case SPARC32_OP_SWAP: return sparc32_emit_swap(ec, d);
-    case SPARC32_OP_CASA: return sparc32_emit_casa(ec, d);
-    default: break;
-    }
-    return sparc32_emit_fallback(ec, d);
-}
-
-static int fp_emit_delay(sparc32_emit_ctx_t *ec, uint32_t npc)
-{
-    const sparc32_decoded_t *d = ec->delay;
-    uint32_t saved_pc = ec->pc;
-    int rc;
-
-    if (d == NULL) {
-        return sparc32_emit_exit_singlestep(ec, ec->fault_pc);
-    }
-    switch (d->cls) {
-    case SPARC32_OP_CALL:
-    case SPARC32_OP_BRANCH:
-    case SPARC32_OP_JMPL:
-    case SPARC32_OP_TRAP:
-    case SPARC32_OP_FBRANCH:
-        /* CTI/TRAP in the delay slot: pristine SINGLE_STEP so the
-         * dispatcher replays the outer transfer via interp_step. */
-        return sparc32_emit_exit_singlestep(ec, ec->fault_pc);
-    case SPARC32_OP_FPU:
-        ec->pc = npc;
-        rc = sparc32_emit_fpu(ec, d);
-        ec->pc = saved_pc;
-        sparc32_emit_fp_flush(ec->buf);
-        return rc;
-    case SPARC32_OP_FPMEM:
-        ec->pc = npc;
-        rc = sparc32_emit_fpmem(ec, d);
-        ec->pc = saved_pc;
-        sparc32_emit_fp_flush(ec->buf);
-        return rc;
-    case SPARC32_OP_ILLEGAL:
-        a64_emit_exit_undef(ec->buf, npc);
-        return ec->buf->overflow ? -1 : 0;
-    default:
-        break;
-    }
-    ec->pc = npc;
-    rc = fp_emit_int_delay(ec, d);
-    ec->pc = saved_pc;
-    return rc;
-}
-
-int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
-{
-    a64_buf_t *b;
-    uint32_t pc;
-    uint32_t npc;
-    uint32_t target;
-    uint32_t cond;
-    int annul;
-    int page_final;
-    size_t p_taken;
-    size_t p_end;
-    int rc;
-
-    if (ec == NULL || ec->buf == NULL || d == NULL) {
-        return -1;
-    }
-    b = ec->buf;
-    pc = ec->pc;
-    npc = pc + 4U;
-    target = pc + (uint32_t)d->disp;
-    cond = d->cond;
-    annul = d->annul != 0U;
-    page_final = ((pc & 0xFFFU) == 0xFFCU) ? 1 : 0;
-    ec->fault_pc = pc;
-    if (cond == 0x0U) { /* FBN: never branches. */
-        return fp_delay_tail(ec, npc, npc + 4U,
-            fp_delay_runs(cond, 0, annul), page_final);
-    }
-    if (cond == 0x8U) { /* FBA: always branches. */
-        return fp_delay_tail(ec, npc, target,
-            fp_delay_runs(cond, 1, annul), page_final);
-    }
-    if (page_final != 0) {
-        fp_taken_compute(b, cond);
-        p_taken = a64_emit_cbz_w_placeholder(b, true, FS1);
-        rc = fp_delay_tail(ec, npc, npc + 4U,
-            fp_delay_runs(cond, 0, annul), page_final);
-        if (rc != 0) {
-            return rc;
-        }
-        a64_patch_cbz_w(b, p_taken, b->count);
-        /* Taken page-final always SINGLE_STEPs (emit_branch shape),
-         * even when the delay was annulled away. */
-        if (fp_delay_runs(cond, 1, annul) != 0) {
-            rc = fp_emit_delay(ec, npc);
-            if (rc != 0) {
-                return rc;
-            }
-        }
-        return sparc32_emit_exit_singlestep(ec, target);
-    }
-    fp_taken_compute(b, cond);
-    p_taken = a64_emit_cbz_w_placeholder(b, true, FS1);
-    if (fp_delay_runs(cond, 0, annul) != 0) {
-        rc = fp_emit_delay(ec, npc);
-        if (rc != 0) {
-            return rc;
-        }
-    }
-    p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    a64_patch_cbz_w(b, p_taken, b->count);
-    if (fp_delay_runs(cond, 1, annul) != 0) {
-        rc = fp_emit_delay(ec, npc);
-        if (rc != 0) {
-            return rc;
-        }
-    }
-    a64_emit_exit_branch(b, target);
-    if (b->overflow) {
-        return -1;
-    }
-    a64_patch_b_cond(b, p_end, b->count);
-    a64_emit_exit_branch(b, npc + 4U);
-    return b->overflow ? -1 : 0;
-}

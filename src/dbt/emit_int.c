@@ -50,25 +50,23 @@
 
 static void e_trap_priv(a64_buf_t *b, uint32_t pc);
 
-/* SPARC cond -> AArch64 cond (icc bit order differs, predicates match). */
-static const uint32_t s_a64_cond[16] = {
-    14u, /* BN  -> never (folded statically; AL unused) */
-    0u, /* BE   -> EQ */
-    13u, /* BLE  -> LE */
-    11u, /* BL   -> LT */
-    9u, /* BLEU -> LS */
-    2u, /* BCS  -> CS */
-    4u, /* BNEG -> MI */
-    6u, /* BVS  -> VS */
-    14u, /* BA   -> AL */
-    1u, /* BNE  -> NE */
-    12u, /* BG   -> GT */
-    10u, /* BGE  -> GE */
-    8u, /* BGU  -> HI */
-    3u, /* BCC  -> CC */
-    5u, /* BPOS -> PL */
-    7u /* BVC  -> VC */
-};
+/* icc <-> NZCV translation lives in src/dbt/emit_cc.c (split for the
+ * 900-line discipline): commit/seed/cond-setup plus the P13-4 live-NZCV
+ * condition resolver (sparc32_emit_live_cond) and the stored-icc table
+ * (sparc32_emit_icc_cond). commit_flags uses only non-flag-setting
+ * MOV/CSET/ORR/LSL/BIC/STR, so live NZCV survives it. */
+
+/* Pick the AArch64 branch condition for a Bicc: live host NZCV from a
+ * preceding cc setter needs no setup, otherwise rebuild from icc. */
+static unsigned e_branch_cond(a64_buf_t *b, uint32_t cond)
+{
+    unsigned ac;
+    if (sparc32_emit_live_cond(b, cond, &ac) != 0) {
+        return ac;
+    }
+    sparc32_emit_cond_setup(b, cond);
+    return sparc32_emit_icc_cond(cond);
+}
 
 /* ---- tiny emit utilities ---------------------------------------------- */
 
@@ -106,10 +104,6 @@ static void e_ea_into(a64_buf_t *b, unsigned wd, const sparc32_decoded_t *d)
     a64_emit_add_reg_w(b, false, wd, ES2, wd, A64_SHIFT_LSL, 0u);
 }
 
-/* icc <-> NZCV translation lives in src/dbt/emit_cc.c (split for the
- * 900-line discipline): sparc32_emit_commit_flags, sparc32_emit_seed_carry,
- * sparc32_emit_cond_setup. */
-
 /* Privileged-state access trap (RDPSR/RDWIM/RDTBR, WRPSR/WRWIM/WRTBR,
  * RETT, numbered ASR, supervisor ASI): EXIT_TRAP with exit_arg 3. */
 static void e_trap_priv(a64_buf_t *b, uint32_t pc)
@@ -139,6 +133,8 @@ static void e_mov64(a64_buf_t *b, unsigned rd, uint64_t v)
 static void e_call_prologue(a64_buf_t *b, uint64_t addr)
 {
     b->gpr_cache_valid = 0;
+    /* Helper calls clobber host NZCV for the rest of the block. */
+    b->nzcv_valid = 0;
     a64_emit(b, A64_STR_X30_PRE);
     e_mov64(b, ES2, addr);
 }
@@ -384,7 +380,10 @@ int sparc32_emit_alu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     e_stgreg(b, d->rd, ES0);
     if (d->cc != 0u) {
+        /* commit_flags preserves host NZCV (MOV/CSET/ORR/LSL/BIC/STR
+         * only), so the cc kind stays live for a following Bicc. */
         sparc32_emit_commit_flags(b, d->op3 == 0x14U || d->op3 == 0x1CU);
+        sparc32_emit_track_cc(b, d->op3);
     }
     return b->overflow ? -1 : 0;
 }
@@ -504,8 +503,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
          * when the delay ran (interp_cti's tail). An annulled not-taken
          * path completes the transfer inline with a plain BRANCH exit
          * (NONE after commit), never SINGLE_STEP. */
-        sparc32_emit_cond_setup(b, cond);
-        p_taken = a64_emit_b_cond_placeholder(b, s_a64_cond[cond & 15u]);
+        p_taken = a64_emit_b_cond_placeholder(b, e_branch_cond(b, cond));
         b->gpr_cache_valid = 0;
         if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
             rc = e_emit_delay(ec, npc);
@@ -530,8 +528,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         }
         return sparc32_emit_exit_singlestep(ec, target);
     }
-    sparc32_emit_cond_setup(b, cond);
-    p_taken = a64_emit_b_cond_placeholder(b, s_a64_cond[cond & 15u]);
+    p_taken = a64_emit_b_cond_placeholder(b, e_branch_cond(b, cond));
     b->gpr_cache_valid = 0;
     if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
         rc = e_emit_delay(ec, npc);
@@ -584,6 +581,9 @@ int sparc32_emit_call(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     a64_emit_mov_pc32(b, ES0, pc);
     a64_emit_str_imm_w(b, ES0, A64_XCTX, e_reg_off(SPARC32_O7));
+    /* The call target runs arbitrary code at runtime and clobbers host
+     * NZCV, so no earlier cc result stays live past this point. */
+    b->nzcv_valid = 0;
     b->is_call = true;
     rc = e_emit_delay(ec, npc);
     if (rc != 0) {
@@ -679,7 +679,8 @@ int sparc32_emit_trap(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     if (d->cond != 0x8u) {
         sparc32_emit_cond_setup(b, d->cond);
-        p_taken = a64_emit_b_cond_placeholder(b, s_a64_cond[d->cond & 15u]);
+        p_taken =
+            a64_emit_b_cond_placeholder(b, sparc32_emit_icc_cond(d->cond));
     } else {
         p_taken = (size_t)-1;
     }
@@ -687,6 +688,8 @@ int sparc32_emit_trap(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
      * dynamic %g1 number; any other true trap number is EXIT_TRAP. */
     a64_emit_mov_imm32(b, ES0, (uint32_t)SPARC32_TRAP_SYSCALL_NUM);
     a64_emit_sub_reg_w(b, true, A64_ZR, EKEEP, ES0, A64_SHIFT_LSL, 0u);
+    /* The trap-number compare is not a live cc result. */
+    b->nzcv_valid = 0;
     p_syscall = a64_emit_b_cond_placeholder(b, A64_COND_EQ);
     p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     a64_patch_b_cond(b, p_syscall, b->count);
@@ -775,14 +778,24 @@ int sparc32_emit_casa(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     return e_emit_memcall(ec, d, (uint64_t)(uintptr_t)&sparc32_rt_mem, 0);
 }
 
+static int e_emit_window(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
+    int is_save)
+{
+    int fast = sparc32_emit_win_fast(ec, d, is_save);
+    if (fast != 0) {
+        return fast > 0 ? (ec->buf->overflow ? -1 : 0) : -1;
+    }
+    return e_emit_memcall(ec, d, (uint64_t)(uintptr_t)&sparc32_rt_window, 1);
+}
+
 int sparc32_emit_save(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
-    return e_emit_memcall(ec, d, (uint64_t)(uintptr_t)&sparc32_rt_window, 1);
+    return e_emit_window(ec, d, 1);
 }
 
 int sparc32_emit_restore(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
-    return e_emit_memcall(ec, d, (uint64_t)(uintptr_t)&sparc32_rt_window, 1);
+    return e_emit_window(ec, d, 0);
 }
 
 int sparc32_emit_flush(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)

@@ -40,6 +40,14 @@ void interp_window_reset(void)
     }
 }
 
+/* JIT-visible base of the window backing file (P13-4): the inline
+ * SAVE/RESTORE fast path rotates ctx->r[8..31] against this array
+ * with 64-bit LDP/STP instead of calling interp_window. */
+uint32_t *interp_winfile_base(void)
+{
+    return &interp_winfile[0][0];
+}
+
 /* Spill winfile[w] (16 l/i words) to guest [va, va + 64). */
 bool interp_spill_to(sparc32_ctx_t *ctx, uint32_t w, uint32_t va)
 {
@@ -106,6 +114,9 @@ bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
             ctx->r[SPARC32_L0 + i] = interp_winfile[tgt][i];
         }
         ctx->cwp = tgt;
+        /* Mirror CWP into PSR bits 4..0 (P13-4: the inline fast path
+         * commits the same word, so both engines agree exactly). */
+        ctx->psr = (ctx->psr & ~0x1FU) | tgt;
         if (ctx->cansave > 0U) {
             ctx->cansave--;
         }
@@ -144,6 +155,9 @@ bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
             ctx->r[SPARC32_I0 + i] = interp_winfile[tgt][8U + i];
         }
         ctx->cwp = tgt;
+        /* Mirror CWP into PSR bits 4..0 (P13-4: the inline fast path
+         * commits the same word, so both engines agree exactly). */
+        ctx->psr = (ctx->psr & ~0x1FU) | tgt;
         if (ctx->canrestore > 0U) {
             ctx->canrestore--;
         }

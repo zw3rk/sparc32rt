@@ -93,6 +93,18 @@ typedef struct a64_buf {
     unsigned  exit_slot_count;
     bool      fp_fast_checked;
     bool      fpsr_dirty;
+    /* P13-4 live-NZCV tracking: 0 = invalid, 1 = ADDcc, 2 = SUBcc,
+     * 3 = Logic cc. a64_buf_init zeroes it at block entry; every
+     * emitter that touches host NZCV (TST/CMP/ADDS/SUBS/FCMP/MSR
+     * NZCV, helper BLR) clears it, cc setters record their kind. */
+    uint8_t   nzcv_valid;
+    /* P13-4 write-through FPR cache in callee-saved d8..d15: bit s
+     * of fpr_valid means D(8+s) holds guest double pair fpr_tag[s]
+     * (pair = (freg >> 1) & 15, slot = pair & 7). ctx->f[] in memory
+     * stays coherent (every cached write goes through), so eviction
+     * and single-precision aliasing only clear valid bits. */
+    uint8_t   fpr_valid;
+    uint8_t   fpr_tag[8];
 } a64_buf_t;
 
 static inline void a64_buf_init(a64_buf_t *b, uint32_t *storage, size_t cap)
@@ -307,6 +319,124 @@ static inline void a64_jmpl_record(a64_buf_t *b, unsigned src_w,
             ((A64_XCTX & 31u) << 5) | (tmp_x & 31u));
         a64_emit_strb_imm_w(b, val_w, tmp_x, lo_a);
     }
+}
+
+/* P13-4 shared inline primitives (raw forms verified against clang on
+ * AArch64): x25-cached prot probe, TBZ miss branch, 64-bit LDP/STP for
+ * window rotation, D-register moves for the d8..d15 FPR cache. */
+
+/* LDRB Wt,[Xn,Wm,uxtw]: single probe into the x25-cached prot table. */
+static inline void a64_emit_ldrb_reg(a64_buf_t *b, unsigned rt_w,
+    unsigned rn_x, unsigned rm_w)
+{
+    a64_emit(b, 0x38604800U | ((rm_w & 31U) << 16) |
+        ((rn_x & 31U) << 5) | (rt_w & 31U));
+}
+
+/* TBZ Wt,#bit,label placeholder (prot fast-path miss branch). The
+ * 14-bit word displacement covers +/-32 KiB; slow labels sit a few
+ * instructions past the probe. */
+static inline size_t a64_emit_tbz_w_placeholder(a64_buf_t *b, unsigned rt,
+    unsigned bit)
+{
+    size_t idx;
+    b->cond_branch_depth++;
+    idx = b->count;
+    a64_emit(b, 0x36000000U | ((bit & 31U) << 19) | (rt & 31U));
+    return idx;
+}
+
+static inline void a64_patch_tbz_w(a64_buf_t *b, size_t patch_idx,
+    size_t target_idx)
+{
+    uint32_t keep;
+    int32_t disp;
+    if (b->cond_branch_depth > 0U) {
+        b->cond_branch_depth--;
+    }
+    if (patch_idx >= b->count) {
+        return;
+    }
+    disp = (int32_t)target_idx - (int32_t)patch_idx;
+    keep = b->words[patch_idx] & 0xFFF8001FU;
+    b->words[patch_idx] = keep | (((uint32_t)disp & 0x3FFFU) << 5);
+}
+
+/* LSL Xd,Xn,#sh (UBFM alias): row-offset scaling for window rotation. */
+static inline void a64_emit_lsl_x(a64_buf_t *b, unsigned rd_x,
+    unsigned rn_x, unsigned sh)
+{
+    a64_emit(b, 0xD3400000U | (((64U - sh) & 63U) << 16) |
+        (((63U - sh) & 63U) << 10) | ((rn_x & 31U) << 5) |
+        (rd_x & 31U));
+}
+
+/* LSR Xd,Xn,#sh (UBFM alias): double high-half extraction. */
+static inline void a64_emit_lsr_x(a64_buf_t *b, unsigned rd_x,
+    unsigned rn_x, unsigned sh)
+{
+    a64_emit(b, 0xD3400000U | ((sh & 63U) << 16) | (63U << 10) |
+        ((rn_x & 31U) << 5) | (rd_x & 31U));
+}
+
+/* ADD Xd,Xn,Xm (shifted register, LSL #0). */
+static inline void a64_emit_add_reg_x(a64_buf_t *b, unsigned rd_x,
+    unsigned rn_x, unsigned rm_x)
+{
+    a64_emit(b, 0x8B000000U | ((rm_x & 31U) << 16) |
+        ((rn_x & 31U) << 5) | (rd_x & 31U));
+}
+
+/* LDP/STP Xt1,Xt2,[Xn,#off]: off must be a multiple of 8. */
+static inline void a64_emit_ldp_x(a64_buf_t *b, unsigned rt1_x,
+    unsigned rt2_x, unsigned rn_x, uint32_t off)
+{
+    a64_emit(b, 0xA9400000U | (((off >> 3) & 0x7FU) << 15) |
+        ((rt2_x & 31U) << 10) | ((rn_x & 31U) << 5) | (rt1_x & 31U));
+}
+
+static inline void a64_emit_stp_x(a64_buf_t *b, unsigned rt1_x,
+    unsigned rt2_x, unsigned rn_x, uint32_t off)
+{
+    a64_emit(b, 0xA9000000U | (((off >> 3) & 0x7FU) << 15) |
+        ((rt2_x & 31U) << 10) | ((rn_x & 31U) << 5) | (rt1_x & 31U));
+}
+
+/* FMOV Dd,Dn / FMOV Dd,Xn / FMOV Xn,Dd (d8..d15 cache traffic).
+ * FMOV (register, double) is 0x1E604000U; 0x1E602000U is unallocated
+ * for nonzero destinations (clang-verified: fmov d8, d0 = 0x1E604008). */
+static inline void a64_emit_fmov_d_d(a64_buf_t *b, unsigned vd,
+    unsigned vn)
+{
+    a64_emit(b, 0x1E604000U | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+static inline void a64_emit_fmov_d_x(a64_buf_t *b, unsigned vd,
+    unsigned rn_x)
+{
+    a64_emit(b, 0x9E670000U | ((rn_x & 31U) << 5) | (vd & 31U));
+}
+
+static inline void a64_emit_fmov_x_d(a64_buf_t *b, unsigned rd_x,
+    unsigned vn)
+{
+    a64_emit(b, 0x9E660000U | ((vn & 31U) << 5) | (rd_x & 31U));
+}
+
+/* INS Vd.S[1],Vn.S[0]: assemble the high half of a cached double. */
+static inline void a64_emit_ins_s10(a64_buf_t *b, unsigned vd,
+    unsigned vn)
+{
+    a64_emit(b, 0x6E0C0400U | ((vn & 31U) << 5) | (vd & 31U));
+}
+
+/* Emit-time FPR-cache invalidation for a guest single/double freg
+ * write: clears the slot bit, so later reads miss and refill from
+ * the (coherent) ctx memory. No runtime instructions. */
+static inline void a64_fpr_invalidate(a64_buf_t *b, unsigned freg)
+{
+    unsigned slot = (((freg >> 1) & 15U) & 7U);
+    b->fpr_valid &= (uint8_t)~(uint8_t)(1U << slot);
 }
 
 /* Guest memory FP loads/stores via [xG, wAddr, uxtw] (SPARC is big-endian:

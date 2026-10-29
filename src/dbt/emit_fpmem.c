@@ -26,10 +26,10 @@
 #define FPMS0 15u /* w15/x15: exit guest PC / EA */
 #define FPMS1 16u /* w16: exit reason */
 #define FPMS2 17u /* w17: helper call target */
-#define FPMS3 21u /* w21: fast-path table base */
+#define FPMS3 21u /* w21: prot table value / cached-double temp */
+#define FPMSP 25u /* x25: trampoline-cached g_vm32_prot base, never x18 */
 
 const uint8_t *sparc32_vm_prot_base(void);
-const uint8_t *sparc32_vm_state_base(void);
 
 /* Guest F register file word offset. */
 #define FP_F_OFF ((uint32_t)offsetof(sparc32_ctx_t, f))
@@ -39,23 +39,14 @@ static uint32_t fp_f_off(uint32_t r)
     return FP_F_OFF + ((r & 31U) * 4U);
 }
 
-/* Same checks as Lane P5 sparc32_emit_mem_fast (emit_fast.c): per-4K
- * prot bit (0=READ, 1=WRITE); miss jumps to slow. */
-static size_t f_check_prot(a64_buf_t *b, unsigned va_w, unsigned bit,
-    const uint8_t *base)
+/* P13-4 single-lookup prot check against the x25-cached table (3
+ * insns, same shape as sparc32_emit_mem_fast): loads test bit 0
+ * (READ); stores test bit 3 (writable and code-free). */
+static size_t f_check_prot(a64_buf_t *b, unsigned va_w, unsigned bit)
 {
-    size_t p_slow;
     a64_emit_ubfm_w(b, FPMS2, va_w, 12u, 31u);
-    if (base == NULL) {
-        p_slow = a64_emit_cbz_w_placeholder(b, false, 31u);
-        return p_slow;
-    }
-    fp_mov64x(b, FPMS3, (uint64_t)(uintptr_t)base);
-    a64_emit_add_uxtw_x(b, FPMS3, FPMS3, FPMS2);
-    a64_emit_ldrb_imm_w(b, FPMS2, FPMS3, 0u);
-    a64_emit_ubfm_w(b, FPMS2, FPMS2, bit, bit);
-    p_slow = a64_emit_cbz_w_placeholder(b, false, FPMS2);
-    return p_slow;
+    a64_emit_ldrb_reg(b, FPMS3, FPMSP, FPMS2);
+    return a64_emit_tbz_w_placeholder(b, FPMS3, bit);
 }
 
 static size_t f_check_align(a64_buf_t *b, unsigned va_w, unsigned hi_bit)
@@ -165,6 +156,10 @@ static void fp_slowcall(a64_buf_t *b, uint32_t op3, uint32_t rd,
     sparc32_emit_fp_flush(b);
     b->fp_fast_checked = false;
     b->gpr_cache_valid = 0;
+    /* The helper call clobbers host NZCV. The f[] cache stays valid:
+     * slow loads always exit the fragment, slow stores never touch
+     * ctx->f[] (LDFSR writes only fsr). */
+    b->nzcv_valid = 0;
     a64_emit_add_uxtw_x(b, 0U, A64_XCTX, A64_ZR);
     a64_emit_mov_w(b, 1U, FPMS0);
     a64_emit_mov_imm32(b, 2U, op3);
@@ -194,56 +189,81 @@ static int fp_emit_fast(a64_buf_t *b, const sparc32_decoded_t *d,
     int is_double = (op3 == 0x23U || op3 == 0x27U) ? 1 : 0;
     size_t p_a;
     size_t p_p;
-    size_t p_c = (size_t)-1;
     size_t p_end;
-    const uint8_t *prot = sparc32_vm_prot_base();
-    const uint8_t *state = sparc32_vm_state_base();
 
+    if (sparc32_vm_prot_base() == NULL) {
+        fp_slowcall(b, op3, d->rd, fault_pc);
+        return b->overflow ? -1 : 0;
+    }
     if (is_double != 0) {
         p_a = f_check_align(b, FPMS0, 2u);
     } else {
         p_a = f_check_align(b, FPMS0, 1u);
     }
-    p_p = f_check_prot(b, FPMS0, (is_store != 0) ? 1u : 0u, prot);
-    if (is_store != 0 && state != NULL) {
-        a64_emit_ubfm_w(b, FPMS2, FPMS0, 12u, 31u);
-        fp_mov64x(b, FPMS3, (uint64_t)(uintptr_t)state);
-        a64_emit_add_uxtw_x(b, FPMS3, FPMS3, FPMS2);
-        a64_emit_ldrb_imm_w(b, FPMS2, FPMS3, 0u);
-        a64_emit_ubfm_w(b, FPMS2, FPMS2, 2u, 2u);
-        p_c = a64_emit_cbz_w_placeholder(b, true, FPMS2);
-    }
+    p_p = f_check_prot(b, FPMS0, (is_store != 0) ? 3u : 0u);
     if (is_store == 0) {
-        a64_emit_guest_ldr_w(b, FPMS1, FPMS0);
-        a64_emit_rev_w(b, FPMS1, FPMS1);
-        a64_emit_str_imm_w(b, FPMS1, A64_XCTX, fp_f_off(d->rd));
         if (is_double != 0) {
+            /* LDDF: populate the d8..d15 slot on the way through
+             * (hi in FPMS3, lo in FPMS1, assembled via v7). */
+            unsigned pair = (d->rd >> 1) & 15U;
+            unsigned slot = pair & 7U;
+            a64_emit_guest_ldr_w(b, FPMS1, FPMS0);
+            a64_emit_rev_w(b, FPMS1, FPMS1);
+            a64_emit_str_imm_w(b, FPMS1, A64_XCTX, fp_f_off(d->rd));
+            a64_emit_mov_w(b, FPMS3, FPMS1);
             a64_emit_add_imm_w(b, false, FPMS2, FPMS0, 4u, 0u);
             a64_emit_guest_ldr_w(b, FPMS1, FPMS2);
             a64_emit_rev_w(b, FPMS1, FPMS1);
             a64_emit_str_imm_w(b, FPMS1, A64_XCTX,
                 fp_f_off(d->rd + 1U));
+            a64_emit_fmov_w_to_s(b, 8U + slot, FPMS1);
+            a64_emit_fmov_w_to_s(b, 7u, FPMS3);
+            a64_emit_ins_s10(b, 8U + slot, 7u);
+            b->fpr_valid |= (uint8_t)(1U << slot);
+            b->fpr_tag[slot] = (uint8_t)pair;
+        } else {
+            a64_emit_guest_ldr_w(b, FPMS1, FPMS0);
+            a64_emit_rev_w(b, FPMS1, FPMS1);
+            a64_emit_str_imm_w(b, FPMS1, A64_XCTX, fp_f_off(d->rd));
+            /* LDF writes one word: drop the aliased double slot. */
+            a64_fpr_invalidate(b, d->rd);
         }
     } else {
-        a64_emit_ldr_imm_w(b, FPMS1, A64_XCTX, fp_f_off(d->rd));
-        a64_emit_rev_w(b, FPMS1, FPMS1);
-        a64_emit_guest_str_w(b, FPMS1, FPMS0);
         if (is_double != 0) {
-            a64_emit_ldr_imm_w(b, FPMS1, A64_XCTX,
-                fp_f_off(d->rd + 1U));
+            unsigned pair = (d->rd >> 1) & 15U;
+            unsigned slot = pair & 7U;
+            if ((((b->fpr_valid >> slot) & 1U) != 0U) &&
+                b->fpr_tag[slot] == (uint8_t)pair) {
+                /* STDF hit: split the cached double, no ctx loads. */
+                a64_emit_fmov_x_d(b, FPMS3, 8U + slot);
+                a64_emit_lsr_x(b, FPMS1, FPMS3, 32u);
+                a64_emit_rev_w(b, FPMS1, FPMS1);
+                a64_emit_guest_str_w(b, FPMS1, FPMS0);
+                a64_emit_rev_w(b, FPMS3, FPMS3);
+                a64_emit_add_imm_w(b, false, FPMS2, FPMS0, 4u, 0u);
+                a64_emit_guest_str_w(b, FPMS3, FPMS2);
+            } else {
+                a64_emit_ldr_imm_w(b, FPMS1, A64_XCTX,
+                    fp_f_off(d->rd));
+                a64_emit_rev_w(b, FPMS1, FPMS1);
+                a64_emit_guest_str_w(b, FPMS1, FPMS0);
+                a64_emit_ldr_imm_w(b, FPMS1, A64_XCTX,
+                    fp_f_off(d->rd + 1U));
+                a64_emit_rev_w(b, FPMS1, FPMS1);
+                a64_emit_add_imm_w(b, false, FPMS2, FPMS0, 4u, 0u);
+                a64_emit_guest_str_w(b, FPMS1, FPMS2);
+            }
+        } else {
+            a64_emit_ldr_imm_w(b, FPMS1, A64_XCTX, fp_f_off(d->rd));
             a64_emit_rev_w(b, FPMS1, FPMS1);
-            a64_emit_add_imm_w(b, false, FPMS2, FPMS0, 4u, 0u);
-            a64_emit_guest_str_w(b, FPMS1, FPMS2);
+            a64_emit_guest_str_w(b, FPMS1, FPMS0);
         }
     }
     p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     {
         size_t slow = b->count;
         a64_patch_cbz_w(b, p_a, slow);
-        a64_patch_cbz_w(b, p_p, slow);
-        if (p_c != (size_t)-1) {
-            a64_patch_cbz_w(b, p_c, slow);
-        }
+        a64_patch_tbz_w(b, p_p, slow);
         fp_slowcall(b, op3, d->rd, fault_pc);
         a64_patch_b_cond(b, p_end, b->count);
     }

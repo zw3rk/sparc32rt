@@ -28,11 +28,13 @@
  * window (sparc32_guest_ptr + ctx->regions); faults use
  * ctx->exit_reason/ctx->fault_addr.
  *
- * Implementation note: the helpers live here as static functions so the
- * whole integer emitter (emit_int.c + this file) stays within the 900-line
- * per-file discipline. They compile into emit_int.o (the sole includer);
- * JIT-emitted code resolves their addresses at emit time from the
- * translator process. No other unit may call them or take their address.
+ * Implementation note: the helpers live here so the whole integer
+ * emitter (emit_int.c + this file) stays within the 900-line per-file
+ * discipline. They compile into emit_int.o (the sole includer), except
+ * sparc32_rt_window and sparc32_rt_mem, which are non-static so the
+ * Lane P5/P13-4 inline fast paths (emit_fast.c) can funnel their slow
+ * labels here; JIT-emitted code resolves their addresses at emit time
+ * from the translator process. No other unit may include this header.
  */
 
 #ifndef SPARC32RT_DBT_EMIT_PRIV_H
@@ -295,8 +297,11 @@ static uint32_t sparc32_rt_muldiv(sparc32_ctx_t *ctx, uint32_t op3,
 
 /* Window op: rs1 register index, src2 second-operand selector (simm13
  * value when ctl bit1 is set, rs2 index otherwise), rd destination index,
- * ctl bit0 = is_save, bit1 = is_imm, pc spill/fill fault address. */
-static uint32_t sparc32_rt_window(sparc32_ctx_t *ctx, uint32_t rs1,
+ * ctl bit0 = is_save, bit1 = is_imm, pc spill/fill fault address.
+ * Non-static (like sparc32_rt_mem below): the Lane P13-4 inline
+ * SAVE/RESTORE fast path (emit_fast.c) funnels its spill/fill slow
+ * path here. */
+uint32_t sparc32_rt_window(sparc32_ctx_t *ctx, uint32_t rs1,
     uint32_t src2, uint32_t rd, uint32_t ctl, uint32_t pc)
 {
     sparc32_decoded_t d;
