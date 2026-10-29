@@ -504,7 +504,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
          * path completes the transfer inline with a plain BRANCH exit
          * (NONE after commit), never SINGLE_STEP. */
         p_taken = a64_emit_b_cond_placeholder(b, e_branch_cond(b, cond));
-        b->gpr_cache_valid = 0;
+        b->gpr_cache_valid = 0; b->fpr_valid = 0;
         if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
             rc = e_emit_delay(ec, npc);
             if (rc != 0) {
@@ -519,7 +519,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
             return rc;
         }
         a64_patch_b_cond(b, p_taken, b->count);
-        b->gpr_cache_valid = 0;
+        b->gpr_cache_valid = 0; b->fpr_valid = 0;
         if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
             rc = e_emit_delay(ec, npc);
             if (rc != 0) {
@@ -529,7 +529,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         return sparc32_emit_exit_singlestep(ec, target);
     }
     p_taken = a64_emit_b_cond_placeholder(b, e_branch_cond(b, cond));
-    b->gpr_cache_valid = 0;
+    b->gpr_cache_valid = 0; b->fpr_valid = 0;
     if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
         rc = e_emit_delay(ec, npc);
         if (rc != 0) {
@@ -538,7 +538,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     a64_patch_b_cond(b, p_taken, b->count);
-    b->gpr_cache_valid = 0;
+    b->gpr_cache_valid = 0; b->fpr_valid = 0;
     if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
         rc = e_emit_delay(ec, npc);
         if (rc != 0) {

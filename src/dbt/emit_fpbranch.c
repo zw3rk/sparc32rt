@@ -181,12 +181,16 @@ int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     if (page_final != 0) {
         fp_taken_compute(b, cond);
         p_taken = a64_emit_cbz_w_placeholder(b, true, FS1);
+        b->gpr_cache_valid = 0;
+        b->fpr_valid = 0;
         rc = fp_delay_tail(ec, npc, npc + 4U,
             fp_delay_runs(cond, 0, annul), page_final);
         if (rc != 0) {
             return rc;
         }
         a64_patch_cbz_w(b, p_taken, b->count);
+        b->gpr_cache_valid = 0;
+        b->fpr_valid = 0;
         /* Taken page-final always SINGLE_STEPs (emit_branch shape),
          * even when the delay was annulled away. */
         if (fp_delay_runs(cond, 1, annul) != 0) {
@@ -199,6 +203,8 @@ int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     fp_taken_compute(b, cond);
     p_taken = a64_emit_cbz_w_placeholder(b, true, FS1);
+    b->gpr_cache_valid = 0;
+    b->fpr_valid = 0;
     if (fp_delay_runs(cond, 0, annul) != 0) {
         rc = fp_emit_delay(ec, npc);
         if (rc != 0) {
@@ -207,6 +213,8 @@ int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     a64_patch_cbz_w(b, p_taken, b->count);
+    b->gpr_cache_valid = 0;
+    b->fpr_valid = 0;
     if (fp_delay_runs(cond, 1, annul) != 0) {
         rc = fp_emit_delay(ec, npc);
         if (rc != 0) {
