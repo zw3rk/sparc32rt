@@ -89,9 +89,10 @@ static void f_ea_into(a64_buf_t *b, unsigned wd, const sparc32_decoded_t *d)
 extern uint32_t sparc32_rt_mem(sparc32_ctx_t *ctx, uint32_t va,
     uint32_t op3, uint32_t rd, uint32_t rs2, uint32_t asi);
 
-static void f_emit_slowcall(a64_buf_t *b, const sparc32_decoded_t *d,
-    uint32_t fault_pc)
+static void f_emit_slowcall(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
+    bool is_store)
 {
+    a64_buf_t *b = ec->buf;
     size_t p_fault;
     size_t p_cont;
     uint32_t op3 = d->op3 & 0x3Fu;
@@ -126,12 +127,23 @@ static void f_emit_slowcall(a64_buf_t *b, const sparc32_decoded_t *d,
         }
     }
     p_fault = a64_emit_cbz_w_placeholder(b, true, 0u);
-    p_cont = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    a64_patch_cbz_w(b, p_fault, b->count);
-    a64_emit_mov_w(b, F_ES1, 0u);
-    a64_emit_mov_pc32(b, F_ES0, fault_pc);
-    a64_emit_ret(b);
-    a64_patch_b_cond(b, p_cont, b->count);
+    if (is_store && ec->delay == NULL) {
+        sparc32_emit_fp_flush(b);
+        a64_emit_movz_w(b, F_ES1, (uint16_t)SPARC32_EXIT_BRANCH, 0u);
+        a64_emit_mov_pc32(b, F_ES0, ec->pc + 4u);
+        a64_emit_ret(b);
+        a64_patch_cbz_w(b, p_fault, b->count);
+        a64_emit_mov_w(b, F_ES1, 0u);
+        a64_emit_mov_pc32(b, F_ES0, ec->fault_pc);
+        a64_emit_ret(b);
+    } else {
+        p_cont = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_cbz_w(b, p_fault, b->count);
+        a64_emit_mov_w(b, F_ES1, 0u);
+        a64_emit_mov_pc32(b, F_ES0, ec->fault_pc);
+        a64_emit_ret(b);
+        a64_patch_b_cond(b, p_cont, b->count);
+    }
     /* The helper call clobbers host NZCV for the rest of the block. */
     b->nzcv_valid = 0;
 }
@@ -282,15 +294,6 @@ int sparc32_emit_mem_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
             a64_emit(b, 0xD5033BBFu); /* dmb ish (TSO store-release) */
             a64_emit_guest_str_w(b, F_ES1, F_ES0);
             a64_emit(b, 0xD5033BBFu); /* dmb ish */
-            f_mov64(b, F_ES1, (uint64_t)(uintptr_t)&g_sparc32_ldstub_lock);
-            a64_emit_ldr_imm_w(b, F_ES2, F_ES1, 0u);
-            a64_emit_sub_reg_w(b, true, A64_ZR, F_ES0, F_ES2, A64_SHIFT_LSL, 0u);
-            {
-                size_t p_rel = a64_emit_b_cond_placeholder(b, A64_COND_NE);
-                a64_emit_stp_x(b, A64_ZR, A64_ZR, F_ES1, 0u);
-                a64_emit(b, 0xD5033BBFu); /* dmb ish */
-                a64_patch_b_cond(b, p_rel, b->count);
-            }
         } else if (width == 2u) {
             a64_emit_rev16_w(b, F_ES1, F_ES1);
             a64_emit_guest_strh_w(b, F_ES1, F_ES0);
@@ -298,15 +301,6 @@ int sparc32_emit_mem_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
             a64_emit(b, 0xD5033BBFu); /* dmb ish (TSO store-release for ldstub/clrb) */
             a64_emit_guest_strb_w(b, F_ES1, F_ES0);
             a64_emit(b, 0xD5033BBFu); /* dmb ish */
-            f_mov64(b, F_ES1, (uint64_t)(uintptr_t)&g_sparc32_ldstub_lock);
-            a64_emit_ldr_imm_w(b, F_ES2, F_ES1, 0u);
-            a64_emit_sub_reg_w(b, true, A64_ZR, F_ES0, F_ES2, A64_SHIFT_LSL, 0u);
-            {
-                size_t p_rel = a64_emit_b_cond_placeholder(b, A64_COND_NE);
-                a64_emit_stp_x(b, A64_ZR, A64_ZR, F_ES1, 0u);
-                a64_emit(b, 0xD5033BBFu); /* dmb ish */
-                a64_patch_b_cond(b, p_rel, b->count);
-            }
         }
     }
     p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
@@ -316,7 +310,7 @@ int sparc32_emit_mem_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
             a64_patch_cbz_w(b, p_a, slow);
         }
         a64_patch_tbz_w(b, p_p, slow);
-        f_emit_slowcall(b, d, ec->fault_pc);
+        f_emit_slowcall(ec, d, is_store);
         a64_patch_b_cond(b, p_end, b->count);
     }
     return b->overflow ? -1 : 1;

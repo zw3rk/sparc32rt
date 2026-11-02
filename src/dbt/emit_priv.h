@@ -187,7 +187,7 @@ static uint32_t sparc32_rt_muldiv(sparc32_ctx_t *ctx, uint32_t op3,
         return SPARC32_EXIT_NONE;
     }
     case 0x0FU: { /* SDIV: truncates toward zero. */
-        int64_t dvd = ((int64_t)(int32_t)ctx->y << 32) | (int64_t)a;
+        int64_t dvd = (int64_t)(((uint64_t)ctx->y << 32) | (uint64_t)a);
         int32_t dvs = (int32_t)b;
 
         if (dvs == 0) {
@@ -218,7 +218,7 @@ static uint32_t sparc32_rt_muldiv(sparc32_ctx_t *ctx, uint32_t op3,
         return SPARC32_EXIT_NONE;
     }
     case 0x1FU: { /* SDIVcc */
-        int64_t dvd = ((int64_t)(int32_t)ctx->y << 32) | (int64_t)a;
+        int64_t dvd = (int64_t)(((uint64_t)ctx->y << 32) | (uint64_t)a);
         int32_t dvs = (int32_t)b;
         int64_t q;
 

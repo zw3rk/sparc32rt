@@ -335,15 +335,28 @@ int rt_host_map_file(void *hint_addr, size_t len, int linux_prot, int shared,
         uintptr_t end = start + len;
         uintptr_t hp_start = start & ~(uintptr_t)(hp - 1u);
         uintptr_t hp_end = (end + (uintptr_t)(hp - 1u)) & ~(uintptr_t)(hp - 1u);
-        ssize_t n;
+        size_t done = 0u;
+        if (shared != 0) {
+            return -EINVAL;
+        }
         if (mprotect((void *)hp_start, hp_end - hp_start,
                 PROT_READ | PROT_WRITE) != 0) {
             return -errno;
         }
         memset(hint_addr, 0, len);
-        n = pread(host_fd, hint_addr, len, (off_t)aligned_file_offset);
-        if (n < 0) {
-            return -errno;
+        while (done < len) {
+            ssize_t n = pread(host_fd, (char *)hint_addr + done,
+                len - done, (off_t)(aligned_file_offset + (uint64_t)done));
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -errno;
+            }
+            if (n == 0) {
+                break;
+            }
+            done += (size_t)n;
         }
         *out_host_addr = hint_addr;
         return 0;

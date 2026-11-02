@@ -272,7 +272,7 @@ static bool interp_alu(sparc32_ctx_t *ctx, uint32_t pc,
         return true;
     }
     case 0x0FU: { /* SDIV */
-        int64_t dvd = ((int64_t)(int32_t)ctx->y << 32) | (int64_t)a;
+        int64_t dvd = (int64_t)(((uint64_t)ctx->y << 32) | (uint64_t)a);
         int32_t dvs = (int32_t)b;
         if (dvs == 0) {
             return interp_trap_taken(ctx, SPARC32_TRAP_DIV_ZERO);
@@ -301,7 +301,7 @@ static bool interp_alu(sparc32_ctx_t *ctx, uint32_t pc,
         return true;
     }
     case 0x1FU: { /* SDIVcc */
-        int64_t dvd = ((int64_t)(int32_t)ctx->y << 32) | (int64_t)a;
+        int64_t dvd = (int64_t)(((uint64_t)ctx->y << 32) | (uint64_t)a);
         int32_t dvs = (int32_t)b;
         int64_t q;
         if (dvs == 0) {

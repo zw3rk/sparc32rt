@@ -15,6 +15,7 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <sys/syscall.h>
@@ -120,7 +121,8 @@ long sparc32_futex_wait_emu(sparc32_ctx_t *ctx, uint32_t uaddr,
         } else {
             int64_t rel = (sec > 9000000000LL) ? 9000000000LL * 1000000000LL :
                 sec * 1000000000LL + nsec;
-            deadline = futex_emu_now_ns() + rel;
+            int64_t now = futex_emu_now_ns();
+            deadline = (now > INT64_MAX - rel) ? INT64_MAX : (now + rel);
         }
     } else {
         deadline = 0LL;
@@ -290,6 +292,23 @@ long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
             hts[1] = (long long)nsec;
             rc = syscall(SYS_futex_time64, host_ptr, (int)(op & 15U),
                 (int)swapped, hts, 0, 0);
+            return (rc < 0) ? -(long)errno : rc;
+        }
+#elif defined(__linux__) && defined(SYS_futex)
+        {
+            uint32_t *host_ptr = (uint32_t *)sparc32_guest_ptr(ctx, uaddr);
+            uint32_t swapped = ((val & 0xFFU) << 24) |
+                ((val & 0xFF00U) << 8) | ((val & 0xFF0000U) >> 8) |
+                ((val & 0xFF000000U) >> 24);
+            struct timespec hts;
+            long rc;
+            if (nsec >= 1000000000ULL) {
+                return -SP_EINVAL;
+            }
+            hts.tv_sec = (time_t)sec;
+            hts.tv_nsec = (long)nsec;
+            rc = syscall(SYS_futex, host_ptr, (int)(op & 15U),
+                (int)swapped, &hts, 0, 0);
             return (rc < 0) ? -(long)errno : rc;
         }
 #else

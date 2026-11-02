@@ -40,21 +40,22 @@ bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
  * sysroot headers; shared by the syscall layer and delivery). */
 #define SPARC32_SA_ONSTACK 1U
 #define SPARC32_SA_RESTART 2U
+#define SPARC32_SA_NODEFER 0x20U
 #define SPARC32_SA_SIGINFO 0x200U
 #define SPARC32_SS_ONSTACK 1U
 #define SPARC32_SS_DISABLE 2U
 #define SPARC32_MINSIGSTKSZ 4096U
-/* C2-3 signal extensions (implemented in os/syscalls_min.c, consulted
+#define SPARC32_SIGFPU_SIZE 136U
+/* C2-3 signal extensions (implemented in os/syscalls_sig.c, consulted
  * by interp_signal.c delivery): full disposition (handler/restorer/
- * accepted SA_* flags), alternate-stack state, onstack mark, and the
- * host-side FPU save stack (push at delivery, pop newest match at
- * sigreturn; -1 when no push pairs, e.g. longjmp bypassed sigreturn). */
+ * accepted SA_* flags/sa_mask), alternate-stack state, and onstack mark. */
 int sparc32_signal_get_full(int sig, uint32_t *handler_va,
     uint32_t *restorer_va, uint32_t *flags);
+int sparc32_signal_get_action(int sig, uint32_t *handler_va,
+    uint32_t *restorer_va, uint32_t *flags, uint64_t *sa_mask);
 int sparc32_sigaltstack_state(uint32_t *sp, uint32_t *size, int *onstack);
 void sparc32_sigaltstack_set_onstack(int onstack);
-void sparc32_fpu_save_push(const sparc32_ctx_t *ctx);
-int sparc32_fpu_save_pop(sparc32_ctx_t *ctx);
+void sparc32_l2a_set_blocked_mask(sparc32_ctx_t *ctx, uint64_t mask);
 /* Flush-windows trap (ta 3, C2-3): spill every cached caller window to
  * its recorded stack slot so setjmp/longjmp and signal frames observe
  * fully spilled stacks. The cache values are published unchanged, so no

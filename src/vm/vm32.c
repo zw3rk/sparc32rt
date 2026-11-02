@@ -4,26 +4,23 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Implements UNIFICATION-PLAN.md Rev 4 section 4.6 for sparc32rt:
+ * Implements the 4 GiB guest window and per-4 KiB page protection/state
+ * tables for sparc32rt:
  *
  * Regime A1 (host page size H == 4096, native 4 KiB Linux and every
  * hyper-linux run): reserve one 4 GiB MAP_PRIVATE|MAP_ANONYMOUS window
- * [G, G + 4 GiB) with x20 = G and emit the 1-instruction hardware load
- * / store [x20, wAddr, uxtw]. Every 4 KiB guest page maps 1:1 to a host
+ * [G, G + 4 GiB) with x20 = G. Every 4 KiB guest page maps 1:1 to a host
  * page; guest fork() is native kernel MAP_PRIVATE COW.
  *
  * Regime A2 (H > 4096: standalone 16 KiB macOS Mach-O backend_darwin.c
  * and native 16K/64K Linux without /dev/a32host): the same 4 GiB range
  * is a single MAP_PRIVATE|MAP_ANONYMOUS arena whose active host pages
  * carry the union of their 4 KiB sub-page permissions (PROT_READ |
- * PROT_WRITE, never PROT_EXEC). x20 is bound to &tlb[0] and every DBT
- * access runs the 7-instruction Soft-TLB (mem_site.h); permission checks
- * happen in software at site instruction 6, so RELRO + .data sharing one
- * 16 KiB host page costs zero SIGSEGV traps and every page keeps one
- * coherent address HVA = G + gva for DBT, interp_step, futex, and
- * syscall copyin/copyout.
+ * PROT_WRITE, never PROT_EXEC). x20 = G and x25 = g_vm32_prot_jit so
+ * every inline DBT access and interpreter/syscall helper probes the
+ * per-4 KiB protection table directly while sharing HVA = G + gva.
  *
- * Page state + the per-thread 128 KiB TLB live here; file backing and
+ * Per-4 KiB page protection/state tables live here; file backing and
  * the family inode table live in vm_file.c (Provider A, section 5.1).
  * Host primitives come from src/os/backend.h (dual backend, section 6).
  * No AArch64 assembly in this unit (x18 discipline is vacuous here).
@@ -48,8 +45,8 @@
 
 /* Regime selectors. */
 typedef enum {
-    VM32_REGIME_A1 = 1, /* Direct [x20, wAddr, uxtw], H == 4096 */
-    VM32_REGIME_A2 = 2 /* Soft-TLB over MAP_PRIVATE arena, H > 4096 */
+    VM32_REGIME_A1 = 1, /* H == 4096 */
+    VM32_REGIME_A2 = 2  /* H > 4096 sub-page software permissions */
 } vm32_regime_t;
 
 static vm32_regime_t g_vm32_regime = VM32_REGIME_A1;
@@ -59,6 +56,7 @@ static uint64_t g_vm32_base = 0u;
 /* Per-4 KiB guest page protection (Linux PROT bits) and state bits. */
 static uint8_t *g_vm32_prot = NULL;
 static uint8_t *g_vm32_state = NULL;
+static uint64_t g_vm32_code_mask[4096];
 
 /* P13-4 JIT-visible alias of g_vm32_prot. trampoline_a64.S loads this
  * pointer into callee-saved x25 once per block entry, so every inline
@@ -82,22 +80,6 @@ static inline void vm32_sync_fast_write(uint32_t vpn)
     } else {
         g_vm32_prot[vpn] = (uint8_t)(p & (uint8_t)~VM32_PROT_FAST_WRITE);
     }
-}
-
-/* Per-thread Soft-TLB (128 KiB): owner ctx + entries, see mem_site.h. */
-static _Thread_local rt_tlb_entry_t t_tlb[RT_TLB_SIZE];
-static _Thread_local const sparc32_ctx_t *t_tlb_owner = NULL;
-
-static void vm32_tlb_reset_thread(const sparc32_ctx_t *ctx)
-{
-    uint64_t i;
-    for (i = 0u; i < (uint64_t)RT_TLB_SIZE; i++) {
-        t_tlb[i].read_tag = RT_TLB_INVALID_TAG;
-        t_tlb[i].addend = 0u;
-        t_tlb[i].write_tag = RT_TLB_INVALID_TAG;
-        t_tlb[i].flags_reserved = 0u;
-    }
-    t_tlb_owner = ctx;
 }
 
 /* Current regime (valid after vm32_reserve/vm32_attach). */
@@ -134,10 +116,8 @@ static int vm32_alloc_tables(void)
 }
 
 /*
- * Reserve the 4 GiB window and bind ctx->guest_base. Regime follows the
- * live host page size: H == 4096 selects A1 (x20 = G, hardware
- * addressing), H > 4096 selects A2 (x20 = &tlb[0], Soft-TLB). Returns 0
- * on success, -1 on host mapping failure.
+ * Reserve the 4 GiB window and bind ctx->guest_base.
+ * Returns 0 on success, -1 on host mapping failure.
  */
 int vm32_reserve(sparc32_ctx_t *ctx)
 {
@@ -166,7 +146,6 @@ int vm32_reserve(sparc32_ctx_t *ctx)
     g_vm32_base = (uint64_t)(uintptr_t)base;
     g_vm32_ready = true;
     ctx->guest_base = g_vm32_base;
-    vm32_tlb_reset_thread(ctx);
     return 0;
 }
 
@@ -198,8 +177,22 @@ int vm32_attach(sparc32_ctx_t *ctx)
         VM32_REGIME_A1 : VM32_REGIME_A2;
     g_vm32_base = ctx->guest_base;
     g_vm32_ready = true;
-    vm32_tlb_reset_thread(ctx);
     return 0;
+}
+
+/* Clear all per-page permissions and state across execve reset. */
+void vm32_reset(void)
+{
+    if (!g_vm32_ready) {
+        return;
+    }
+    if (g_vm32_prot != NULL) {
+        memset(g_vm32_prot, 0, (size_t)VM32_PAGE_COUNT);
+    }
+    if (g_vm32_state != NULL) {
+        memset(g_vm32_state, 0, (size_t)VM32_PAGE_COUNT);
+    }
+    memset(g_vm32_code_mask, 0, sizeof(g_vm32_code_mask));
 }
 
 /* Canonical host address: every engine addresses HVA = G + gva. */
@@ -210,9 +203,7 @@ void *vm32_hva(const sparc32_ctx_t *ctx, uint32_t gva)
 }
 
 /*
- * Publish per-page state after an mmap/mprotect/munmap commit (section
- * 4.5 Step 4 caller). Marks PAGE_HAS_CODE-free writable pages valid for
- * write_tag via rt_write_tag_allowed; callers then refresh the TLB.
+ * Publish per-page state after an mmap/mprotect/munmap commit.
  */
 void vm32_publish_page(uint32_t gva, uint32_t prot, uint32_t state)
 {
@@ -229,8 +220,7 @@ void vm32_publish_page(uint32_t gva, uint32_t prot, uint32_t state)
  * Revert one page to CLEAN after a file shrink (RC-U3-r4): pages fully
  * beyond the new EOF must refill from the file on next fault instead of
  * serving stale DIRTY bytes. Other state bits (CODE/RESERVATION) and
- * the recorded protection are preserved. No TLB refresh here; callers
- * invalidate the shrunk span once after walking it.
+ * the recorded protection are preserved.
  */
 uint32_t vm32_page_state(uint32_t gva)
 {
@@ -258,126 +248,105 @@ void vm32_page_revert_clean(uint32_t gva)
     vm32_sync_fast_write((uint32_t)vpn);
 }
 
-/*
- * Soft-TLB miss helper (shared per-block trampoline target, section
- * 4.3.3): validates [gva, gva+width) against the published tables,
- * refreshes the calling thread's entry, and returns the canonical HVA.
- * On fault sets ctx EXIT_FAULT/fault_addr and returns NULL. Widths 1/2
- * /4/8 stay single-page fast; width 16 validates both touched pages.
- */
-void *vm_tlb_miss_helper(sparc32_ctx_t *ctx, uint32_t gva, uint32_t width,
-    bool is_store)
-{
-    uint64_t vpn;
-    uint64_t idx;
-    uintptr_t addend;
-    uint8_t prot;
-    uint8_t state;
-    if (ctx == NULL || !g_vm32_ready) {
-        return NULL;
-    }
-    if (width != 1u && width != 2u && width != 4u && width != 8u &&
-        width != 16u) {
-        ctx->exit_reason = SPARC32_EXIT_FAULT;
-        ctx->fault_addr = gva;
-        return NULL;
-    }
-    if ((gva & (width > 4u ? 3u : (width - 1u))) != 0u) {
-        ctx->exit_reason = SPARC32_EXIT_FAULT;
-        ctx->fault_addr = gva;
-        return NULL;
-    }
-    vpn = (uint64_t)(gva / VM32_GUEST_PAGE);
-    if (vpn >= (uint64_t)VM32_PAGE_COUNT) {
-        ctx->exit_reason = SPARC32_EXIT_FAULT;
-        ctx->fault_addr = gva;
-        return NULL;
-    }
-    if (t_tlb_owner != ctx) {
-        vm32_tlb_reset_thread(ctx);
-    }
-    prot = g_vm32_prot[vpn];
-    state = g_vm32_state[vpn];
-    if (is_store ? (prot & 2u) == 0u : (prot & 1u) == 0u) {
-        ctx->exit_reason = SPARC32_EXIT_FAULT;
-        ctx->fault_addr = gva;
-        return NULL;
-    }
-    if (is_store && (state & RT_PAGE_COW_CLEAN) != 0U &&
-        (prot & 2u) != 0u &&
-        (state & (RT_PAGE_HAS_CODE | RT_PAGE_HAS_SW_RESERVATION)) == 0u) {
-        /* First write to a clean COW page: promote in place so this
-         * very miss succeeds without a second fault. HVA is unchanged. */
-        state = (uint8_t)((state & (uint8_t)~RT_PAGE_COW_CLEAN) |
-            (uint8_t)RT_PAGE_COW_DIRTY);
-        g_vm32_state[vpn] = state;
-        vm32_sync_fast_write((uint32_t)vpn);
-    }
-    if (is_store && !rt_write_tag_allowed((uint32_t)state, (uint32_t)prot)) {
-        ctx->exit_reason = SPARC32_EXIT_FAULT;
-        ctx->fault_addr = gva;
-        return NULL;
-    }
-    idx = (vpn & (uint64_t)(RT_TLB_SIZE - 1u));
-    /* Per-entry addend is host_page_base - tag (mem_site.h): the arena
-     * is one contiguous reservation, so this page's host base is
-     * G + vpn * 4 KiB. A bare G under-subtracts by the page base and
-     * misplaces every A2 HVA by up to 4 GiB - 4 KiB. */
-    addend = (uintptr_t)g_vm32_base +
-        (uintptr_t)(vpn * (uint64_t)VM32_GUEST_PAGE);
-    t_tlb[idx].read_tag = (uint64_t)(vpn * (uint64_t)VM32_GUEST_PAGE);
-    t_tlb[idx].addend = addend - (uintptr_t)t_tlb[idx].read_tag;
-    t_tlb[idx].write_tag = is_store ? t_tlb[idx].read_tag :
-        t_tlb[idx].write_tag;
-    if (!is_store) {
-        t_tlb[idx].write_tag = rt_write_tag_allowed((uint32_t)state,
-            (uint32_t)prot) ? t_tlb[idx].read_tag : RT_TLB_INVALID_TAG;
-    }
-    return vm32_hva(ctx, gva);
-}
-
-/*
- * Range-selective Soft-TLB invalidation (section 4.5 Step 5): fewer than
- * 512 pages invalidate only the covered indices, anything larger clears
- * the calling thread's table (peers clear lazily via the quiescence
- * epoch + preemption rewind).
- */
+/* Retained no-op hook for VM lifecycle callers; permissions live in
+ * g_vm32_prot / g_vm32_prot_jit and take effect immediately. */
 void vm32_tlb_invalidate(uint32_t start, uint32_t len)
 {
-    uint64_t first;
-    uint64_t count;
-    uint64_t i;
-    if (!g_vm32_ready) {
-        return;
-    }
-    first = (uint64_t)(start / VM32_GUEST_PAGE);
-    count = (uint64_t)((len + (size_t)VM32_GUEST_PAGE - 1u) /
-        (size_t)VM32_GUEST_PAGE);
-    if (count >= 512u) {
-        vm32_tlb_reset_thread(t_tlb_owner);
-        return;
-    }
-    for (i = 0u; i < count; i++) {
-        uint64_t idx = (first + i) & (uint64_t)(RT_TLB_SIZE - 1u);
-        t_tlb[idx].read_tag = RT_TLB_INVALID_TAG;
-        t_tlb[idx].write_tag = RT_TLB_INVALID_TAG;
-    }
+    (void)start;
+    (void)len;
 }
 
 /*
- * SMC hook: a store or copyout to a PAGE_HAS_CODE page retires the
- * overlapping DBT blocks (via the existing vm_invalidate_jit path) and
- * clears the write tags so further stores trap into the miss helper.
+ * SMC hook: mark all 4 KiB pages covered by [gva, gva + len) as holding
+ * translated code and clear VM32_PROT_FAST_WRITE so subsequent stores trap
+ * into the slow path and invalidate stale translations.
  */
 void vm32_note_code_page(uint32_t gva, uint32_t len)
 {
-    uint64_t vpn = (uint64_t)(gva / VM32_GUEST_PAGE);
-    if (!g_vm32_ready || vpn >= (uint64_t)VM32_PAGE_COUNT) {
+    uint64_t first;
+    uint64_t last;
+    uint64_t vpn;
+    uint64_t lfirst;
+    uint64_t llast;
+    uint64_t line;
+    uint32_t eff_len = (len == 0u) ? 1u : len;
+    if (!g_vm32_ready) {
         return;
     }
-    g_vm32_state[vpn] |= (uint8_t)RT_PAGE_HAS_CODE;
-    vm32_sync_fast_write((uint32_t)vpn);
-    vm32_tlb_invalidate(gva, len);
+    lfirst = (uint64_t)(gva >> 6);
+    llast = ((uint64_t)gva + (uint64_t)eff_len - 1u) >> 6;
+    for (line = lfirst; line <= llast; line++) {
+        uint32_t pv = (uint32_t)(line >> 6) & 4095u;
+        uint32_t bit = (uint32_t)line & 63u;
+        __atomic_or_fetch(&g_vm32_code_mask[pv], (uint64_t)1u << bit,
+            __ATOMIC_RELEASE);
+    }
+    first = (uint64_t)(gva / VM32_GUEST_PAGE);
+    last = ((uint64_t)gva + (uint64_t)eff_len - 1u) /
+        (uint64_t)VM32_GUEST_PAGE;
+    if (last >= (uint64_t)VM32_PAGE_COUNT) {
+        last = (uint64_t)VM32_PAGE_COUNT - 1u;
+    }
+    for (vpn = first; vpn <= last; vpn++) {
+        g_vm32_state[vpn] |= (uint8_t)RT_PAGE_HAS_CODE;
+        vm32_sync_fast_write((uint32_t)vpn);
+    }
+}
+
+void vm32_clear_code_range(uint32_t start, uint32_t end)
+{
+    uint64_t first;
+    uint64_t last;
+    uint64_t vpn;
+    if (!g_vm32_ready || end <= start) {
+        return;
+    }
+    first = (uint64_t)(start / VM32_GUEST_PAGE);
+    last = (uint64_t)((end - 1u) / VM32_GUEST_PAGE);
+    if (last >= (uint64_t)VM32_PAGE_COUNT) {
+        last = (uint64_t)VM32_PAGE_COUNT - 1u;
+    }
+    for (vpn = first; vpn <= last; vpn++) {
+        g_vm32_state[vpn] &= (uint8_t)~RT_PAGE_HAS_CODE;
+        __atomic_store_n(&g_vm32_code_mask[(uint32_t)vpn & 4095u], 0ULL,
+            __ATOMIC_RELEASE);
+        vm32_sync_fast_write((uint32_t)vpn);
+    }
+}
+
+bool vm32_range_has_code(uint32_t gva, size_t len)
+{
+    uint64_t first;
+    uint64_t last;
+    uint64_t vpn;
+    if (!g_vm32_ready || g_vm32_state == NULL || len == 0u) {
+        return false;
+    }
+    if (len <= 64u && (((gva ^ (gva + (uint32_t)len - 1u)) >> 12) == 0u)) {
+        uint32_t pv = gva >> 12;
+        uint64_t mask;
+        uint32_t b0;
+        uint32_t b1;
+        if ((g_vm32_state[pv] & (uint8_t)RT_PAGE_HAS_CODE) == 0u) {
+            return false;
+        }
+        mask = __atomic_load_n(&g_vm32_code_mask[pv & 4095u], __ATOMIC_ACQUIRE);
+        b0 = (gva >> 6) & 63u;
+        b1 = ((gva + (uint32_t)len - 1u) >> 6) & 63u;
+        return (((mask >> b0) & 1ULL) != 0ULL) ||
+            (((mask >> b1) & 1ULL) != 0ULL);
+    }
+    first = (uint64_t)(gva / VM32_GUEST_PAGE);
+    last = ((uint64_t)gva + (uint64_t)len - 1u) / (uint64_t)VM32_GUEST_PAGE;
+    if (last >= (uint64_t)VM32_PAGE_COUNT) {
+        last = (uint64_t)VM32_PAGE_COUNT - 1u;
+    }
+    for (vpn = first; vpn <= last; vpn++) {
+        if ((g_vm32_state[vpn] & (uint8_t)RT_PAGE_HAS_CODE) != 0u) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Lane P5 inline fast-path tables (emit_priv.h): per-4K prot/state bases

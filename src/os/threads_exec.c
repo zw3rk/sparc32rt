@@ -100,10 +100,13 @@ static int thr_read_vec(sparc32_ctx_t *ctx, uint32_t vec_va, char **out,
             thr_free_vec(out, n);
             return -ENOMEM;
         }
-        if (thr_read_cstr(ctx, eva, s, THR_EXEC_STR_MAX) != 0) {
-            free(s);
-            thr_free_vec(out, n);
-            return -EFAULT;
+        {
+            int s_rc = thr_read_cstr(ctx, eva, s, THR_EXEC_STR_MAX);
+            if (s_rc != 0) {
+                free(s);
+                thr_free_vec(out, n);
+                return s_rc;
+            }
         }
         out[n++] = s;
         va += 4U;
@@ -134,25 +137,40 @@ long sparc32_thr_execve(sparc32_ctx_t *ctx, uint32_t path_va,
     if (ctx == NULL) {
         return -EFAULT;
     }
-    /* New image: no handlers (Linux resets caught signals to SIG_DFL). */
-    sparc32_signal_reset_all();
-    if (thr_read_cstr(ctx, path_va, path, sizeof(path)) != 0) {
-        return -EFAULT;
+    rc = thr_read_cstr(ctx, path_va, path, sizeof(path));
+    if (rc != 0) {
+        return rc;
+    }
+    if (path[0] == '\0') {
+        return -ENOENT;
     }
     /* thr_read_vec frees its own partials on error and NULL-terminates
      * on success, so the vectors are always stack_setup-ready here. */
-    if (thr_read_vec(ctx, argv_va, argv, THR_EXEC_ARGS_MAX, &argc) != 0) {
-        return -EFAULT;
+    rc = thr_read_vec(ctx, argv_va, argv, THR_EXEC_ARGS_MAX, &argc);
+    if (rc != 0) {
+        return rc;
     }
-    if (thr_read_vec(ctx, envp_va, envp, THR_EXEC_ARGS_MAX, &envc) != 0) {
+    rc = thr_read_vec(ctx, envp_va, envp, THR_EXEC_ARGS_MAX, &envc);
+    if (rc != 0) {
         thr_free_vec(argv, argc);
-        return -EFAULT;
+        return rc;
     }
-    rt32_vm_reset_for_exec(ctx);
-    if (rt32_elf_load(ctx, -1, path, &info) != 0) {
+    /* Validate target ELF + PT_INTERP non-destructively before mutating
+     * signal dispositions or tearing down the caller's address space. */
+    rc = rt32_elf_validate(ctx, path);
+    if (rc != 0) {
         thr_free_vec(argv, argc);
         thr_free_vec(envp, envc);
-        return -ENOENT;
+        return rc;
+    }
+    /* New image: no handlers (Linux resets caught signals to SIG_DFL). */
+    sparc32_signal_reset_all();
+    rt32_vm_reset_for_exec(ctx);
+    rc = rt32_elf_load(ctx, -1, path, &info);
+    if (rc != 0) {
+        thr_free_vec(argv, argc);
+        thr_free_vec(envp, envc);
+        return rc;
     }
     rc = rt32_stack_setup(ctx, &info, (int)argc, argv, envp, &sp);
     thr_free_vec(argv, argc);

@@ -32,4 +32,8 @@ void interp_run(sparc32_ctx_t *ctx);
  * is installed or the frame does not fit — caller keeps EXIT_FAULT. */
 bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo);
 
+/* Instruction-aware fault -> signal classification (10 SIGBUS vs 11 SIGSEGV).
+ * Shared by src/main.c and clone-thread fault delivery in src/os/threads.c. */
+int sparc32_classify_fault(const sparc32_ctx_t *ctx);
+
 #endif /* SPARC32RT_INTERP_INTERP_H */

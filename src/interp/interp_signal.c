@@ -10,6 +10,7 @@ RC1 subset of Phase-4 signals: rt_signal_frame32 construction for
 
 #include "sparc32rt.h"
 
+#include "interp/interp.h"
 #include "interp/interp_priv.h"
 #include "os/sigframe_sparc32rt.h"
 #include "os/syscalls_min.h"
@@ -17,24 +18,21 @@ RC1 subset of Phase-4 signals: rt_signal_frame32 construction for
 #include <stddef.h>
 #include <stdint.h>
 
-/* Synchronous fault delivery (RC1 subset of Phase-4 signals). Builds the
- * frozen kernel-order rt_signal_frame32 (344 B, 16-aligned) on the guest
- * stack and redirects to an installed old-style handler:
+/* Process-global mask owned by src/os/syscalls_time.c. */
+extern uint64_t sparc32_l2a_blocked_mask(void);
+
+/* Synchronous fault delivery. Builds the frozen kernel-order
+ * rt_signal_frame32 (344 B) + inline sigfpu32 tail (136 B) on the guest
+ * stack (16-aligned) and redirects to an installed handler:
  *   %sp = frame, %o0 = signo, %o1 = &siginfo, %o2 = &pt_regs,
  *   %o7 = restorer, pc = handler, npc = handler + 4.
- * si_addr = ctx->fault_addr; si_code = SEGV_ACCERR(2) when the fault
- * address lies inside a mapped region, else SEGV_MAPERR(1). The test
- * handler patches pc/npc at frame+100/+104 (non-RT signal_frame regs
- * slots aliasing the RT info words on this kernel/qemu layout) and
- * resumes via sigreturn(216), which reads exactly those slots — the
- * kernel-layout regs at +0xE4/+0xE8 are saved faithfully but ignored by
- * that path, matching qemu-sparc do_sigreturn. Returns false when no
- * handler is installed or the frame does not fit (caller keeps EXIT_FAULT).
- * Misaligned DATA accesses never reach here (emulated byte-wise, E06). */
+ * Generic word/halfword alignment checks in interp_mem.c and explicit
+ * doubleword alignment checks in interp.c / emit_int.c raise EXIT_FAULT
+ * with ctx->fault_addr; sparc32_classify_fault selects SIGBUS (10,
+ * BUS_ADRALN) vs SIGSEGV (11, SEGV_MAPERR/SEGV_ACCERR). */
 /* C2-3 delivery stack: an SA_ONSTACK handler runs on the installed
  * alternate stack (top, frame built under it 16-aligned) unless a
- * handler already runs there; records the transition and pushes the
- * live FPU for the matching sigreturn. Returns the sp to build under. */
+ * handler already runs there. Returns the sp to build under. */
 static uint32_t interp_delivery_sp(sparc32_ctx_t *ctx, uint32_t flags)
 {
     uint32_t sp = ctx->r[SPARC32_SP];
@@ -63,8 +61,40 @@ static uint32_t interp_delivery_sp(sparc32_ctx_t *ctx, uint32_t flags)
             sp = asp + asize;
         }
     }
-    sparc32_fpu_save_push(ctx);
     return sp;
+}
+
+static bool interp_frame_fpu(sparc32_ctx_t *ctx, uint32_t fpu_va)
+{
+    uint32_t i;
+    for (i = 0U; i < 32U; i++) {
+        if (!interp_st_be(ctx, fpu_va + i * 4U, 4U, ctx->f[i])) {
+            return false;
+        }
+    }
+    if (!interp_st_be(ctx, fpu_va + 128U, 4U, ctx->fsr)) {
+        return false;
+    }
+    if (!interp_st_be(ctx, fpu_va + 132U, 4U, 0U)) {
+        return false;
+    }
+    return true;
+}
+
+static void interp_apply_delivery_mask(sparc32_ctx_t *ctx, int signo,
+    uint32_t flags, uint64_t sa_mask)
+{
+    uint64_t cur = ctx->sig_mask | sparc32_l2a_blocked_mask();
+    uint64_t next = cur | sa_mask;
+    if ((flags & (SPARC32_SA_NODEFER | 0x40000000U)) == 0U &&
+        signo >= 1 && signo <= 64) {
+        uint64_t bit = 1ULL << (uint64_t)((uint32_t)(signo - 1) % 32U);
+        if ((uint32_t)signo <= 32U) {
+            bit <<= 32U;
+        }
+        next |= bit;
+    }
+    sparc32_l2a_set_blocked_mask(ctx, next);
 }
 
 /* C2-3 frame stack field (0x144, 12 B stack_t): the installed alternate
@@ -106,15 +136,19 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
     uint32_t handler;
     uint32_t restorer;
     uint32_t flags = 0U;
+    uint64_t sa_mask = 0ULL;
+    uint64_t old_mask;
     uint32_t addr;
     uint32_t frame;
+    uint32_t fpu_va;
     uint32_t code = 1U;
     size_t k;
     int i;
     if (ctx == NULL || (signo != 10 && signo != 11)) {
         return false;
     }
-    if (sparc32_signal_get_full(signo, &handler, &restorer, &flags) != 0) {
+    if (sparc32_signal_get_action(signo, &handler, &restorer, &flags,
+            &sa_mask) != 0) {
         return false;
     }
     addr = ctx->fault_addr;
@@ -130,11 +164,14 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
             }
         }
     }
-    frame = (interp_delivery_sp(ctx, flags) - SPARC32_RT_SIGFRAME_SIZE) &
-        ~15U;
-    if (!interp_range_ok(ctx, frame, SPARC32_RT_SIGFRAME_SIZE, 2U)) {
+    frame = (interp_delivery_sp(ctx, flags) -
+        (SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE)) & ~15U;
+    fpu_va = frame + SPARC32_RT_SIGFRAME_SIZE;
+    if (!interp_range_ok(ctx, frame,
+            SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE, 2U)) {
         return false;
     }
+    old_mask = ctx->sig_mask | sparc32_l2a_blocked_mask();
     for (i = 0; i < 8; i++) {
         uint32_t base = frame + (uint32_t)i * 4U;
         if (!interp_st_be(ctx, base, 4U, ctx->r[SPARC32_L0 + (uint32_t)i])) {
@@ -199,13 +236,16 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
             return false;
         }
     }
-    if (!interp_st_be(ctx, frame + 0x130U, 4U, 0U)) {
+    if (!interp_st_be(ctx, frame + 0x130U, 4U, (uint32_t)(old_mask >> 32U))) {
         return false;
     }
-    if (!interp_st_be(ctx, frame + 0x134U, 4U, 0U)) {
+    if (!interp_st_be(ctx, frame + 0x134U, 4U, (uint32_t)old_mask)) {
         return false;
     }
-    if (!interp_st_be(ctx, frame + 0x138U, 4U, 0U)) {
+    if (!interp_st_be(ctx, frame + 0x138U, 4U, fpu_va)) {
+        return false;
+    }
+    if (!interp_frame_fpu(ctx, fpu_va)) {
         return false;
     }
     if (!interp_st_be(ctx, frame + 0x13cU, 4U, SPARC32_RESTORER_MOV_G1)) {
@@ -217,6 +257,7 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
     if (!interp_frame_stack(ctx, frame)) {
         return false;
     }
+    interp_apply_delivery_mask(ctx, signo, flags, sa_mask);
     ctx->r[SPARC32_SP] = frame;
     ctx->r[SPARC32_O0] = (uint32_t)signo;
     ctx->r[SPARC32_O1] = frame + 0x60U;
@@ -230,24 +271,21 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
     return true;
 }
 
-/* ---- Phase 4 async delivery (lane L4a). The sync function above is
- * untouched (E05 byte-identical); this path duplicates its frame
- * construction with async si_code/si_addr. Host handlers only set the
+/* ---- Phase 4 async delivery (lane L4a). Host handlers only set the
  * pending bit (threads.c); delivery happens at safe points via
  * interp_poll_async (interp step / syscall boundary), consulting the
  * merged per-thread + process-global mask. */
 
-/* Process-global mask owned by src/os/syscalls.c (non-static there). */
-extern uint64_t sparc32_l2a_blocked_mask(void);
-
-/* Async frame build: same frozen 344 B layout as the sync path; only
- * si_code/si_addr differ (SI_USER(0)/0: sent, not faulted). */
+/* Async frame build: same frozen 344 B + 136 B FPU layout as the sync path;
+ * only si_code/si_addr differ (SI_USER(0)/0: sent, not faulted). */
 static bool interp_async_build(sparc32_ctx_t *ctx, int signo, uint32_t *frame)
 {
     uint32_t handler;
     uint32_t restorer;
     uint32_t flags = 0U;
+    uint64_t old_mask;
     uint32_t fr;
+    uint32_t fpu_va;
     int i;
     if (ctx == NULL || signo < 1 || signo > 64) {
         return false;
@@ -255,10 +293,14 @@ static bool interp_async_build(sparc32_ctx_t *ctx, int signo, uint32_t *frame)
     if (sparc32_signal_get_full(signo, &handler, &restorer, &flags) != 0) {
         return false;
     }
-    fr = (interp_delivery_sp(ctx, flags) - SPARC32_RT_SIGFRAME_SIZE) & ~15U;
-    if (!interp_range_ok(ctx, fr, SPARC32_RT_SIGFRAME_SIZE, 2U)) {
+    fr = (interp_delivery_sp(ctx, flags) -
+        (SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE)) & ~15U;
+    fpu_va = fr + SPARC32_RT_SIGFRAME_SIZE;
+    if (!interp_range_ok(ctx, fr,
+            SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE, 2U)) {
         return false;
     }
+    old_mask = ctx->sig_mask | sparc32_l2a_blocked_mask();
     for (i = 0; i < 8; i++) {
         uint32_t base = fr + (uint32_t)i * 4U;
         if (!interp_st_be(ctx, base, 4U, ctx->r[SPARC32_L0 + (uint32_t)i])) {
@@ -334,13 +376,16 @@ static bool interp_async_build(sparc32_ctx_t *ctx, int signo, uint32_t *frame)
             return false;
         }
     }
-    if (!interp_st_be(ctx, fr + 0x130U, 4U, 0U)) {
+    if (!interp_st_be(ctx, fr + 0x130U, 4U, (uint32_t)(old_mask >> 32U))) {
         return false;
     }
-    if (!interp_st_be(ctx, fr + 0x134U, 4U, 0U)) {
+    if (!interp_st_be(ctx, fr + 0x134U, 4U, (uint32_t)old_mask)) {
         return false;
     }
-    if (!interp_st_be(ctx, fr + 0x138U, 4U, 0U)) {
+    if (!interp_st_be(ctx, fr + 0x138U, 4U, fpu_va)) {
+        return false;
+    }
+    if (!interp_frame_fpu(ctx, fpu_va)) {
         return false;
     }
     if (!interp_st_be(ctx, fr + 0x13cU, 4U, SPARC32_RESTORER_MOV_G1)) {
@@ -360,12 +405,16 @@ static void interp_async_commit(sparc32_ctx_t *ctx, int signo, uint32_t frame)
 {
     uint32_t handler;
     uint32_t restorer;
+    uint32_t flags = 0U;
+    uint64_t sa_mask = 0ULL;
     uint64_t bit = 1ULL << (uint64_t)((uint32_t)(signo - 1) % 32U);
     if ((uint32_t)signo <= 32U) {
         bit <<= 32U;
     }
     ctx->pending_signals &= ~bit;
-    (void)sparc32_signal_get(signo, &handler, &restorer);
+    (void)sparc32_signal_get_action(signo, &handler, &restorer, &flags,
+        &sa_mask);
+    interp_apply_delivery_mask(ctx, signo, flags, sa_mask);
     ctx->r[SPARC32_SP] = frame;
     ctx->r[SPARC32_O0] = (uint32_t)signo;
     ctx->r[SPARC32_O1] = frame + 0x60U;
@@ -403,6 +452,8 @@ bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
     uint32_t frame;
     uint32_t handler;
     uint32_t restorer;
+    uint32_t flags = 0U;
+    uint64_t sa_mask = 0ULL;
     uint32_t resume;
     uint64_t bit = 1ULL << (uint64_t)((uint32_t)(signo - 1) % 32U);
     if ((uint32_t)signo <= 32U) {
@@ -438,7 +489,9 @@ bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
         }
     }
     ctx->pending_signals &= ~bit;
-    (void)sparc32_signal_get(signo, &handler, &restorer);
+    (void)sparc32_signal_get_action(signo, &handler, &restorer, &flags,
+        &sa_mask);
+    interp_apply_delivery_mask(ctx, signo, flags, sa_mask);
     ctx->r[SPARC32_SP] = frame;
     ctx->r[SPARC32_O0] = (uint32_t)signo;
     ctx->r[SPARC32_O1] = frame + 0x60U;
@@ -489,4 +542,70 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
         return interp_try_deliver_async(ctx, s);
     }
     return false;
+}
+
+/* Safe guest instruction-word fetch for fault classification: reads
+ * through the [G, G + 4 GiB) window only when [va, va + 4) is covered by
+ * a readable tracked region, and never touches exit state (unlike
+ * sparc32_fetch_decode, which would clobber the live fault record). */
+static bool sparc32_fault_insn_word(const sparc32_ctx_t *ctx, uint32_t va,
+    uint32_t *out)
+{
+    const uint8_t *p;
+    if (out == NULL || !interp_range_ok(ctx, va, 4U, 1U)) {
+        return false;
+    }
+    p = (const uint8_t *)sparc32_guest_ptr(ctx, va);
+    *out = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+    return true;
+}
+
+/*
+ * Fault -> signal classification (RC-U3-r2 #2, S32-11). Both engines report
+ * alignment violations as EXIT_FAULT with fault_addr = VA, but
+ * (fault_addr & 3) alone cannot see a 4-byte-aligned, 8-byte-misaligned
+ * LDD/STD: that fault MUST deliver SIGBUS (10, BUS_ADRALN), never
+ * SIGSEGV (11). Decode the faulting instruction (resolving one CTI
+ * delay slot, since a faulting delay reports pc at the transfer for
+ * JMPL but at the CTI for the other CTI classes) and report SIGBUS
+ * only when a doubleword access (LDD/STD/LDDA/STDA) faulted on
+ * (va & 7). FP LDDF/STDF are excluded on purpose: the interpreter
+ * faults those only as 4-byte halves, so their 4-mod-8 faults are
+ * mapping faults (SIGSEGV). Undecodable PCs keep the old heuristic.
+ */
+int sparc32_classify_fault(const sparc32_ctx_t *ctx)
+{
+    uint32_t va = ctx->fault_addr;
+    uint32_t pc = ctx->pc;
+    uint32_t word;
+    sparc32_decoded_t d;
+    unsigned depth;
+    if ((va & 3U) != 0U) {
+        return 10;
+    }
+    if ((va & 7U) == 0U) {
+        return 11;
+    }
+    for (depth = 0U; depth < 2U; depth++) {
+        if (!sparc32_fault_insn_word(ctx, pc, &word)) {
+            return 11;
+        }
+        sparc32_decode_word(word, &d);
+        if (d.cls == (uint32_t)SPARC32_OP_CALL ||
+            d.cls == (uint32_t)SPARC32_OP_BRANCH ||
+            d.cls == (uint32_t)SPARC32_OP_FBRANCH ||
+            d.cls == (uint32_t)SPARC32_OP_JMPL ||
+            d.cls == (uint32_t)SPARC32_OP_TRAP) {
+            pc += 4U;
+            continue;
+        }
+        if (d.op == 3U &&
+            (d.op3 == SPARC32_OP3_LDD || d.op3 == SPARC32_OP3_STD ||
+             d.op3 == SPARC32_OP3_LDDA || d.op3 == SPARC32_OP3_STDA)) {
+            return 10;
+        }
+        return 11;
+    }
+    return 11;
 }

@@ -46,26 +46,63 @@ static inline uint32_t get_be32(const uint8_t *p)
         ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
-/* Bounds check for [va, va+len): reject 32-bit wrap + low guard (L1c model). */
-static inline int l2a_range_ok(uint32_t va, uint64_t len)
+/* Validate that every guest page in [va, va + len) lies within
+ * [SPARC32_LOW_GUARD_SIZE, SPARC32_TASK_SIZE_TOP) and carries req_prot
+ * (1 = READ, 2 = WRITE, 4 = EXEC) in the published g_vm32_prot table. */
+static inline int l2a_range_ok_prot(uint32_t va, uint64_t len,
+    uint32_t req_prot)
 {
+    uint64_t end;
+    const uint8_t *prot;
+    uint32_t pg;
+    uint32_t end_pg;
     if (len == 0U) {
         return 0;
     }
-    if (len > 0x100000000ULL || (uint64_t)va + len > 0x100000000ULL) {
+    if (len > (uint64_t)SPARC32_TASK_SIZE_TOP) {
         return -EFAULT;
     }
-    return (va < SPARC32_LOW_GUARD_SIZE) ? -EFAULT : 0;
+    end = (uint64_t)va + len;
+    if (va < SPARC32_LOW_GUARD_SIZE || end > (uint64_t)SPARC32_TASK_SIZE_TOP) {
+        return -EFAULT;
+    }
+    prot = sparc32_vm_prot_base();
+    if (prot == NULL) {
+        return 0;
+    }
+    pg = va >> 12;
+    end_pg = (uint32_t)((end - 1ULL) >> 12);
+    for (;;) {
+        uint8_t p = __atomic_load_n(&prot[pg], __ATOMIC_ACQUIRE);
+        if (((uint32_t)p & req_prot) != req_prot) {
+            return -EFAULT;
+        }
+        if (pg == end_pg) {
+            break;
+        }
+        pg++;
+    }
+    return 0;
+}
+
+static inline int l2a_range_ok(uint32_t va, uint64_t len)
+{
+    return l2a_range_ok_prot(va, len, 1U);
 }
 
 static inline int l2a_store(sparc32_ctx_t *ctx, uint32_t va, const void *src,
     uint64_t len)
 {
-    if (l2a_range_ok(va, len) != 0) {
+    if (l2a_range_ok_prot(va, len, 2U) != 0) {
         return -EFAULT;
     }
     if (len != 0U) {
         memcpy(sparc32_guest_ptr(ctx, va), src, (size_t)len);
+        if (vm32_range_has_code(va, (size_t)len)) {
+            uint64_t end = (uint64_t)va + len;
+            vm_invalidate_jit(ctx, va,
+                (end > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)end);
+        }
     }
     return 0;
 }

@@ -81,14 +81,17 @@ static long l2a_copy_cstring(sparc32_ctx_t *ctx, uint32_t va, char *out,
     uint32_t cap)
 {
     uint32_t i;
-    if (cap == 0U || l2a_range_ok(va, 1U) != 0) {
+    if (cap == 0U || l2a_range_ok_prot(va, 1U, 1U) != 0) {
         return (cap == 0U) ? -ENAMETOOLONG : -EFAULT;
     }
     for (i = 0U; i < cap; i++) {
         uint32_t a = va + i;
         const uint8_t *p;
-        if (a < va || a < SPARC32_LOW_GUARD_SIZE) {
-            return (a < va) ? -ENAMETOOLONG : -EFAULT;
+        if (a < va) {
+            return -ENAMETOOLONG;
+        }
+        if (l2a_range_ok_prot(a, 1U, 1U) != 0) {
+            return -EFAULT;
         }
         p = (const uint8_t *)sparc32_guest_ptr(ctx, a);
         out[i] = (char)*p;
@@ -379,32 +382,37 @@ static long sys_rwvec(sparc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
 {
     uint64_t total = 0ULL;
     uint32_t i = 0U;
+    uint32_t buf_prot = is_write ? 1U : 2U;
     if (iovcnt > L2A_IOV_MAX) {
         return -EINVAL;
     }
     if (iovcnt == 0U) {
         return 0;
     }
-    if (l2a_range_ok(iov_va, (uint64_t)iovcnt * 8U) != 0) {
+    if (l2a_range_ok_prot(iov_va, (uint64_t)iovcnt * 8U, 1U) != 0) {
         return -EFAULT;
     }
     while (i < iovcnt) {
         struct iovec host[L2A_IOV_BATCH];
+        uint32_t gbase[L2A_IOV_BATCH];
+        uint32_t glen[L2A_IOV_BATCH];
         uint64_t want = 0ULL;
         uint32_t n = 0U;
         uint32_t j;
         ssize_t rc;
         for (j = 0U; j < L2A_IOV_BATCH && i + j < iovcnt; j++) {
             const uint8_t *e = (const uint8_t *)sparc32_guest_ptr(ctx,
-                iov_va + (uint64_t)(i + j) * 8U);
+                iov_va + (uint32_t)((i + j) * 8U));
             uint32_t base = get_be32(e);
             uint32_t len = get_be32(e + 4);
-            if (l2a_range_ok(base, len) != 0) {
+            if (l2a_range_ok_prot(base, len, buf_prot) != 0) {
                 return (total != 0ULL) ? (long)total : -EFAULT;
             }
             if (len == 0U) {
                 continue;
             }
+            gbase[n] = base;
+            glen[n] = len;
             host[n].iov_base = sparc32_guest_ptr(ctx, base);
             host[n].iov_len = (size_t)len;
             n++; want += (uint64_t)len;
@@ -417,6 +425,13 @@ static long sys_rwvec(sparc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
                       : readv((int)fd, host, (int)n);
         if (rc < 0) {
             return (total != 0ULL) ? (long)total : -(long)errno;
+        }
+        if (!is_write && rc > 0) {
+            for (j = 0U; j < n; j++) {
+                if (vm32_range_has_code(gbase[j], glen[j])) {
+                    vm_invalidate_jit(ctx, gbase[j], gbase[j] + glen[j]);
+                }
+            }
         }
         total += (uint64_t)rc;
         i += L2A_IOV_BATCH;

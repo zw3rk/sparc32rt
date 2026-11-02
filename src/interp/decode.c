@@ -344,7 +344,7 @@ void sparc32_decode_word(uint32_t word, sparc32_decoded_t *out)
     if (op == 0x1U) {
         /* Format 1 CALL: 30-bit word displacement, delay slot executes. */
         out->cls = SPARC32_OP_CALL;
-        out->disp = sign_extend(word & 0x3FFFFFFFU, 30U) << 2;
+        out->disp = (int32_t)((uint32_t)sign_extend(word & 0x3FFFFFFFU, 30U) << 2);
         return;
     }
     if (op == 0x0U) {
@@ -361,7 +361,7 @@ void sparc32_decode_word(uint32_t word, sparc32_decoded_t *out)
             out->cls = (op2 == 0x2U) ? SPARC32_OP_BRANCH : SPARC32_OP_FBRANCH;
             out->annul = (word >> 29) & 0x1U;
             out->cond = (word >> 25) & 0x0FU;
-            out->disp = sign_extend(disp22, 22U) << 2;
+            out->disp = (int32_t)((uint32_t)sign_extend(disp22, 22U) << 2);
             return;
         }
         /* op2 == 0 is UNIMP (const22 trap operand); 1/3/5/7 are V9-only

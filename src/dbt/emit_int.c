@@ -50,30 +50,7 @@
 
 static void e_trap_priv(a64_buf_t *b, uint32_t pc);
 
-/* icc <-> NZCV translation lives in src/dbt/emit_cc.c (split for the
- * 900-line discipline): commit/seed/cond-setup plus the P13-4 live-NZCV
- * condition resolver (sparc32_emit_live_cond) and the stored-icc table
- * (sparc32_emit_icc_cond). commit_flags uses only non-flag-setting
- * MOV/CSET/ORR/LSL/BIC/STR, so live NZCV survives it. */
-
-/* Pick the AArch64 branch condition for a Bicc: live host NZCV from a
- * preceding cc setter needs no setup, otherwise rebuild from icc. */
-static unsigned e_branch_cond(a64_buf_t *b, uint32_t cond)
-{
-    unsigned ac;
-    if (sparc32_emit_live_cond(b, cond, &ac) != 0) {
-        return ac;
-    }
-    sparc32_emit_cond_setup(b, cond);
-    return sparc32_emit_icc_cond(cond);
-}
-
 /* ---- tiny emit utilities ---------------------------------------------- */
-
-static uint32_t e_reg_off(uint32_t r)
-{
-    return (r & 31u) * 4u;
-}
 
 static void e_ldgreg(a64_buf_t *b, unsigned wd, uint32_t rs)
 {
@@ -162,83 +139,6 @@ static void e_call_invoke_faultable(sparc32_emit_ctx_t *ec)
 static void e_arg_ctx(a64_buf_t *b)
 {
     a64_emit_add_uxtw_x(b, 0u, A64_XCTX, A64_ZR);
-}
-
-int sparc32_emit_exit_singlestep(sparc32_emit_ctx_t *ec, uint32_t pc)
-{
-    a64_buf_t *b;
-
-    if (ec == NULL || ec->buf == NULL) {
-        return -1;
-    }
-    b = ec->buf;
-    a64_emit_mov_pc32(b, ES0, pc);
-    a64_emit_movz_w(b, ES1, (uint16_t)SPARC32_EXIT_SINGLE_STEP, 0u);
-    a64_emit_ret(b);
-    return b->overflow ? -1 : 0;
-}
-
-/* ---- delay slots (E02) ------------------------------------------------
- * The delay instruction executes unless annulled away; its faults preempt
- * the transfer (interp_cti). A CTI or TRAP in the delay slot cannot be
- * inlined (the outer transfer is cancelled / UNDEF per interp_single), so
- * the whole CTI falls back to SINGLE_STEP and interp_step replays it.
- * FPU/FBfcc/ILLEGAL delays become EXIT_UNDEF at the delay address, exactly
- * like interp_single. ec->fault_pc must already hold the CTI address so a
- * faulting delay reports the CTI as the fault site. */
-
-static int e_emit_one(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d);
-
-static int e_emit_delay(sparc32_emit_ctx_t *ec, uint32_t npc)
-{
-    const sparc32_decoded_t *d = ec->delay;
-    uint32_t saved_pc = ec->pc;
-    int rc;
-
-    if (d == NULL) {
-        return sparc32_emit_exit_singlestep(ec, ec->fault_pc);
-    }
-    switch (d->cls) {
-    case SPARC32_OP_CALL:
-    case SPARC32_OP_BRANCH:
-    case SPARC32_OP_JMPL:
-    case SPARC32_OP_TRAP:
-        /* CTI (or trap) in the delay slot: pristine SINGLE_STEP so the
-         * dispatcher replays the outer CTI with interp_step. */
-        return sparc32_emit_exit_singlestep(ec, ec->fault_pc);
-    case SPARC32_OP_FPU:
-        ec->pc = npc;
-        rc = sparc32_emit_fpu(ec, d);
-        ec->pc = saved_pc;
-        sparc32_emit_fp_flush(ec->buf);
-        return rc;
-    case SPARC32_OP_FPMEM:
-        ec->pc = npc;
-        rc = sparc32_emit_fpmem(ec, d);
-        ec->pc = saved_pc;
-        sparc32_emit_fp_flush(ec->buf);
-        return rc;
-    case SPARC32_OP_FBRANCH:
-    case SPARC32_OP_ILLEGAL:
-        a64_emit_exit_undef(ec->buf, npc);
-        return ec->buf->overflow ? -1 : 0;
-    default:
-        break;
-    }
-    ec->pc = npc;
-    rc = e_emit_one(ec, d);
-    ec->pc = saved_pc;
-    return rc;
-}
-
-/* True when the delay slot must run on this path (E02 annul rules). */
-static int e_delay_runs(uint32_t cls, uint32_t cond, int taken, int annul)
-{
-    (void)cls;
-    if (taken != 0) {
-        return (cond == 0x8u && annul != 0) ? 0 : 1;
-    }
-    return annul != 0 ? 0 : 1;
 }
 
 /* ---- per-class emitters ------------------------------------------------ */
@@ -443,221 +343,6 @@ int sparc32_emit_wrasr(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     return b->overflow ? -1 : 0;
 }
 
-/* Page-final rule: a CTI at (pc & 0xfff) == 0xffc leaves the fragment via
- * SINGLE_STEP carrying the post-CTI PC, exactly like interp_cti's
- * EXIT_SINGLE_STEP (the dispatcher replays the transfer). The delay slot
- * is emitted inline first so its effects and faults precede the exit. */
-static int e_page_final(sparc32_emit_ctx_t *ec, uint32_t npc,
-    uint32_t post_pc)
-{
-    int rc = e_emit_delay(ec, npc);
-
-    if (rc != 0) {
-        return rc;
-    }
-    return sparc32_emit_exit_singlestep(ec, post_pc);
-}
-
-int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
-{
-    a64_buf_t *b = ec->buf;
-    uint32_t pc = ec->pc;
-    uint32_t npc = pc + 4u;
-    uint32_t target = pc + (uint32_t)d->disp;
-    uint32_t cond = d->cond;
-    int annul = d->annul != 0u;
-    int page_final = ((pc & 0xFFFu) == 0xFFCu);
-    size_t p_taken;
-    size_t p_end;
-    int rc;
-
-    ec->fault_pc = pc;
-    if (cond == 0x0u) { /* BN: never branches; falls through past delay. */
-        if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
-            if (page_final) {
-                return e_page_final(ec, npc, npc + 4u);
-            }
-            if (e_emit_delay(ec, npc) != 0) {
-                return -1;
-            }
-        }
-        a64_emit_exit_branch(b, npc + 4u);
-        return b->overflow ? -1 : 0;
-    }
-    if (cond == 0x8u) { /* BA: always branches. */
-        if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
-            if (page_final) {
-                return e_page_final(ec, npc, target);
-            }
-            rc = e_emit_delay(ec, npc);
-            if (rc != 0) {
-                return rc;
-            }
-        }
-        a64_emit_exit_branch(b, target);
-        return b->overflow ? -1 : 0;
-    }
-    if (page_final) {
-        /* Runtime condition at the page end, mirroring interp_cti: the
-         * delay runs unless annulled away, and SINGLE_STEP fires only
-         * when the delay ran (interp_cti's tail). An annulled not-taken
-         * path completes the transfer inline with a plain BRANCH exit
-         * (NONE after commit), never SINGLE_STEP. */
-        p_taken = a64_emit_b_cond_placeholder(b, e_branch_cond(b, cond));
-        b->gpr_cache_valid = 0; b->fpr_valid = 0;
-        if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
-            rc = e_emit_delay(ec, npc);
-            if (rc != 0) {
-                return rc;
-            }
-            rc = sparc32_emit_exit_singlestep(ec, npc + 4u);
-        } else {
-            a64_emit_exit_branch(b, npc + 4u);
-            rc = b->overflow ? -1 : 0;
-        }
-        if (rc != 0) {
-            return rc;
-        }
-        a64_patch_b_cond(b, p_taken, b->count);
-        b->gpr_cache_valid = 0; b->fpr_valid = 0;
-        if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
-            rc = e_emit_delay(ec, npc);
-            if (rc != 0) {
-                return rc;
-            }
-        }
-        return sparc32_emit_exit_singlestep(ec, target);
-    }
-    p_taken = a64_emit_b_cond_placeholder(b, e_branch_cond(b, cond));
-    b->gpr_cache_valid = 0; b->fpr_valid = 0;
-    if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
-        rc = e_emit_delay(ec, npc);
-        if (rc != 0) {
-            return rc;
-        }
-    }
-    p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    a64_patch_b_cond(b, p_taken, b->count);
-    b->gpr_cache_valid = 0; b->fpr_valid = 0;
-    if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
-        rc = e_emit_delay(ec, npc);
-        if (rc != 0) {
-            return rc;
-        }
-    }
-    a64_emit_exit_branch(b, target);
-    if (b->overflow) {
-        return -1;
-    }
-    a64_patch_b_cond(b, p_end, b->count);
-    /* Not-taken fallthrough needs its own exit: without it the B.AL above
-     * lands one word past the fragment (host SIGILL in the arena tail). */
-    a64_emit_exit_branch(b, npc + 4u);
-    return b->overflow ? -1 : 0;
-}
-
-int sparc32_emit_call(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
-{
-    a64_buf_t *b = ec->buf;
-    uint32_t pc = ec->pc;
-    uint32_t npc = pc + 4u;
-    uint32_t target = pc + (uint32_t)d->disp;
-    int rc;
-
-    ec->fault_pc = pc;
-    if ((pc & 0xFFFu) == 0xFFCu) {
-        a64_emit_mov_pc32(b, ES0, pc);
-        a64_emit_str_imm_w(b, ES0, A64_XCTX, e_reg_off(SPARC32_O7));
-        b->is_call = true;
-        return e_page_final(ec, npc, target);
-    }
-    /* Pristine-fallback check first: %o7 must still hold the old value
-     * when the dispatcher replays via interp_step. */
-    if (ec->delay == NULL || ec->delay->cls == (uint32_t)SPARC32_OP_CALL ||
-        ec->delay->cls == (uint32_t)SPARC32_OP_BRANCH ||
-        ec->delay->cls == (uint32_t)SPARC32_OP_JMPL ||
-        ec->delay->cls == (uint32_t)SPARC32_OP_TRAP) {
-        return sparc32_emit_exit_singlestep(ec, pc);
-    }
-    a64_emit_mov_pc32(b, ES0, pc);
-    a64_emit_str_imm_w(b, ES0, A64_XCTX, e_reg_off(SPARC32_O7));
-    /* The call target runs arbitrary code at runtime and clobbers host
-     * NZCV, so no earlier cc result stays live past this point. */
-    b->nzcv_valid = 0;
-    b->is_call = true;
-    rc = e_emit_delay(ec, npc);
-    if (rc != 0) {
-        return rc;
-    }
-    a64_emit_exit_branch(b, target);
-    return b->overflow ? -1 : 0;
-}
-
-/* Delays that cannot stop (SETHI/SHIFT/FLUSH/STBAR, ALU op3<0x0E) skip
- * the record; SAVE/RESTORE keep it (spill/fill can fault). */
-static int e_delay_needs_jmpl_record(const sparc32_decoded_t *dl)
-{
-    if (dl == NULL) {
-        return 1;
-    }
-    switch (dl->cls) {
-    case SPARC32_OP_SETHI:
-    case SPARC32_OP_SHIFT:
-    case SPARC32_OP_FLUSH:
-    case SPARC32_OP_STBAR:
-        return 0;
-    case SPARC32_OP_ALU:
-        return ((dl->op3 & 0x3Fu) < 0x0Eu) ? 0 : 1;
-    default:
-        break;
-    }
-    return 1;
-}
-
-int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
-{
-    a64_buf_t *b = ec->buf;
-    uint32_t pc = ec->pc;
-    uint32_t npc = pc + 4u;
-    int rc;
-
-    ec->fault_pc = pc;
-    if ((pc & 0xFFFu) == 0xFFCu) {
-        /* The resume target is a runtime value, so nothing may be
-         * committed: pristine SINGLE_STEP and the dispatcher replays the
-         * whole JMPL (link write, delay, transfer) via interp_step. */
-        return sparc32_emit_exit_singlestep(ec, pc);
-    }
-    if (ec->delay == NULL || ec->delay->cls == (uint32_t)SPARC32_OP_CALL ||
-        ec->delay->cls == (uint32_t)SPARC32_OP_BRANCH ||
-        ec->delay->cls == (uint32_t)SPARC32_OP_JMPL ||
-        ec->delay->cls == (uint32_t)SPARC32_OP_TRAP) {
-        return sparc32_emit_exit_singlestep(ec, pc);
-    }
-    /* Target into keeper w22; inline STRs record it (no BLR, cache live). */
-    e_ea_into(b, EKEEP, d);
-    if (e_delay_needs_jmpl_record(ec->delay) != 0) {
-        a64_jmpl_record(b, EKEEP, ES2, ES0);
-    }
-    if (d->rd == SPARC32_O7) {
-        b->is_call = true;
-    }
-    /* Delay-slot stops report the delay address; commit resolves npc
-     * from the recorded target. The link write stays deferred past the
-     * slot so a faulting delay leaves rd pristine (interp parity). */
-    ec->fault_pc = npc;
-    rc = e_emit_delay(ec, npc);
-    if (rc != 0) {
-        return rc;
-    }
-    if (d->rd != 0u) {
-        a64_emit_mov_pc32(b, ES0, pc);
-        e_stgreg(b, d->rd, ES0);
-    }
-    a64_emit_exit_branch_reg(b, EKEEP);
-    return b->overflow ? -1 : 0;
-}
-
 int sparc32_emit_trap(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
     a64_buf_t *b = ec->buf;
@@ -764,6 +449,22 @@ static int e_emit_memcall(sparc32_emit_ctx_t *ec,
     }
     e_call_prologue(b, helper);
     e_call_invoke_faultable(ec);
+    if (is_window == 0 && ec->delay == NULL &&
+        (d->cls == (uint32_t)SPARC32_OP_STORE ||
+         d->cls == (uint32_t)SPARC32_OP_SWAP ||
+         d->cls == (uint32_t)SPARC32_OP_CASA ||
+         (d->op3 & 0x0Fu) == 0x0Du)) {
+        size_t p_ok;
+        /* ldar w21, [x28]; ldr x22, [x27, #0]; eor x21, x21, x22, lsr #32 */
+        a64_emit(b, 0x88DFFC00u | (28u << 5) | 21u);
+        a64_emit(b, 0xF9400376u);
+        a64_emit(b, 0xCA5682B5u);
+        p_ok = a64_emit_cbz_w_placeholder(b, false, 21u);
+        a64_emit_movz_w(b, ES1, (uint16_t)SPARC32_EXIT_BRANCH, 0u);
+        a64_emit_mov_pc32(b, ES0, ec->pc + 4u);
+        a64_emit_ret(b);
+        a64_patch_cbz_w(b, p_ok, b->count);
+    }
     return b->overflow ? -1 : 0;
 }
 
@@ -835,7 +536,7 @@ int sparc32_emit_fallback(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     return ec->buf->overflow ? -1 : 0;
 }
 
-static int e_emit_one(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
+int sparc32_emit_one(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
     switch (d->cls) {
     case SPARC32_OP_SETHI:   return sparc32_emit_sethi(ec, d);
@@ -873,7 +574,7 @@ int sparc32_emit_insn(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         return -1;
     }
     ec->fault_pc = ec->pc;
-    rc = e_emit_one(ec, d);
+    rc = sparc32_emit_one(ec, d);
     if (rc != 0 || ec->buf->overflow) {
         return -1;
     }

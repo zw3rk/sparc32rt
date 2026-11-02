@@ -35,18 +35,31 @@ long sparc32_l2a_futex_emu32(sparc32_ctx_t *ctx, uint32_t uaddr,
 
 static uint32_t l2a_blocked[2] = { 0U, 0U };
 
+/* Unblockable signals on SPARC Linux: SIGKILL (9 -> bit 8) and
+ * SIGSTOP (17 -> bit 16) in the high 32-bit word (signals 1..32). */
+#define SP_UNBLOCKABLE_HI ((1U << 8) | (1U << 16))
+
 uint64_t sparc32_l2a_blocked_mask(void)
 {
     return ((uint64_t)l2a_blocked[0] << 32) | (uint64_t)l2a_blocked[1];
 }
 
+void sparc32_l2a_set_blocked_mask(sparc32_ctx_t *ctx, uint64_t mask)
+{
+    uint32_t hi = (uint32_t)(mask >> 32U) & ~SP_UNBLOCKABLE_HI;
+    uint32_t lo = (uint32_t)mask;
+    l2a_blocked[0] = hi;
+    l2a_blocked[1] = lo;
+    if (ctx != NULL) {
+        ctx->sig_mask = ((uint64_t)hi << 32U) | (uint64_t)lo;
+    }
+}
+
 static int l2a_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
 {
-    if (l2a_range_ok(va, 4U) != 0) {
-        return -EFAULT;
-    }
-    put_be32((uint8_t *)sparc32_guest_ptr(ctx, va), v);
-    return 0;
+    uint8_t b[4];
+    put_be32(b, v);
+    return l2a_store(ctx, va, b, sizeof(b));
 }
 
 #define SP_CLOCK_REALTIME 0U
@@ -68,7 +81,7 @@ long sparc32_l2a_gettimeofday(sparc32_ctx_t *ctx, uint32_t tv_va,
     if (tv_va == 0U) {
         return 0;
     }
-    if (l2a_range_ok(tv_va, sizeof(b)) != 0) {
+    if (l2a_range_ok_prot(tv_va, sizeof(b), 2U) != 0) {
         return -EFAULT;
     }
     if (gettimeofday(&tv, NULL) != 0) {
@@ -175,7 +188,7 @@ long sparc32_l2a_clock_gettime(sparc32_ctx_t *ctx, uint32_t clk_id,
     case SP_CLOCK_MONOTONIC: host_clk = CLOCK_MONOTONIC; break;
     default: return -EINVAL;
     }
-    if (l2a_range_ok(tp_va, sizeof(b)) != 0) {
+    if (l2a_range_ok_prot(tp_va, sizeof(b), 2U) != 0) {
         return -EFAULT;
     }
     if (clock_gettime(host_clk, &ts) != 0) {
@@ -202,7 +215,7 @@ long sparc32_l2a_clock_gettime64(sparc32_ctx_t *ctx, uint32_t clk_id,
     case SP_CLOCK_MONOTONIC: host_clk = CLOCK_MONOTONIC; break;
     default: return -EINVAL;
     }
-    if (l2a_range_ok(tp_va, sizeof(b)) != 0) {
+    if (l2a_range_ok_prot(tp_va, sizeof(b), 2U) != 0) {
         return -EFAULT;
     }
     if (clock_gettime(host_clk, &ts) != 0) {
@@ -225,7 +238,7 @@ long sparc32_l2a_getrandom(sparc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
         0U) {
         return -EINVAL;
     }
-    if (l2a_range_ok(buf_va, len) != 0) {
+    if (l2a_range_ok_prot(buf_va, len, 2U) != 0) {
         return -EFAULT;
     }
     if (len == 0U) {
@@ -236,6 +249,9 @@ long sparc32_l2a_getrandom(sparc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
      * hook returns -errno on failure, bytes filled on success. */
     rc = rt_host_getrandom(sparc32_guest_ptr(ctx, buf_va), (size_t)len,
         (unsigned int)flags);
+    if (rc > 0 && vm32_range_has_code(buf_va, (size_t)rc)) {
+        vm_invalidate_jit(ctx, buf_va, buf_va + (uint32_t)rc);
+    }
     return (long)rc;
 }
 
@@ -289,28 +305,34 @@ long sparc32_l2a_rt_sigprocmask(sparc32_ctx_t *ctx, uint32_t how,
     uint32_t set_va, uint32_t oset_va, uint32_t sigsetsize)
 {
     uint8_t old[8];
+    uint64_t cur;
     if (sigsetsize != 8U) {
         return -EINVAL;
     }
-    put_be32(old, l2a_blocked[0]);
-    put_be32(old + 4, l2a_blocked[1]);
+    if (oset_va != 0U && l2a_range_ok_prot(oset_va, sizeof(old), 2U) != 0) {
+        return -EFAULT;
+    }
+    cur = sparc32_l2a_blocked_mask();
+    if (ctx != NULL) {
+        cur |= ctx->sig_mask;
+    }
+    put_be32(old, (uint32_t)(cur >> 32U));
+    put_be32(old + 4, (uint32_t)cur);
     if (set_va != 0U) {
         const uint8_t *p;
-        uint32_t n0;
-        uint32_t n1;
+        uint64_t n;
         if (l2a_range_ok(set_va, 8U) != 0) {
             return -EFAULT;
         }
         p = (const uint8_t *)sparc32_guest_ptr(ctx, set_va);
-        n0 = get_be32(p);
-        n1 = get_be32(p + 4);
+        n = ((uint64_t)get_be32(p) << 32U) | (uint64_t)get_be32(p + 4);
         switch (how) {
-        case SPARC_SIG_BLOCK: l2a_blocked[0] |= n0; l2a_blocked[1] |= n1; break;
-        case SPARC_SIG_UNBLOCK:
-            l2a_blocked[0] &= ~n0; l2a_blocked[1] &= ~n1; break;
-        case SPARC_SIG_SETMASK: l2a_blocked[0] = n0; l2a_blocked[1] = n1; break;
+        case SPARC_SIG_BLOCK: cur |= n; break;
+        case SPARC_SIG_UNBLOCK: cur &= ~n; break;
+        case SPARC_SIG_SETMASK: cur = n; break;
         default: return -EINVAL;
         }
+        sparc32_l2a_set_blocked_mask(ctx, cur);
     } else if (how != SPARC_SIG_BLOCK && how != SPARC_SIG_UNBLOCK &&
         how != SPARC_SIG_SETMASK) {
         return -EINVAL;
@@ -323,7 +345,7 @@ long sparc32_l2a_ioctl(sparc32_ctx_t *ctx, uint32_t fd, uint32_t request,
 {
     if (request == SP_FIONREAD) {
         int n = 0;
-        if (l2a_range_ok(arg_va, 4U) != 0) {
+        if (l2a_range_ok_prot(arg_va, 4U, 2U) != 0) {
             return -EFAULT;
         }
         if (ioctl((int)fd, FIONREAD, &n) != 0) {

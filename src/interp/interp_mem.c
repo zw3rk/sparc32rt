@@ -14,8 +14,6 @@ G-window loads/stores with region coverage checks, shared by the
 
 #include <string.h>
 
-sparc32_ldstub_lock_t g_sparc32_ldstub_lock;
-
 void interp_wreg(sparc32_ctx_t *ctx, uint32_t rd, uint32_t v)
 {
     if (rd != 0U) {
@@ -67,9 +65,8 @@ bool interp_range_ok(const sparc32_ctx_t *ctx, uint32_t va,
 /* SPARC alignment: word accesses need 4-alignment, halfwords 2-alignment;
  * the oracle raises SIGBUS otherwise (L1d misaligned word load traps).
  * Single bytes never fault. Window spill/fill (64 B of words) needs only
- * word alignment. (Residual RC1 gap: 8-byte LDD/STD at 4-but-unaligned-8
- * emulates instead of faulting; no RC1 test covers it — Phase 3 owns
- * doubleword alignment with the FPU.) */
+ * word alignment; integer LDD/STD/LDDA/STDA enforce 8-byte alignment
+ * directly in interp.c / emit_int.c before calling these word helpers. */
 static bool interp_aligned(uint32_t va, uint32_t len)
 {
     uint32_t need = (len <= 1U) ? 1U : ((len == 2U) ? 2U : 4U);
@@ -90,6 +87,7 @@ bool interp_mem_rd(sparc32_ctx_t *ctx, uint32_t va, void *dst,
         return false;
     }
     memcpy(dst, sparc32_guest_ptr(ctx, va), (size_t)len);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
     return true;
 }
 
@@ -106,13 +104,11 @@ bool interp_mem_wr(sparc32_ctx_t *ctx, uint32_t va, const void *src,
         ctx->fault_addr = va;
         return false;
     }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     memcpy(sparc32_guest_ptr(ctx, va), src, (size_t)len);
-    if (__atomic_load_n(&g_sparc32_ldstub_lock.va, __ATOMIC_RELAXED) == va &&
-        __atomic_load_n(&g_sparc32_ldstub_lock.owner, __ATOMIC_RELAXED) ==
-            (uintptr_t)ctx) {
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-        __atomic_store_n(&g_sparc32_ldstub_lock.va, 0U, __ATOMIC_RELEASE);
-        __atomic_store_n(&g_sparc32_ldstub_lock.owner, 0U, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (vm32_range_has_code(va, (size_t)len)) {
+        vm_invalidate_jit(ctx, va, va + len);
     }
     return true;
 }

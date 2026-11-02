@@ -43,6 +43,7 @@
 #include "sparc32rt.h"
 #include "interp/interp.h"
 #include "interp/interp_priv.h"
+#include "os/l2a_access.h"
 #include "os/syscall_nr.h"
 #include "os/threads.h"
 #include "rt32/rt32.h"
@@ -164,23 +165,10 @@ static long ret_guest_u32(uint32_t v)
     return (long)(int32_t)v;
 }
 
-/* Bounds check for a [va, va + len) guest range: rejects 32-bit wrap
- * and the low guard page. Returns 0 when addressable, -EFAULT when not.
- * The whole 4 GiB window is reserved PROT_NONE with mapped regions
- * inside (src/rt32/vm.c), so anything passing this check is safe to
- * touch through sparc32_guest_ptr for the Phase-1 subset. */
-static int guest_range_ok(uint32_t va, uint32_t len)
+/* Bounds + permission check for a [va, va + len) guest range. */
+static int guest_range_ok_prot(uint32_t va, uint32_t len, uint32_t req_prot)
 {
-    if (len == 0U) {
-        return 0;
-    }
-    if ((uint64_t)va + (uint64_t)len > 0x100000000ULL) {
-        return -EFAULT;
-    }
-    if (va < SPARC32_LOW_GUARD_SIZE) {
-        return -EFAULT;
-    }
-    return 0;
+    return l2a_range_ok_prot(va, len, req_prot);
 }
 
 /* Big-endian guest word access (guest is BE, host may be LE). */
@@ -189,7 +177,7 @@ static int sys_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v);
 static int sys_ld_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t *out)
 {
     const uint8_t *p;
-    if (guest_range_ok(va, 4U) != 0) {
+    if (guest_range_ok_prot(va, 4U, 1U) != 0) {
         return -EFAULT;
     }
     p = (const uint8_t *)sparc32_guest_ptr(ctx, va);
@@ -215,15 +203,20 @@ long sparc32_sys_rt_sigreturn(sparc32_ctx_t *ctx);
 
 static long sys_read(sparc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t count)
 {
-    if (guest_range_ok(buf_va, count) != 0) {
+    ssize_t n;
+    if (guest_range_ok_prot(buf_va, count, 2U) != 0) {
         return -EFAULT;
     }
-    return host_ret(read((int)fd, sparc32_guest_ptr(ctx, buf_va), (size_t)count));
+    n = read((int)fd, sparc32_guest_ptr(ctx, buf_va), (size_t)count);
+    if (n > 0 && vm32_range_has_code(buf_va, (size_t)n)) {
+        vm_invalidate_jit(ctx, buf_va, buf_va + (uint32_t)n);
+    }
+    return host_ret(n);
 }
 
 static long sys_write(sparc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t count)
 {
-    if (guest_range_ok(buf_va, count) != 0) {
+    if (guest_range_ok_prot(buf_va, count, 1U) != 0) {
         return -EFAULT;
     }
     return host_ret(write((int)fd, sparc32_guest_ptr(ctx, buf_va), (size_t)count));
@@ -299,41 +292,29 @@ static long sys_uname(sparc32_ctx_t *ctx, uint32_t buf_va)
     static const char *const uts_fields[SPARC32_UTS_FIELDS] = {
         "Linux", "sparc32rt", "6.1.0", "#1 SMP sparc32rt", "sparc", "(none)",
     };
-    uint8_t *buf;
+    uint8_t buf[SPARC32_UTS_TOTAL];
     size_t i;
     size_t j;
 
-    if (buf_va > UINT32_MAX - (SPARC32_UTS_TOTAL - 1U)) {
+    if (guest_range_ok_prot(buf_va, SPARC32_UTS_TOTAL, 2U) != 0) {
         return -EFAULT;
     }
-    if (buf_va < SPARC32_LOW_GUARD_SIZE) {
-        return -EFAULT;
-    }
-    buf = (uint8_t *)sparc32_guest_ptr(ctx, buf_va);
+    memset(buf, 0, sizeof(buf));
     for (i = 0U; i < SPARC32_UTS_FIELDS; i++) {
-        uint8_t *field = buf + (size_t)i * SPARC32_UTS_FIELD;
-
-        memset(field, 0, SPARC32_UTS_FIELD);
+        uint8_t *field = buf + i * SPARC32_UTS_FIELD;
         for (j = 0U; uts_fields[i][j] != '\0' && j < SPARC32_UTS_FIELD - 1U; j++) {
             field[j] = (uint8_t)uts_fields[i][j];
         }
     }
-    return 0;
+    return (long)l2a_store(ctx, buf_va, buf, sizeof(buf));
 }
 
 /* Big-endian guest word stores (guest is BE, host may be LE). */
 static int sys_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
 {
-    uint8_t *p;
-    if (guest_range_ok(va, 4U) != 0) {
-        return -EFAULT;
-    }
-    p = (uint8_t *)sparc32_guest_ptr(ctx, va);
-    p[0] = (uint8_t)(v >> 24);
-    p[1] = (uint8_t)(v >> 16);
-    p[2] = (uint8_t)(v >> 8);
-    p[3] = (uint8_t)v;
-    return 0;
+    uint8_t b[4];
+    put_be32(b, v);
+    return l2a_store(ctx, va, b, sizeof(b));
 }
 
 #if defined(__linux__)
@@ -384,7 +365,7 @@ static uint32_t rlim32_sat(uint64_t v)
 static long sys_getrlimit(sparc32_ctx_t *ctx, uint32_t res, uint32_t buf_va)
 {
     struct rlimit h;
-    if (guest_range_ok(buf_va, 8U) != 0) {
+    if (guest_range_ok_prot(buf_va, 8U, 2U) != 0) {
         return -EFAULT;
     }
     if (getrlimit((int)res, &h) != 0) {
@@ -410,7 +391,7 @@ static long sys_prlimit64(sparc32_ctx_t *ctx, uint32_t pid, uint32_t res,
     uint64_t cur;
     uint64_t max;
     if (new_va != 0U) {
-        if (guest_range_ok(new_va, 16U) != 0) {
+        if (guest_range_ok_prot(new_va, 16U, 1U) != 0) {
             return -EFAULT;
         }
         if (sys_ld_be64(ctx, new_va, &cur) != 0) {
@@ -424,7 +405,7 @@ static long sys_prlimit64(sparc32_ctx_t *ctx, uint32_t pid, uint32_t res,
         newp = &newh;
     }
     if (old_va != 0U) {
-        if (guest_range_ok(old_va, 16U) != 0) {
+        if (guest_range_ok_prot(old_va, 16U, 2U) != 0) {
             return -EFAULT;
         }
         oldp = &oldh;
@@ -473,8 +454,8 @@ static long sys_get_robust_list(sparc32_ctx_t *ctx, uint32_t pid,
     if (pid != 0U) {
         return -ESRCH;
     }
-    if (guest_range_ok(head_ptr_va, 4U) != 0 ||
-        guest_range_ok(len_ptr_va, 4U) != 0) {
+    if (guest_range_ok_prot(head_ptr_va, 4U, 2U) != 0 ||
+        guest_range_ok_prot(len_ptr_va, 4U, 2U) != 0) {
         return -EFAULT;
     }
     if (sys_st_be32(ctx, head_ptr_va, ctx->robust_list_head) != 0) {
@@ -535,11 +516,6 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
     o3 = ctx->r[SPARC32_O3];
     o4 = ctx->r[SPARC32_O4];
     o5 = ctx->r[SPARC32_O5];
-    if (__atomic_load_n(&g_sparc32_ldstub_lock.owner, __ATOMIC_RELAXED) ==
-        (uintptr_t)ctx) {
-        __atomic_store_n(&g_sparc32_ldstub_lock.va, 0U, __ATOMIC_RELEASE);
-        __atomic_store_n(&g_sparc32_ldstub_lock.owner, 0U, __ATOMIC_RELEASE);
-    }
 
     switch (nr) {
     case (long)SPARC32__NR_exit:

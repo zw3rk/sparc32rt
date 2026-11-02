@@ -19,6 +19,7 @@
 #include <stdio.h>
 
 #include "sparc32rt.h"
+#include "interp/interp_priv.h"
 #include "os/sigframe_sparc32rt.h"
 
 static int failures = 0;
@@ -167,6 +168,7 @@ static void check_sigframe(void)
     CHECK_CONST("restorer ta", SPARC32_RESTORER_TA_10, 0x91d02010UL);
     CHECK_CONST("SIGMASK_SIZE", SPARC32_SIGMASK_SIZE, 8);
     CHECK_CONST("RT_SIGFRAME_SIZE", SPARC32_RT_SIGFRAME_SIZE, 344);
+    CHECK_CONST("SIGFPU_SIZE", SPARC32_SIGFPU_SIZE, 136);
 
     CHECK_SIZE(sparc32_mcontext_t, 80);
     CHECK_SIZE(sparc32_sigcontext_t, 88);

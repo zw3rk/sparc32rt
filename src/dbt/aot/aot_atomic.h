@@ -36,6 +36,8 @@
 #include "sparc32rt.h"
 #include "interp/interp_priv.h"
 
+extern void vm_invalidate_jit(sparc32_ctx_t *ctx, uint32_t start, uint32_t end);
+
 /* Encode a guest word to the 32-bit cell image stored at HVA (BE bytes). */
 static inline uint32_t sparc32_be_cell_encode(uint32_t v)
 {
@@ -92,26 +94,13 @@ static inline bool sparc32_atomic_ldstub(sparc32_ctx_t *ctx, uint32_t va,
     uint8_t *cell;
     uint8_t old;
     void *hva = sparc32_atomic_hva(ctx, va, 1U, 3U);
-    uintptr_t me = (uintptr_t)ctx;
     if (hva == NULL) {
         return false;
     }
-    while (__atomic_load_n(&g_sparc32_ldstub_lock.owner, __ATOMIC_ACQUIRE) != me) {
-        uintptr_t zero = 0U;
-        if (__atomic_compare_exchange_n(&g_sparc32_ldstub_lock.owner, &zero, me,
-                false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-            break;
-        }
-        sched_yield();
-    }
     cell = (uint8_t *)hva;
-    old = __atomic_exchange_n(cell, (uint8_t)0xFF, __ATOMIC_SEQ_CST);
-    if (old == 0U) {
-        __atomic_store_n(&g_sparc32_ldstub_lock.va, va, __ATOMIC_RELEASE);
-    } else {
-        __atomic_store_n(&g_sparc32_ldstub_lock.va, 0U, __ATOMIC_RELEASE);
-        __atomic_store_n(&g_sparc32_ldstub_lock.owner, 0U, __ATOMIC_RELEASE);
-        sched_yield();
+    old = __atomic_exchange_n(cell, (uint8_t)0xFFU, __ATOMIC_SEQ_CST);
+    if (vm32_range_has_code(va, 1U)) {
+        vm_invalidate_jit(ctx, va, va + 1U);
     }
     interp_wreg(ctx, rd, (uint32_t)old);
     return true;
@@ -134,6 +123,9 @@ static inline bool sparc32_atomic_swap(sparc32_ctx_t *ctx, uint32_t va,
     }
     cell = (uint32_t *)hva;
     old_cell = __atomic_exchange_n(cell, new_cell, __ATOMIC_SEQ_CST);
+    if (vm32_range_has_code(va, 4U)) {
+        vm_invalidate_jit(ctx, va, va + 4U);
+    }
     interp_wreg(ctx, rd, sparc32_be_cell_decode(old_cell));
     return true;
 }
@@ -156,8 +148,12 @@ static inline bool sparc32_atomic_casa(sparc32_ctx_t *ctx, uint32_t va,
         return false;
     }
     cell = (uint32_t *)hva;
-    __atomic_compare_exchange_n(cell, &expected, desired, false,
-        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    if (__atomic_compare_exchange_n(cell, &expected, desired, false,
+            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        if (vm32_range_has_code(va, 4U)) {
+            vm_invalidate_jit(ctx, va, va + 4U);
+        }
+    }
     interp_wreg(ctx, rd, sparc32_be_cell_decode(expected));
     return true;
 }

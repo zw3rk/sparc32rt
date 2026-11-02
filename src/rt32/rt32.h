@@ -72,6 +72,7 @@ typedef struct rt32_elf_info {
 } rt32_elf_info_t;
 
 int rt32_open_guest_ro(const sparc32_ctx_t *ctx, const char *guest_path);
+int rt32_elf_validate(const sparc32_ctx_t *ctx, const char *path);
 int rt32_elf_load(sparc32_ctx_t *ctx, int exec_fd, const char *path,
                   rt32_elf_info_t *out_info);
 int rt32_stack_setup(sparc32_ctx_t *ctx, const rt32_elf_info_t *elf_info,

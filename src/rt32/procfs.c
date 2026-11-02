@@ -15,6 +15,7 @@
 #define _GNU_SOURCE
 #include "rt32/procfs.h"
 
+#include "os/l2a_access.h"
 #include "rt32/rt32.h"
 
 #include <errno.h>
@@ -29,31 +30,22 @@
 #define PROCFS_SELF_LEN 11U
 #define PROCFS_PATH_MAX 4096U
 
-/* Bounds check for [va, va+len): reject 32-bit wrap + low guard. */
-static int procfs_range_ok(uint32_t va, uint64_t len)
-{
-    if (len == 0U) {
-        return 0;
-    }
-    if (len > 0x100000000ULL || (uint64_t)va + len > 0x100000000ULL) {
-        return -EFAULT;
-    }
-    return (va < SPARC32_LOW_GUARD_SIZE) ? -EFAULT : 0;
-}
-
 /* NUL-terminated guest string -> host out (0 ok, -EFAULT/-ENAMETOOLONG). */
 static long procfs_copy_in(sparc32_ctx_t *ctx, uint32_t va, char *out,
                            uint32_t cap)
 {
     uint32_t i;
-    if (cap == 0U || procfs_range_ok(va, 1U) != 0) {
+    if (cap == 0U || l2a_range_ok_prot(va, 1U, 1U) != 0) {
         return (cap == 0U) ? -ENAMETOOLONG : -EFAULT;
     }
     for (i = 0U; i < cap; i++) {
         uint32_t a = va + i;
         const uint8_t *p;
-        if (a < va || a < SPARC32_LOW_GUARD_SIZE) {
-            return (a < va) ? -ENAMETOOLONG : -EFAULT;
+        if (a < va) {
+            return -ENAMETOOLONG;
+        }
+        if (l2a_range_ok_prot(a, 1U, 1U) != 0) {
+            return -EFAULT;
         }
         p = (const uint8_t *)sparc32_guest_ptr(ctx, a);
         out[i] = (char)*p;
@@ -68,13 +60,7 @@ static long procfs_copy_in(sparc32_ctx_t *ctx, uint32_t va, char *out,
 static long procfs_copy_out(sparc32_ctx_t *ctx, uint32_t va, const void *src,
                             uint64_t len)
 {
-    if (procfs_range_ok(va, len) != 0) {
-        return -EFAULT;
-    }
-    if (len != 0U) {
-        memcpy(sparc32_guest_ptr(ctx, va), src, (size_t)len);
-    }
-    return 0;
+    return (long)l2a_store(ctx, va, src, len);
 }
 
 /* Split an absolute /proc/self/<rel> path; false for anything else. */

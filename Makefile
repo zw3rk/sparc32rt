@@ -26,7 +26,7 @@ HOST_CC ?= cc
 # -pedantic and every prescribed warning intact). On macOS the macro would
 # hide MAP_ANONYMOUS, so it stays Linux-only.
 U3_PROBE_CC := $(or $(CC),cc)
-CFLAGS  ?= -std=c11 -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
+CFLAGS  ?= -std=c11 -Wall -Wextra -Werror -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32
 ifeq ($(findstring darwin,$(shell $(U3_PROBE_CC) -dumpmachine 2>/dev/null)),darwin)
   CFLAGS += -D_DARWIN_C_SOURCE
 else
@@ -79,7 +79,7 @@ build: $(SPARC32RT_BIN) ## Build static-PIE sparc32rt binary (cross: aarch64-unk
 build-darwin: ## Build native darwin-arm64 binary (Backend 2) with host cc
 	@$(MAKE) $(BUILD_DIR)/sparc32rt-darwin CC=cc OBJ_DIR=$(BUILD_DIR)/darwin-obj \
 		SPARC32RT_BIN=$(BUILD_DIR)/sparc32rt-darwin \
-		CFLAGS="-std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32" \
+		CFLAGS="-std=c11 -D_DARWIN_C_SOURCE -Wall -Wextra -Werror -Werror=vla -pedantic -Os -fPIE -Iinclude -Isrc -Isrc/rt32" \
 		LDFLAGS=""
 
 $(SPARC32RT_BIN): $(OBJS)
@@ -98,12 +98,12 @@ check: build check-line-limits check-abi-invariants ## Phase 0 gate: build + lin
 
 check-line-limits: ## Every .c/.h/.S source file must stay <= 900 lines
 	@fail=0; \
-	for f in $$(find src include -name '*.c' -o -name '*.h' -o -name '*.S'); do \
+	for f in $$(find src include tests \( -name '*.c' -o -name '*.h' -o -name '*.S' \)); do \
 	  n=$$(wc -l < "$$f"); \
 	  if [ "$$n" -gt 900 ]; then echo "LIMIT FAIL: $$f has $$n lines (> 900)"; fail=1; fi; \
 	done; \
 	if [ "$$fail" -ne 0 ]; then exit 1; fi; \
-	echo "line limits OK (all src/include .c/.h/.S <= 900 lines)"
+	echo "line limits OK (all src/include/tests .c/.h/.S <= 900 lines)"
 
 check-abi-invariants: ## Build+run tests/check_abi_invariants.c with the host cc (L0b; skip if absent)
 	@if [ -f tests/check_abi_invariants.c ]; then \

@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifndef MAP_ANONYMOUS
@@ -509,30 +510,165 @@ static int load_elf32_image(sparc32_ctx_t *ctx, int fd, uint32_t default_pie_bas
     return 0;
 }
 
+static int validate_elf32_fd(int fd, uint32_t default_pie_base,
+                             char *interp_out, size_t interp_cap)
+{
+    struct stat st;
+    elf32_ehdr_t ehdr;
+    elf32_phdr_t phdrs[64];
+    size_t phdr_bytes;
+    uint32_t min_vaddr = UINT32_MAX;
+    uint32_t load_bias = 0U;
+    uint64_t entry64;
+    uint32_t prev_seg_end = 0U;
+    bool entry_in_load = false;
+    uint16_t i;
+
+    if (interp_out != NULL && interp_cap > 0U) {
+        interp_out[0] = '\0';
+    }
+    if (fstat(fd, &st) != 0) {
+        return -errno;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        return -EISDIR;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return -EACCES;
+    }
+    if (pread_full(fd, &ehdr, sizeof(ehdr), 0) != 0) {
+        return -ENOEXEC;
+    }
+    if (ehdr.e_ident[0] != 0x7fU || ehdr.e_ident[1] != 'E' ||
+        ehdr.e_ident[2] != 'L'  || ehdr.e_ident[3] != 'F' ||
+        ehdr.e_ident[4] != ELFCLASS32 || ehdr.e_ident[5] != ELFDATA2MSB) {
+        return -ENOEXEC;
+    }
+    ehdr_from_be(&ehdr);
+    if (ehdr.e_machine != EM_SPARC ||
+        (ehdr.e_flags != 0U && ehdr.e_flags != 0x300U) ||
+        (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN) ||
+        ehdr.e_phentsize != sizeof(elf32_phdr_t) ||
+        ehdr.e_phnum == 0U || ehdr.e_phnum > 64U) {
+        return -ENOEXEC;
+    }
+    phdr_bytes = (size_t)ehdr.e_phnum * sizeof(elf32_phdr_t);
+    if (pread_full(fd, phdrs, phdr_bytes, (off_t)ehdr.e_phoff) != 0) {
+        return -ENOEXEC;
+    }
+    for (i = 0U; i < ehdr.e_phnum; i++) {
+        phdr_from_be(&phdrs[i]);
+        if (phdrs[i].p_type == PT_LOAD && phdrs[i].p_memsz > 0U &&
+            phdrs[i].p_vaddr < min_vaddr) {
+            min_vaddr = phdrs[i].p_vaddr;
+        }
+    }
+    if (min_vaddr == UINT32_MAX || ehdr.e_entry == 0U) {
+        return -ENOEXEC;
+    }
+    if (ehdr.e_type == ET_DYN && min_vaddr < 0x10000U) {
+        load_bias = default_pie_base;
+    }
+    entry64 = (uint64_t)ehdr.e_entry + (uint64_t)load_bias;
+    if (entry64 < 0x10000ULL || entry64 >= (uint64_t)SPARC32_TASK_SIZE_TOP ||
+        (entry64 & 3ULL) != 0ULL) {
+        return -ENOEXEC;
+    }
+    for (i = 0U; i < ehdr.e_phnum; i++) {
+        const elf32_phdr_t *ph = &phdrs[i];
+        if (ph->p_type == PT_INTERP) {
+            char tmp_interp[256];
+            char *dst = (interp_out != NULL && interp_cap >= sizeof(tmp_interp))
+                ? interp_out : tmp_interp;
+            if (ph->p_filesz == 0U || ph->p_filesz >= sizeof(tmp_interp) ||
+                pread_full(fd, dst, ph->p_filesz, (off_t)ph->p_offset) != 0) {
+                return -ENOEXEC;
+            }
+            dst[ph->p_filesz] = '\0';
+            if (dst[0] == '\0') {
+                return -ENOEXEC;
+            }
+        } else if (ph->p_type == PT_LOAD && ph->p_memsz > 0U) {
+            uint64_t seg_vaddr64 = (uint64_t)load_bias + (uint64_t)ph->p_vaddr;
+            uint64_t seg_end64 = seg_vaddr64 + (uint64_t)ph->p_memsz;
+            uint32_t page_start = sparc32_page_down((uint32_t)seg_vaddr64);
+            uint64_t map_end64 = (seg_end64 + 0xFFFULL) & ~0xFFFULL;
+            if (ph->p_filesz > ph->p_memsz ||
+                seg_vaddr64 >= (uint64_t)SPARC32_TASK_SIZE_TOP ||
+                seg_end64 > (uint64_t)SPARC32_TASK_SIZE_TOP ||
+                (uint32_t)seg_vaddr64 < prev_seg_end ||
+                page_start < 0x10000U ||
+                map_end64 > (uint64_t)SPARC32_TASK_SIZE_TOP ||
+                (uint64_t)ph->p_offset + (uint64_t)ph->p_filesz > (uint64_t)st.st_size) {
+                return -ENOEXEC;
+            }
+            prev_seg_end = (uint32_t)seg_end64;
+            if ((ph->p_flags & PF_X) != 0U &&
+                entry64 >= seg_vaddr64 && entry64 + 4ULL <= seg_end64) {
+                entry_in_load = true;
+            }
+        }
+    }
+    return entry_in_load ? 0 : -ENOEXEC;
+}
+
+int rt32_elf_validate(const sparc32_ctx_t *ctx, const char *path)
+{
+    char interp_path[256];
+    int fd;
+    int rc;
+
+    if (path == NULL || path[0] == '\0') {
+        return -ENOENT;
+    }
+    fd = rt32_open_guest_ro(ctx, path);
+    if (fd < 0) {
+        return -errno;
+    }
+    rc = validate_elf32_fd(fd, 0x00400000U, interp_path, sizeof(interp_path));
+    close(fd);
+    if (rc != 0) {
+        return rc;
+    }
+    if (interp_path[0] != '\0') {
+        int ifd = rt32_open_guest_ro(ctx, interp_path);
+        if (ifd < 0) {
+            return -errno;
+        }
+        rc = validate_elf32_fd(ifd, 0x3F000000U, NULL, 0U);
+        close(ifd);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    return 0;
+}
+
 int rt32_elf_load(sparc32_ctx_t *ctx, int exec_fd, const char *path, rt32_elf_info_t *out_info)
 {
     int fd = exec_fd;
     int rc;
 
     if (!ctx || !out_info) {
-        return -1;
+        return -EINVAL;
     }
 
     if (fd < 0) {
-        if (!path) {
-            return -1;
+        if (!path || path[0] == '\0') {
+            return -ENOENT;
         }
         fd = rt32_open_guest_ro(ctx, path);
         if (fd < 0) {
-            fprintf(stderr, "sparc32rt: cannot open '%s': %s\n", path, strerror(errno));
-            return -1;
+            int err = errno;
+            fprintf(stderr, "sparc32rt: cannot open '%s': %s\n", path, strerror(err));
+            return -err;
         }
     }
 
     rc = load_elf32_image(ctx, fd, 0x00400000U, path ? path : "[guest]", out_info);
     close(fd);
     if (rc != 0) {
-        return -1;
+        return (rc < 0 && rc != -1) ? rc : -ENOEXEC;
     }
 
     ctx->elf_base  = out_info->load_bias;
@@ -549,15 +685,16 @@ int rt32_elf_load(sparc32_ctx_t *ctx, int exec_fd, const char *path, rt32_elf_in
         uint32_t interp_end;
 
         if (ifd < 0) {
+            int err = errno;
             fprintf(stderr, "sparc32rt: cannot open interpreter '%s': %s\n",
-                    out_info->interp_path, strerror(errno));
-            return -1;
+                    out_info->interp_path, strerror(err));
+            return -err;
         }
 
         irc = load_elf32_image(ctx, ifd, interp_base, out_info->interp_path, &interp_info);
         close(ifd);
         if (irc != 0) {
-            return -1;
+            return (irc < 0 && irc != -1) ? irc : -ENOEXEC;
         }
         out_info->interp_base = interp_info.load_bias;
         ctx->interp_base      = interp_info.load_bias;

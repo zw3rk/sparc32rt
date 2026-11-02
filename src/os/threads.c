@@ -30,6 +30,7 @@
 #include <unistd.h>
 
 #include "sparc32rt.h"
+#include "os/l2a_access.h"
 #include "os/syscalls_min.h"
 #include "os/threads.h"
 #include "interp/interp.h"
@@ -192,34 +193,17 @@ void sparc32_thr_sig_set(sparc32_ctx_t *ctx, int sig, bool blocked)
     }
 }
 
-/* Guest BE word access through the G window (32-bit wrap + low-guard
- * check; the 4 GiB window is PROT_NONE with mapped regions inside). */
+/* Guest BE word access through the G window with page-permission checks. */
 int sparc32_thr_range_ok(uint32_t va, uint32_t len)
 {
-    if (len == 0U) {
-        return 0;
-    }
-    if ((uint64_t)va + (uint64_t)len > 0x100000000ULL) {
-        return -EFAULT;
-    }
-    if (va < SPARC32_LOW_GUARD_SIZE) {
-        return -EFAULT;
-    }
-    return 0;
+    return l2a_range_ok_prot(va, len, 1U);
 }
 
 static int thr_st(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
 {
-    uint8_t *p;
-    if (sparc32_thr_range_ok(va, 4U) != 0) {
-        return -EFAULT;
-    }
-    p = (uint8_t *)sparc32_guest_ptr(ctx, va);
-    p[0] = (uint8_t)(v >> 24);
-    p[1] = (uint8_t)(v >> 16);
-    p[2] = (uint8_t)(v >> 8);
-    p[3] = (uint8_t)v;
-    return 0;
+    uint8_t b[4];
+    put_be32(b, v);
+    return l2a_store(ctx, va, b, sizeof(b));
 }
 
 /* pipe(42): SPARC dual-return (E04). The tail commits %o0 from the
@@ -246,7 +230,7 @@ long sparc32_thr_pipe2(sparc32_ctx_t *ctx, uint32_t fds_va, uint32_t flags)
     int fds[2];
     int oflags = 0;
     sparc32_threads_ensure_init(ctx);
-    if (ctx == NULL || sparc32_thr_range_ok(fds_va, 8U) != 0) {
+    if (ctx == NULL || l2a_range_ok_prot(fds_va, 8U, 2U) != 0) {
         return -EFAULT;
     }
     if ((flags & ~0x404000U) != 0U) {
@@ -327,10 +311,11 @@ static long thr_wait_common(sparc32_ctx_t *ctx, uint32_t pid,
     if (ctx == NULL) {
         return -EFAULT;
     }
-    if (wstat_va != 0U && sparc32_thr_range_ok(wstat_va, 4U) != 0) {
+    if (wstat_va != 0U && l2a_range_ok_prot(wstat_va, 4U, 2U) != 0) {
         return -EFAULT;
     }
-    if (has_rusage && rusage_va != 0U && sparc32_thr_range_ok(rusage_va, 72U) != 0) {
+    if (has_rusage && rusage_va != 0U &&
+        l2a_range_ok_prot(rusage_va, 72U, 2U) != 0) {
         return -EFAULT;
     }
     if (has_rusage && rusage_va != 0U) {
@@ -347,7 +332,11 @@ static long thr_wait_common(sparc32_ctx_t *ctx, uint32_t pid,
         return -EFAULT;
     }
     if (has_rusage && rusage_va != 0U) {
-        memset(sparc32_guest_ptr(ctx, rusage_va), 0, 72);
+        uint8_t z[72];
+        memset(z, 0, sizeof(z));
+        if (l2a_store(ctx, rusage_va, z, sizeof(z)) != 0) {
+            return -EFAULT;
+        }
     }
     return (long)got;
 }
@@ -372,11 +361,13 @@ long sparc32_thr_waitpid(sparc32_ctx_t *ctx, uint32_t pid,
 static void thr_thread_finish(struct thr_start *st, long status)
 {
     sparc32_ctx_t *ctx = st->ctx;
-    if (st->clear_tid_va != 0U && sparc32_thr_range_ok(st->clear_tid_va, 4U) == 0) {
-        uint8_t *p = (uint8_t *)sparc32_guest_ptr(ctx, st->clear_tid_va);
-        p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 0;
+    if (st->clear_tid_va != 0U &&
+        l2a_range_ok_prot(st->clear_tid_va, 4U, 2U) == 0) {
+        (void)thr_st(ctx, st->clear_tid_va, 0U);
 #if defined(__linux__) && defined(SYS_futex)
-        (void)syscall(SYS_futex, (uint32_t *)p, 1, 1, NULL, NULL, 0);
+        (void)syscall(SYS_futex,
+            (uint32_t *)sparc32_guest_ptr(ctx, st->clear_tid_va),
+            1, 1, NULL, NULL, 0);
 #else
         {
             extern long sparc32_futex_wake_emu(sparc32_ctx_t *c,
@@ -424,7 +415,7 @@ static void *thr_thread_entry(void *arg)
             if (ctx->exit_reason == SPARC32_EXIT_SINGLE_STEP) {
                 ctx->fault_addr = ctx->exit_dest;
             }
-            signo = (ctx->fault_addr & 3U) != 0U ? 10 : 11;
+            signo = sparc32_classify_fault(ctx);
             if (interp_try_deliver_sync(ctx, signo)) {
                 continue;
             }
@@ -695,189 +686,4 @@ long sparc32_thr_set_tid_address(sparc32_ctx_t *ctx, uint32_t tidptr_va)
         ctx->host_tid = thr_gettid();
     }
     return (long)ctx->host_tid;
-}
-
-/* rt_sigpending(104): kernel-layout BE quad (signals 1..32 in the high
- * word). sigsetsize must be 8 (E05 rule). */
-long sparc32_thr_rt_sigpending(sparc32_ctx_t *ctx, uint32_t set_va,
-    uint32_t sigsetsize)
-{
-    uint8_t out[8];
-    uint64_t p;
-    sparc32_threads_ensure_init(ctx);
-    if (ctx == NULL) {
-        return -EFAULT;
-    }
-    if (sigsetsize != 8U) {
-        return -EINVAL;
-    }
-    if (set_va != 0U && sparc32_thr_range_ok(set_va, 8U) != 0) {
-        return -EFAULT;
-    }
-    p = ctx->pending_signals;
-    out[0] = (uint8_t)(p >> 56);
-    out[1] = (uint8_t)(p >> 48);
-    out[2] = (uint8_t)(p >> 40);
-    out[3] = (uint8_t)(p >> 32);
-    out[4] = (uint8_t)(p >> 24);
-    out[5] = (uint8_t)(p >> 16);
-    out[6] = (uint8_t)(p >> 8);
-    out[7] = (uint8_t)p;
-    if (set_va != 0U) {
-        memcpy(sparc32_guest_ptr(ctx, set_va), out, sizeof(out));
-    }
-    return 0;
-}
-
-/* rt_sigsuspend(107): replace mask, sleep for an unblocked pending
- * signal, deliver synchronously, fail EINTR; both masks restored first.
- * set_va doubles as restore scratch (guest memory ends unchanged). */
-long sparc32_thr_rt_sigsuspend(sparc32_ctx_t *ctx, uint32_t set_va,
-    uint32_t sigsetsize)
-{
-    uint64_t n;
-    uint64_t old;
-    uint64_t old_ctx;
-    uint8_t *buf;
-    uint8_t tmp[8];
-    sigset_t host_set;
-    int s;
-    sparc32_threads_ensure_init(ctx);
-    if (ctx == NULL) {
-        return -EFAULT;
-    }
-    if (sigsetsize != 8U) {
-        return -EINVAL;
-    }
-    if (set_va == 0U || sparc32_thr_range_ok(set_va, 8U) != 0) {
-        return -EFAULT;
-    }
-    buf = (uint8_t *)sparc32_guest_ptr(ctx, set_va);
-    n = ((uint64_t)buf[0] << 56) | ((uint64_t)buf[1] << 48) |
-        ((uint64_t)buf[2] << 40) | ((uint64_t)buf[3] << 32) |
-        ((uint64_t)buf[4] << 24) | ((uint64_t)buf[5] << 16) |
-        ((uint64_t)buf[6] << 8) | (uint64_t)buf[7];
-    memcpy(tmp, buf, sizeof(tmp));
-    old = sparc32_l2a_blocked_mask();
-    old_ctx = ctx->sig_mask;
-    if (sparc32_l2a_rt_sigprocmask(ctx, SPARC_SIG_SETMASK, set_va, 0U, 8U) != 0) {
-        return -EFAULT;
-    }
-    ctx->sig_mask = n;
-    sigemptyset(&host_set);
-    for (;;) {
-        bool woke = false;
-        for (s = 1; s <= 64; s++) {
-            uint64_t bit = 1ULL << (uint64_t)((uint32_t)(s - 1) % 32U);
-            uint32_t handler;
-            uint32_t restorer;
-            if ((uint32_t)s <= 32U) {
-                bit <<= 32U;
-            }
-            if ((ctx->pending_signals & bit) == 0U) {
-                continue;
-            }
-            if (sparc32_thr_sig_blocked(ctx, s) != 0) {
-                continue;
-            }
-            if (sparc32_signal_get(s, &handler, &restorer) != 0) {
-                ctx->pending_signals &= ~bit;
-                continue;
-            }
-            for (int k = 0; k < 8; k++) {
-                buf[k] = (uint8_t)(old >> (56 - 8 * k));
-            }
-            (void)sparc32_l2a_rt_sigprocmask(ctx, SPARC_SIG_SETMASK, set_va, 0U, 8U);
-            memcpy(buf, tmp, sizeof(tmp));
-            ctx->sig_mask = old_ctx;
-            /* In-dispatch delivery (sigsuspend asserts the handler ran
-             * before return). The tail then commits O0=EINTR/C=1 over
-             * %o0 — exactly the post-handler state — while the frame
-             * psr carries C for the sigreturn restore. */
-            if (!interp_deliver_async_for_syscall(ctx, s, true)) {
-                ctx->pending_signals &= ~bit;
-            }
-            woke = true;
-            break;
-        }
-        if (woke) {
-            return -EINTR;
-        }
-        (void)sigsuspend(&host_set);
-    }
-}
-
-/* setitimer(83): ITIMER_REAL one-shot/periodic via the host timer.
- * Guest itimerval is 16 bytes big-endian (interval, value; each a
- * 4-byte sec + 4-byte usec pair). VIRTUAL/PROF timers return -EINVAL
- * (RC4 scope: the oracle test uses REAL only). SIGALRM lands through
- * the installed host handler and the pending-bit safe-point path. */
-long sparc32_thr_setitimer(sparc32_ctx_t *ctx, uint32_t which,
-    uint32_t new_va, uint32_t old_va)
-{
-    const uint8_t *np;
-    uint8_t *op;
-    struct itimerval ntv;
-    struct itimerval otv;
-    struct itimerval *oldp;
-    if (which != 0U) {
-        return -EINVAL;
-    }
-    if (new_va == 0U || sparc32_thr_range_ok(new_va, 16U) != 0) {
-        return -EFAULT;
-    }
-    if (old_va != 0U && sparc32_thr_range_ok(old_va, 16U) != 0) {
-        return -EFAULT;
-    }
-    np = (const uint8_t *)sparc32_guest_ptr(ctx, new_va);
-    ntv.it_interval.tv_sec = (time_t)(int32_t)(((uint32_t)np[0] << 24) |
-        ((uint32_t)np[1] << 16) | ((uint32_t)np[2] << 8) |
-        (uint32_t)np[3]);
-    ntv.it_interval.tv_usec = (suseconds_t)(int32_t)(((uint32_t)np[4] << 24) |
-        ((uint32_t)np[5] << 16) | ((uint32_t)np[6] << 8) |
-        (uint32_t)np[7]);
-    ntv.it_value.tv_sec = (time_t)(int32_t)(((uint32_t)np[8] << 24) |
-        ((uint32_t)np[9] << 16) | ((uint32_t)np[10] << 8) |
-        (uint32_t)np[11]);
-    ntv.it_value.tv_usec = (suseconds_t)(int32_t)(((uint32_t)np[12] << 24) |
-        ((uint32_t)np[13] << 16) | ((uint32_t)np[14] << 8) |
-        (uint32_t)np[15]);
-    if (ntv.it_interval.tv_sec < 0 || ntv.it_interval.tv_usec < 0 ||
-        ntv.it_interval.tv_usec >= 1000000 ||
-        ntv.it_value.tv_sec < 0 || ntv.it_value.tv_usec < 0 ||
-        ntv.it_value.tv_usec >= 1000000) {
-        return -EINVAL;
-    }
-    oldp = (old_va != 0U) ? &otv : NULL;
-    if (setitimer(ITIMER_REAL, &ntv, oldp) != 0) {
-        return -(long)errno;
-    }
-    if (old_va != 0U) {
-        uint32_t osec;
-        uint32_t ousec;
-        uint32_t vsec;
-        uint32_t vusec;
-        op = (uint8_t *)sparc32_guest_ptr(ctx, old_va);
-        osec = (uint32_t)otv.it_interval.tv_sec;
-        ousec = (uint32_t)otv.it_interval.tv_usec;
-        vsec = (uint32_t)otv.it_value.tv_sec;
-        vusec = (uint32_t)otv.it_value.tv_usec;
-        op[0] = (uint8_t)(osec >> 24);
-        op[1] = (uint8_t)(osec >> 16);
-        op[2] = (uint8_t)(osec >> 8);
-        op[3] = (uint8_t)osec;
-        op[4] = (uint8_t)(ousec >> 24);
-        op[5] = (uint8_t)(ousec >> 16);
-        op[6] = (uint8_t)(ousec >> 8);
-        op[7] = (uint8_t)ousec;
-        op[8] = (uint8_t)(vsec >> 24);
-        op[9] = (uint8_t)(vsec >> 16);
-        op[10] = (uint8_t)(vsec >> 8);
-        op[11] = (uint8_t)vsec;
-        op[12] = (uint8_t)(vusec >> 24);
-        op[13] = (uint8_t)(vusec >> 16);
-        op[14] = (uint8_t)(vusec >> 8);
-        op[15] = (uint8_t)vusec;
-    }
-    return 0;
 }
