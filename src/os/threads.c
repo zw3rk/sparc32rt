@@ -5,19 +5,20 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * fork/vfork, wait4/waitpid, clone via host pthreads,
- * kill family with synchronous self-delivery,
- * rt_sigpending/rt_sigsuspend. pipe/pipe2 and the guest FD table live
- * in threads_fd.c; execve lives in threads_exec.c (splits for the
- * 900-line discipline). Oracle evidence in the commit message.
+ * rt_sigpending/rt_sigsuspend. The kill family (kill/tkill/tgkill,
+ * gettid, set_tid_address) lives in threads_kill.c; pipe/pipe2 and
+ * the guest FD table live in threads_fd.c; execve lives in
+ * threads_exec.c (splits for the 900-line discipline). Oracle
+ * evidence in the commit message.
  * vfork is fork + document. Async (#5): host handlers only set the
  * process-pending word; delivery at safe points. RC4 hookups for
  * threaded proof are listed in threads.h.
  *
- * Lock order (S32-R3-2, S32-R3-3): thr_live_lock -> g_dbt_lock ->
- * VM spinlock. vm_lock_acquire() performs the DBT quiescence step
- * itself; fork prepare takes the three in order and holds them
- * across fork() so the child inherits no partial mutation and no
- * lock owned by a vanished thread.
+ * Lock order (S32-R3-2, S32-R3-3): thr_live_lock -> sigact_lock ->
+ * thr_fd_lock -> g_dbt_lock -> VM spinlock. vm_lock_acquire()
+ * performs the DBT quiescence step itself; fork prepare takes the
+ * five in order and holds them across fork() so the child inherits
+ * no partial mutation and no lock owned by a vanished thread.
  */
 /* sched_yield/pthread + syscall() under strict -std=c11 with musl. */
 #define _GNU_SOURCE
@@ -56,7 +57,7 @@ extern void dbt_fork_parent(void);
 extern void dbt_fork_child_reset(void);
 extern void sparc32_vm_fork_child_reset(void);
 
-static int thr_gettid(void)
+int thr_gettid(void)
 {
 #if defined(__APPLE__)
     uint64_t tid = 0;
@@ -75,6 +76,79 @@ static bool thr_init_done = false;
 static _Atomic uint64_t g_process_pending = 0ULL;
 static _Atomic bool g_exec_retiring = false;
 static _Atomic uintptr_t g_exec_survivor = 0U;
+
+/* Sticky per-context retirement marks (S32-R3-4 follow-up #4): every
+ * context ever marked retired stays marked until its own storage is
+ * freed, so a slow sibling that missed the wait still observes the
+ * flag after the globals stop changing. Guarded by thr_live_lock;
+ * readers use acquire loads so the hot poll stays lock-free. */
+static sparc32_ctx_t *thr_retired[THR_MAX_LIVE];
+
+static void thr_retired_add_locked(sparc32_ctx_t *ctx)
+{
+    size_t i;
+    for (i = 0U; i < THR_MAX_LIVE; i++) {
+        if (__atomic_load_n(&thr_retired[i], __ATOMIC_RELAXED) == ctx) {
+            return;
+        }
+    }
+    for (i = 0U; i < THR_MAX_LIVE; i++) {
+        if (__atomic_load_n(&thr_retired[i], __ATOMIC_RELAXED) == NULL) {
+            __atomic_store_n(&thr_retired[i], ctx, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+}
+
+static void thr_retired_remove_locked(sparc32_ctx_t *ctx)
+{
+    size_t i;
+    for (i = 0U; i < THR_MAX_LIVE; i++) {
+        if (__atomic_load_n(&thr_retired[i], __ATOMIC_RELAXED) == ctx) {
+            __atomic_store_n(&thr_retired[i], NULL, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+static bool thr_retired_contains(const sparc32_ctx_t *ctx)
+{
+    size_t i;
+    if (ctx == NULL) {
+        return false;
+    }
+    for (i = 0U; i < THR_MAX_LIVE; i++) {
+        if (__atomic_load_n(&thr_retired[i], __ATOMIC_ACQUIRE) == ctx) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Live-registry lock + lookup shared by the threads_*.c splits (see
+ * threads.h). The pointer is only valid while the lock is held. */
+void thr_live_enter(void)
+{
+    pthread_mutex_lock(&thr_live_lock);
+}
+
+void thr_live_leave(void)
+{
+    pthread_mutex_unlock(&thr_live_lock);
+}
+
+sparc32_ctx_t *thr_live_find_locked(int32_t want_tid, int32_t self_tid,
+    const sparc32_ctx_t *self)
+{
+    size_t i;
+    for (i = 0U; i < THR_MAX_LIVE; i++) {
+        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i], __ATOMIC_ACQUIRE);
+        if (c != NULL && (c->host_tid == want_tid ||
+                (want_tid == self_tid && c == self))) {
+            return c;
+        }
+    }
+    return NULL;
+}
 
 static void thr_register(sparc32_ctx_t *ctx)
 {
@@ -107,6 +181,10 @@ static void thr_deregister(sparc32_ctx_t *ctx)
             __atomic_store_n(&thr_live[i], NULL, __ATOMIC_RELEASE);
         }
     }
+    /* A context that frees its own storage drops its retirement mark
+     * with it, so a later allocation that reuses the address is never
+     * mistaken for a retired sibling (S32-R3-4 follow-up #4). */
+    thr_retired_remove_locked(ctx);
     pthread_mutex_unlock(&thr_live_lock);
 }
 
@@ -254,6 +332,9 @@ void sparc32_thr_self_retire(sparc32_ctx_t *ctx)
 void sparc32_threads_ensure_init(sparc32_ctx_t *ctx)
 {
     thr_register(ctx);
+    /* Inherited descriptors 0..2 join the guest FD table once, so a
+     * later F_SETFD on them is honoured at exec (follow-up #6). */
+    sparc32_fd_ensure_init();
     if (__atomic_load_n(&thr_init_done, __ATOMIC_ACQUIRE)) {
         return;
     }
@@ -280,14 +361,19 @@ static int thr_st(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
 }
 
 /* Coordinated fork (S32-R3-2): quiesce admission and execution in the
- * documented lock order (thr_live_lock -> g_dbt_lock -> VM spinlock),
- * fork, then rebuild single-threaded state. The child inherits all
- * three locks held by the surviving (forking) thread, so it owns and
- * then reinitializes them; no lock is ever owned by a vanished
- * thread, and no reader/runner survives to observe a torn VM table. */
+ * documented lock order (thr_live_lock -> sigact_lock -> thr_fd_lock
+ * -> g_dbt_lock -> VM spinlock), fork, then rebuild single-threaded
+ * state. The child inherits all five locks held by the surviving
+ * (forking) thread, so it owns and then reinitializes them; no lock
+ * is ever owned by a vanished thread, and no reader/runner survives
+ * to observe a torn VM table. A sibling inside rt_sigaction or an
+ * open-family call at fork time no longer leaves the child with a
+ * permanently locked mutex (S32-R3-2 follow-up #3). */
 void sparc32_thr_fork_prepare(void)
 {
     pthread_mutex_lock(&thr_live_lock);
+    sparc32_signal_fork_prepare();
+    sparc32_fd_fork_prepare();
     dbt_fork_prepare();
     vm_lock_acquire_noquiesce();
 }
@@ -296,6 +382,8 @@ void sparc32_thr_fork_parent(void)
 {
     vm_lock_release_noquiesce();
     dbt_fork_parent();
+    sparc32_fd_fork_parent();
+    sparc32_signal_fork_parent();
     pthread_mutex_unlock(&thr_live_lock);
 }
 
@@ -304,14 +392,17 @@ void sparc32_thr_fork_child(sparc32_ctx_t *ctx)
     size_t i;
     sparc32_vm_fork_child_reset();
     dbt_fork_child_reset();
-    /* The forking thread owns thr_live_lock in the child: release it,
-     * then rebuild it empty so vanished threads leave no slots behind,
-     * then re-register the sole survivor. */
+    /* The forking thread owns every process-wide mutex in the child:
+     * release each one, then rebuild it so vanished threads leave no
+     * slots or marks behind, then re-register the sole survivor. */
+    sparc32_fd_fork_child();
+    sparc32_signal_fork_child();
     pthread_mutex_unlock(&thr_live_lock);
     pthread_mutex_destroy(&thr_live_lock);
     pthread_mutex_init(&thr_live_lock, NULL);
     for (i = 0U; i < THR_MAX_LIVE; i++) {
         __atomic_store_n(&thr_live[i], NULL, __ATOMIC_RELAXED);
+        __atomic_store_n(&thr_retired[i], NULL, __ATOMIC_RELAXED);
     }
     atomic_store_explicit(&g_process_pending, 0ULL, memory_order_relaxed);
     atomic_store_explicit(&g_exec_retiring, false, memory_order_relaxed);
@@ -356,25 +447,43 @@ long sparc32_thr_vfork(sparc32_ctx_t *ctx)
     return sparc32_thr_fork(ctx);
 }
 
-/* execve sibling retirement (S32-R3-4): old guest threads must not
- * survive the image replacement. The survivor marks itself; every
- * clone-thread loop polls sparc32_thr_is_retired() and exits through
- * the normal thread-finish path (which deregisters and frees its own
+/* execve sibling retirement (S32-R3-4, follow-up #4): old guest
+ * threads must not survive the image replacement. The survivor marks
+ * every other live context retired; every clone-thread loop polls
+ * sparc32_thr_is_retired() — including inside the inner interp_step
+ * loop, so compute-bound siblings observe it — and exits through the
+ * normal thread-finish path (which deregisters and frees its own
  * context, so no cross-thread free ever runs). */
 void sparc32_thr_exec_retire_begin(sparc32_ctx_t *survivor)
 {
+    size_t i;
     atomic_store_explicit(&g_exec_survivor, (uintptr_t)survivor,
         memory_order_release);
     atomic_store_explicit(&g_exec_retiring, true, memory_order_release);
+    /* Mark every other live context retired under the lock. The marks
+     * are sticky per context (see thr_retired): the wait below never
+     * clears them, so a slow sibling still observes its own mark after
+     * the registry slot is gone instead of resuming against the new
+     * image. Contexts cloned after the exec are never marked. */
+    pthread_mutex_lock(&thr_live_lock);
+    for (i = 0U; i < THR_MAX_LIVE; i++) {
+        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i], __ATOMIC_ACQUIRE);
+        if (c != NULL && c != survivor) {
+            thr_retired_add_locked(c);
+        }
+    }
+    pthread_mutex_unlock(&thr_live_lock);
 }
 
 bool sparc32_thr_is_retired(const sparc32_ctx_t *ctx)
 {
+    if (ctx == NULL) {
+        return false;
+    }
     if (!atomic_load_explicit(&g_exec_retiring, memory_order_acquire)) {
         return false;
     }
-    return (sparc32_ctx_t *)atomic_load_explicit(&g_exec_survivor,
-        memory_order_acquire) != ctx;
+    return thr_retired_contains(ctx);
 }
 
 void sparc32_thr_exec_retire_wait(sparc32_ctx_t *survivor)
@@ -382,8 +491,11 @@ void sparc32_thr_exec_retire_wait(sparc32_ctx_t *survivor)
     /* Bounded wait (~2 s): siblings poll out on their own; a thread
      * stuck in a host blocking call cannot observe the flag, so the
      * transaction must still commit. Leftovers are deregistered (never
-     * freed here) so the new image owns a clean registry; a late
-     * sibling faults out through its stale mapping and exits. */
+     * freed here) so the new image owns a clean registry — but their
+     * sticky retirement marks are kept, so a late sibling still exits
+     * through the retire path instead of running its old PC against
+     * the new image. Only fork_child (a fresh process) resets the
+     * marks and the retiring flag. */
     struct timespec ts;
     int tries;
     size_t n;
@@ -412,8 +524,6 @@ void sparc32_thr_exec_retire_wait(sparc32_ctx_t *survivor)
         }
     }
     pthread_mutex_unlock(&thr_live_lock);
-    atomic_store_explicit(&g_exec_retiring, false, memory_order_release);
-    atomic_store_explicit(&g_exec_survivor, 0U, memory_order_release);
 }
 
 static long thr_wait_common(sparc32_ctx_t *ctx, uint32_t pid,
@@ -518,6 +628,13 @@ static void *thr_thread_entry(void *arg)
             return NULL;
         }
         while (ctx->exit_reason == SPARC32_EXIT_NONE) {
+            /* Inner-loop retire poll (S32-R3-4 follow-up #4): a
+             * compute-bound sibling never reaches a syscall, so the
+             * outer-loop check alone would never fire. */
+            if (sparc32_thr_is_retired(ctx)) {
+                thr_thread_finish(st, 0L);
+                return NULL;
+            }
             interp_step(ctx);
             if (ctx->exit_reason != SPARC32_EXIT_NONE) {
                 break;
@@ -672,190 +789,6 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
     return child_tid;
 }
 
-/* Self-directed process signal (S32-R3-7): the signal is
- * process-directed, so it joins the process queue for single-winner
- * claiming at the next safe point (late delivery: the dispatch tail
- * already committed this syscall's return). Ignored signals are
- * discarded; default dispositions were already applied by the host
- * (kill() above ran with the mirrored host disposition). */
-static long thr_kill_self(sparc32_ctx_t *ctx, int sig)
-{
-    if (sparc32_signal_disposition(sig) == SPARC32_SIG_DISP_IGN) {
-        sparc32_thr_discard_signal(ctx, sig);
-        return 0;
-    }
-    sparc32_thr_note_signal(sig);
-    return 0;
-}
-
-static bool thr_is_self(uint32_t pid)
-{
-    pid_t self = getpid();
-    return pid == 0U || pid == (uint32_t)self || pid == 0xFFFFFFFFU;
-}
-
-long sparc32_thr_kill(sparc32_ctx_t *ctx, uint32_t pid, uint32_t sig)
-{
-    sparc32_threads_ensure_init(ctx);
-    if (ctx == NULL) {
-        return -EFAULT;
-    }
-    if (sig > 64U) {
-        return -EINVAL;
-    }
-    if (sig != 0U && kill((pid_t)(int32_t)pid, (int)sig) != 0) {
-        return -(long)errno;
-    }
-    if (sig != 0U && thr_is_self(pid)) {
-        return thr_kill_self(ctx, (int)sig);
-    }
-    return 0;
-}
-
-/* Thread-directed delivery (S32-R3-7): the bit lands on the target
- * context only. A host wakeup follows (same signal number) so a
- * target parked in sigsuspend observes it; the safe-point poll
- * dedups the wakeup's process bit against the thread bit and still
- * delivers exactly once. Ignored signals never wake; default
- * dispositions go through the real host call so the kernel acts. */
-static long thr_kill_tid(sparc32_ctx_t *ctx, uint32_t tgid,
-    uint32_t tid, uint32_t sig)
-{
-    long rc = 0;
-    sparc32_ctx_t *target = NULL;
-    size_t i;
-    if (sig > 64U) {
-        return -EINVAL;
-    }
-    if (sig == 0U) {
-        /* Existence check only. */
-        pthread_mutex_lock(&thr_live_lock);
-        for (i = 0U; i < THR_MAX_LIVE; i++) {
-            sparc32_ctx_t *c = __atomic_load_n(&thr_live[i],
-                __ATOMIC_ACQUIRE);
-            if (c != NULL && (c->host_tid == (int32_t)tid ||
-                    ((int32_t)tid == thr_gettid() && c == ctx))) {
-                target = c;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&thr_live_lock);
-        if (target != NULL) {
-            return 0;
-        }
-#if defined(__linux__) && defined(SYS_tgkill)
-        rc = syscall(SYS_tgkill, (pid_t)(int32_t)tgid, (pid_t)(int32_t)tid,
-            0);
-        return (rc == 0) ? 0 : -(long)errno;
-#else
-        return -ESRCH;
-#endif
-    }
-    pthread_mutex_lock(&thr_live_lock);
-    for (i = 0U; i < THR_MAX_LIVE; i++) {
-        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i], __ATOMIC_ACQUIRE);
-        if (c != NULL && (c->host_tid == (int32_t)tid ||
-                ((int32_t)tid == thr_gettid() && c == ctx))) {
-            target = c;
-            break;
-        }
-    }
-    if (target != NULL) {
-        int disp = sparc32_signal_disposition((int)sig);
-        if (disp == SPARC32_SIG_DISP_IGN) {
-            uint64_t bit = sparc32_thr_sigbit((int)sig);
-            __atomic_fetch_and(&target->pending_signals, ~bit,
-                __ATOMIC_ACQ_REL);
-            pthread_mutex_unlock(&thr_live_lock);
-            return 0;
-        }
-        if (disp == SPARC32_SIG_DISP_CAUGHT) {
-            __atomic_fetch_or(&target->pending_signals, sparc32_thr_sigbit((int)sig),
-                __ATOMIC_RELEASE);
-        }
-    }
-    pthread_mutex_unlock(&thr_live_lock);
-    if (target == NULL) {
-#if defined(__linux__) && defined(SYS_tgkill)
-        rc = syscall(SYS_tgkill, (pid_t)(int32_t)tgid, (pid_t)(int32_t)tid,
-            (int)sig);
-#elif defined(__linux__) && defined(SYS_tkill)
-        (void)tgid;
-        rc = syscall(SYS_tkill, (pid_t)(int32_t)tid, (int)sig);
-#else
-        (void)tgid;
-        rc = kill((pid_t)(int32_t)tid, (int)sig);
-#endif
-        if (rc != 0) {
-            return -(long)errno;
-        }
-        return 0;
-    }
-    if (sparc32_signal_disposition((int)sig) == SPARC32_SIG_DISP_CAUGHT &&
-        target != ctx) {
-        /* Wakeup for a target that may park in sigsuspend. The
-         * handler only sets the process bit; the poll dedups it
-         * against the thread bit above. */
-#if defined(__linux__) && defined(SYS_tgkill)
-        (void)syscall(SYS_tgkill, (pid_t)(int32_t)tgid,
-            (pid_t)target->host_tid, (int)sig);
-#elif defined(__linux__) && defined(SYS_tkill)
-        (void)syscall(SYS_tkill, (pid_t)target->host_tid, (int)sig);
-#else
-        (void)kill(getpid(), (int)sig);
-#endif
-        if ((int32_t)tid == thr_gettid()) {
-            return thr_kill_self(ctx, (int)sig);
-        }
-    } else if ((int32_t)tid == thr_gettid()) {
-        return thr_kill_self(ctx, (int)sig);
-    }
-    return 0;
-}
-
-long sparc32_thr_gettid(sparc32_ctx_t *ctx)
-{
-    sparc32_threads_ensure_init(ctx);
-    if (ctx == NULL) {
-        return -EFAULT;
-    }
-    if (ctx->host_tid <= 0) {
-        ctx->host_tid = thr_gettid();
-    }
-    return (long)ctx->host_tid;
-}
-
-long sparc32_thr_tkill(sparc32_ctx_t *ctx, uint32_t tid, uint32_t sig)
-{
-    sparc32_threads_ensure_init(ctx);
-    if (ctx == NULL) {
-        return -EFAULT;
-    }
-    return thr_kill_tid(ctx, (uint32_t)getpid(), tid, sig);
-}
-
-long sparc32_thr_tgkill(sparc32_ctx_t *ctx, uint32_t tgid, uint32_t tid,
-    uint32_t sig)
-{
-    sparc32_threads_ensure_init(ctx);
-    if (ctx == NULL) {
-        return -EFAULT;
-    }
-    return thr_kill_tid(ctx, tgid, tid, sig);
-}
-
-/* set_tid_address(166) completion: record + real tid + one-time async
- * init, so plain static binaries get async coverage without any other
- * L4a syscall. */
-long sparc32_thr_set_tid_address(sparc32_ctx_t *ctx, uint32_t tidptr_va)
-{
-    sparc32_threads_ensure_init(ctx);
-    if (ctx == NULL) {
-        return -EFAULT;
-    }
-    ctx->clear_child_tid = tidptr_va;
-    if (ctx->host_tid <= 0) {
-        ctx->host_tid = thr_gettid();
-    }
-    return (long)ctx->host_tid;
-}
+/* The kill family (kill/tkill/tgkill, gettid, set_tid_address)
+ * lives in threads_kill.c (split for the 900-line file discipline);
+ * it shares the registry above through thr_live_enter/leave/find. */

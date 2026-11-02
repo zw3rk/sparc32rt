@@ -563,3 +563,24 @@ long sparc32_sys_rt_sigreturn(sparc32_ctx_t *ctx)
     }
     return sigreturn_restore_common(ctx, base, pc, npc);
 }
+
+/* Fork coordination (S32-R3-2 follow-up #3): the child inherits this
+ * mutex held across fork() (a sibling inside rt_sigaction at fork
+ * time), so the survivor owns and then rebuilds it. The table itself
+ * survives through COW, matching Linux. */
+void sparc32_signal_fork_prepare(void)
+{
+    pthread_mutex_lock(&sigact_lock);
+}
+
+void sparc32_signal_fork_parent(void)
+{
+    pthread_mutex_unlock(&sigact_lock);
+}
+
+void sparc32_signal_fork_child(void)
+{
+    pthread_mutex_unlock(&sigact_lock);
+    pthread_mutex_destroy(&sigact_lock);
+    pthread_mutex_init(&sigact_lock, NULL);
+}

@@ -66,13 +66,27 @@ void sparc32_fd_note_close(int fd)
 
 void sparc32_fd_note_dup2(int oldfd, int newfd)
 {
-    /* dup2/dup3 clear CLOEXEC on the target (Linux): the target stays
-     * tracked (it is guest-owned) but no longer close-on-exec. */
     if (newfd < 0 || newfd >= THR_FD_TRACK_MAX) {
         return;
     }
-    (void)oldfd;
     pthread_mutex_lock(&thr_fd_lock);
+    if (oldfd == newfd) {
+        /* dup2(fd, fd) is a no-op that keeps CLOEXEC (Linux): leave a
+         * tracked flag alone, and adopt the host flag when the
+         * descriptor was never tracked (S32-R3-9 follow-up #6). */
+        if (thr_fd_used[newfd] == 0U) {
+            int flags = fcntl(newfd, F_GETFD);
+            if (flags >= 0) {
+                thr_fd_used[newfd] = 1U;
+                thr_fd_cloexec[newfd] =
+                    ((flags & FD_CLOEXEC) != 0) ? 1U : 0U;
+            }
+        }
+        pthread_mutex_unlock(&thr_fd_lock);
+        return;
+    }
+    /* dup2/dup3 clear CLOEXEC on the target (Linux): the target stays
+     * tracked (it is guest-owned) but no longer close-on-exec. */
     thr_fd_used[newfd] = 1U;
     thr_fd_cloexec[newfd] = 0U;
     pthread_mutex_unlock(&thr_fd_lock);
@@ -90,6 +104,53 @@ void sparc32_fd_note_set_cloexec(int fd, bool cloexec)
         thr_fd_cloexec[fd] = cloexec ? 1U : 0U;
     }
     pthread_mutex_unlock(&thr_fd_lock);
+}
+
+/* Register inherited descriptors 0..2 as guest-owned (once), so a
+ * later F_SETFD on stdio is honoured at exec (S32-R3-9 follow-up #6).
+ * Runs at translator startup through sparc32_threads_ensure_init;
+ * descriptors already closed stay untracked. */
+void sparc32_fd_ensure_init(void)
+{
+    static bool done = false;
+    int fd;
+    pthread_mutex_lock(&thr_fd_lock);
+    if (done) {
+        pthread_mutex_unlock(&thr_fd_lock);
+        return;
+    }
+    for (fd = 0; fd <= 2; fd++) {
+        if (thr_fd_used[fd] == 0U) {
+            int flags = fcntl(fd, F_GETFD);
+            if (flags >= 0) {
+                thr_fd_used[fd] = 1U;
+                thr_fd_cloexec[fd] =
+                    ((flags & FD_CLOEXEC) != 0) ? 1U : 0U;
+            }
+        }
+    }
+    done = true;
+    pthread_mutex_unlock(&thr_fd_lock);
+}
+
+/* Fork coordination (S32-R3-2 follow-up #3): the child inherits this
+ * mutex held across fork(), so the survivor owns and then rebuilds
+ * it. The table itself survives through COW, matching Linux. */
+void sparc32_fd_fork_prepare(void)
+{
+    pthread_mutex_lock(&thr_fd_lock);
+}
+
+void sparc32_fd_fork_parent(void)
+{
+    pthread_mutex_unlock(&thr_fd_lock);
+}
+
+void sparc32_fd_fork_child(void)
+{
+    pthread_mutex_unlock(&thr_fd_lock);
+    pthread_mutex_destroy(&thr_fd_lock);
+    pthread_mutex_init(&thr_fd_lock, NULL);
 }
 
 void sparc32_fd_cloexec_sweep(void)

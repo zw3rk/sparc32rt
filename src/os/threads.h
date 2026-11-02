@@ -26,14 +26,6 @@
  * exact blocked-mask format, so per-thread ctx->sig_mask is the whole
  * mask (S32-R3-5: no process-global merge).
  */
-static inline uint64_t sparc32_thr_sigbit(int sig)
-{
-    uint64_t bit = 1ULL << (uint64_t)((uint32_t)(sig - 1) % 32U);
-    if ((uint32_t)sig <= 32U) {
-        bit <<= 32U;
-    }
-    return bit;
-}
 
 #ifndef SPARC32RT_OS_THREADS_H
 #define SPARC32RT_OS_THREADS_H
@@ -43,6 +35,15 @@ static inline uint64_t sparc32_thr_sigbit(int sig)
 #include <stdint.h>
 
 #include "sparc32rt.h"
+
+static inline uint64_t sparc32_thr_sigbit(int sig)
+{
+    uint64_t bit = 1ULL << (uint64_t)((uint32_t)(sig - 1) % 32U);
+    if ((uint32_t)sig <= 32U) {
+        bit <<= 32U;
+    }
+    return bit;
+}
 
 /* clone(217) flags (Linux arch-independent values; tls arrives in o3). */
 #define THR_CLONE_VM 0x00000100U
@@ -85,6 +86,20 @@ long sparc32_thr_gettid(sparc32_ctx_t *ctx);
  * coverage without issuing any other L4a syscall). Host dispositions
  * are installed lazily by rt_sigaction; ensure_init only registers. */
 void sparc32_threads_ensure_init(sparc32_ctx_t *ctx);
+
+/* Live-registry lock + lookup shared by the threads_*.c splits (the
+ * kill family lives in threads_kill.c). A pointer from
+ * thr_live_find_locked is valid only until thr_live_leave: the target
+ * may exit and free its context as soon as the lock is released, so
+ * callers copy what they need (host_tid) and never dereference the
+ * pointer after unlock (S32-R3-1 follow-up #2). */
+void thr_live_enter(void);
+void thr_live_leave(void);
+sparc32_ctx_t *thr_live_find_locked(int32_t want_tid, int32_t self_tid,
+    const sparc32_ctx_t *self);
+
+/* Real kernel TID of the calling host thread (shared by the splits). */
+int thr_gettid(void);
 
 /* Async host handler (installed per caught signal by rt_sigaction):
  * sets the process-pending bit. Never touches live contexts. */
@@ -147,6 +162,21 @@ void sparc32_fd_note_close(int fd);
 void sparc32_fd_note_dup2(int oldfd, int newfd);
 void sparc32_fd_note_set_cloexec(int fd, bool cloexec);
 void sparc32_fd_cloexec_sweep(void);
+
+/* One-time registration of inherited descriptors 0..2 as guest-owned
+ * so F_SETFD on them is honoured at exec (S32-R3-9 follow-up #6). */
+void sparc32_fd_ensure_init(void);
+
+/* Fork child/parent hooks owned by the sigact (syscalls_sig.c) and
+ * guest-FD (threads_fd.c) tables: the child inherits every
+ * process-wide mutex held across fork(), so the survivor owns and
+ * then reinitializes each one (S32-R3-2 follow-up #3). */
+void sparc32_signal_fork_prepare(void);
+void sparc32_signal_fork_parent(void);
+void sparc32_signal_fork_child(void);
+void sparc32_fd_fork_prepare(void);
+void sparc32_fd_fork_parent(void);
+void sparc32_fd_fork_child(void);
 
 /* setitimer(83): ITIMER_REAL one-shot via host setitimer; VIRTUAL/PROF
  * return -EINVAL (RC4 scope). SIGALRM lands via the host handler. */
