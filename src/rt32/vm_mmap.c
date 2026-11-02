@@ -570,3 +570,59 @@ uint32_t rt32_vm_mremap(sparc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
         }
     }
 }
+
+/* Reserve [start, start+len) as PROT_NONE without touching the region
+ * table (moved from vm.c for the 900-line discipline). */
+int vm_reserve_prot_none(sparc32_ctx_t *ctx, uint32_t start, uint32_t len)
+{
+    size_t hp = vm_host_page_size();
+    void *res;
+    if (hp > (size_t)SPARC32_PAGE_SIZE) {
+        uint32_t mask = (uint32_t)hp - 1U;
+        uint32_t in_start = (start + mask) & ~mask;
+        uint32_t in_end   = (start + len) & ~mask;
+        if (in_end > in_start) {
+            (void)mprotect(sparc32_guest_ptr(ctx, in_start),
+                           (size_t)(in_end - in_start), PROT_NONE);
+        }
+        return 0;
+    }
+    res = mmap(sparc32_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (res == MAP_FAILED) {
+        return -errno;
+    }
+    return 0;
+}
+
+/* Exec teardown (S32-R3-4): drop every tracked region (no persistent
+ * vDSO page, so exec clears the whole table; the stack setup path
+ * re-registers what the new image needs). The whole replacement stays
+ * under the writer lock: vm_lock_acquire already quiesced DBT runners,
+ * so no generated access is in flight while the old window is
+ * destroyed, and no concurrent mapper can observe the torn table.
+ * Cached translations for the destroyed image are retired after the
+ * lock drops (the new image reuses the same VAs, so stale blocks must
+ * not survive). */
+void rt32_vm_reset_for_exec(sparc32_ctx_t *ctx)
+{
+    vm_lock_acquire();
+    vm_reset_table_locked();
+
+    /* Kernel exec semantics: the old address space is destroyed. Reset
+     * the window back to PROT_NONE while keeping [G, G+4GiB) reserved. */
+    (void)mmap(sparc32_guest_ptr(ctx, SPARC32_LOW_GUARD_SIZE),
+               (size_t)(RT32_WINDOW_SIZE - (uint64_t)SPARC32_LOW_GUARD_SIZE),
+               PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    vm32_reset();
+    vm_lock_release();
+
+    vm_invalidate_jit(ctx, SPARC32_LOW_GUARD_SIZE, 0xFFFFFFFFU);
+
+    ctx->brk_base    = 0U;
+    ctx->brk_curr    = 0U;
+    ctx->mmap_cursor = RT32_MMAP_BASE_32;
+    ctx->region_count = 0U;
+    (void)rt32_vm_record_region(ctx, 0U, SPARC32_LOW_GUARD_SIZE,
+                                0U, 0x32U, "[null_guard]");
+}

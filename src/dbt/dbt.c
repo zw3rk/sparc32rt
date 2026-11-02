@@ -489,6 +489,11 @@ int dbt_run(sparc32_ctx_t *ctx)
     for (;;) {
         const dbt_block_t *b = dbt_lookup(ctx, ctx->pc);
         int r;
+        /* Exec retire (S32-R3-4): a sibling's execve replaced the
+         * image; leave through the retire path, never the old code. */
+        if (sparc32_thr_is_retired(ctx)) {
+            sparc32_thr_self_retire(ctx);
+        }
         if (b == NULL) {
             if (ctx->exit_reason == SPARC32_EXIT_NONE) {
                 ctx->exit_reason = SPARC32_EXIT_FAULT;
@@ -496,7 +501,7 @@ int dbt_run(sparc32_ctx_t *ctx)
             }
             return (int)ctx->exit_reason;
         }
-        if (ctx->pending_signals != 0U && interp_poll_async(ctx)) {
+        if (sparc32_thr_has_pending(ctx) && interp_poll_async(ctx)) {
             continue;
         }
         r = dbt_exec_enter(ctx, b, true);
@@ -525,7 +530,7 @@ int dbt_step(sparc32_ctx_t *ctx)
     }
     entry_pc = ctx->pc;
     ctx->exit_reason = SPARC32_EXIT_NONE;
-    if (ctx->pending_signals != 0U && interp_poll_async(ctx)) {
+    if (sparc32_thr_has_pending(ctx) && interp_poll_async(ctx)) {
         return (int)ctx->exit_reason;
     }
     dbt_lock_acquire();

@@ -51,6 +51,13 @@ void dbt_lock_release(void);
 void dbt_runner_enter_locked(void);
 void dbt_runner_leave(void);
 
+/* VM-mutation quiescence + coordinated fork (S32-R3-2, S32-R3-3). */
+void dbt_quiesce_begin(void);
+void dbt_quiesce_end(void);
+void dbt_fork_prepare(void);
+void dbt_fork_parent(void);
+void dbt_fork_child_reset(void);
+
 uint32_t *dbt_code_reserve_locked(sparc32_ctx_t *ctx, size_t n_words);
 int dbt_code_publish_locked(sparc32_ctx_t *ctx);
 void dbt_flush_locked(sparc32_ctx_t *ctx);

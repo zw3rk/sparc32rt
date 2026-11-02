@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -24,6 +25,7 @@
 #include "os/l2a_access.h"
 #include "os/sigframe_sparc32rt.h"
 #include "os/syscalls_min.h"
+#include "os/threads.h"
 
 #define SP_FIONREAD 0x4004667fU
 #define SP_TCGETS 0x80245408U
@@ -33,25 +35,18 @@
 long sparc32_l2a_futex_emu32(sparc32_ctx_t *ctx, uint32_t uaddr,
     uint32_t op, uint32_t val, uint32_t timeout_va);
 
-static uint32_t l2a_blocked[2] = { 0U, 0U };
-
-/* Unblockable signals on SPARC Linux: SIGKILL (9 -> bit 8) and
- * SIGSTOP (17 -> bit 16) in the high 32-bit word (signals 1..32). */
-#define SP_UNBLOCKABLE_HI ((1U << 8) | (1U << 16))
-
+/* Blocked-mask ownership (S32-R3-5): the mask is per-thread state in
+ * ctx->sig_mask. Unblockable signals (SIGKILL=9, SIGSTOP=17) are
+ * stripped on every write. */
 uint64_t sparc32_l2a_blocked_mask(void)
 {
-    return ((uint64_t)l2a_blocked[0] << 32) | (uint64_t)l2a_blocked[1];
+    return 0ULL;
 }
 
 void sparc32_l2a_set_blocked_mask(sparc32_ctx_t *ctx, uint64_t mask)
 {
-    uint32_t hi = (uint32_t)(mask >> 32U) & ~SP_UNBLOCKABLE_HI;
-    uint32_t lo = (uint32_t)mask;
-    l2a_blocked[0] = hi;
-    l2a_blocked[1] = lo;
     if (ctx != NULL) {
-        ctx->sig_mask = ((uint64_t)hi << 32U) | (uint64_t)lo;
+        ctx->sig_mask = sparc32_thr_mask_sanitize(mask);
     }
 }
 
@@ -313,27 +308,37 @@ long sparc32_l2a_futex(sparc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
 long sparc32_l2a_rt_sigprocmask(sparc32_ctx_t *ctx, uint32_t how,
     uint32_t set_va, uint32_t oset_va, uint32_t sigsetsize)
 {
+    /* Snapshot the whole input set before writing any old-set output:
+     * set_va and oset_va may alias or overlap, so the input words are
+     * loaded into locals first and no store runs until parsing ends. */
     uint8_t old[8];
     uint64_t cur;
+    bool have_set = false;
+    uint64_t n = 0ULL;
+    if (ctx == NULL) {
+        return -EFAULT;
+    }
     if (sigsetsize != 8U) {
         return -EINVAL;
     }
     if (oset_va != 0U && l2a_range_ok_prot(oset_va, sizeof(old), 2U) != 0) {
         return -EFAULT;
     }
-    cur = sparc32_l2a_blocked_mask();
-    if (ctx != NULL) {
-        cur |= ctx->sig_mask;
-    }
-    put_be32(old, (uint32_t)(cur >> 32U));
-    put_be32(old + 4, (uint32_t)cur);
     if (set_va != 0U) {
         uint8_t p[8];
-        uint64_t n;
         if (l2a_load(ctx, set_va, p, sizeof(p)) != 0) {
             return -EFAULT;
         }
         n = ((uint64_t)get_be32(p) << 32U) | (uint64_t)get_be32(p + 4);
+        have_set = true;
+    } else if (how != SPARC_SIG_BLOCK && how != SPARC_SIG_UNBLOCK &&
+        how != SPARC_SIG_SETMASK) {
+        return -EINVAL;
+    }
+    cur = ctx->sig_mask;
+    put_be32(old, (uint32_t)(cur >> 32U));
+    put_be32(old + 4, (uint32_t)cur);
+    if (have_set) {
         switch (how) {
         case SPARC_SIG_BLOCK: cur |= n; break;
         case SPARC_SIG_UNBLOCK: cur &= ~n; break;
@@ -341,9 +346,6 @@ long sparc32_l2a_rt_sigprocmask(sparc32_ctx_t *ctx, uint32_t how,
         default: return -EINVAL;
         }
         sparc32_l2a_set_blocked_mask(ctx, cur);
-    } else if (how != SPARC_SIG_BLOCK && how != SPARC_SIG_UNBLOCK &&
-        how != SPARC_SIG_SETMASK) {
-        return -EINVAL;
     }
     return (oset_va != 0U) ? l2a_store(ctx, oset_va, old, sizeof(old)) : 0;
 }

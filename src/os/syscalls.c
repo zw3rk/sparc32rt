@@ -38,6 +38,7 @@
 #include "os/sigframe_sparc32rt.h"
 #include "os/syscall_nr.h"
 #include "os/syscalls_min.h"
+#include "os/threads.h"
 #include "rt32/procfs.h"
 
 /* SPARC open flags (arch/sparc fcntl.h); low 2 access bits match hosts. */
@@ -251,13 +252,22 @@ static long sys_openat(sparc32_ctx_t *ctx, int32_t dirfd, uint32_t path_va,
 long sparc32_l2a_openat(sparc32_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
     uint32_t flags, uint32_t mode)
 {
-    return sys_openat(ctx, (int32_t)dirfd, path_va, flags, mode);
+    /* Successful guest opens join the close-on-exec table (S32-R3-9). */
+    long rc = sys_openat(ctx, (int32_t)dirfd, path_va, flags, mode);
+    if (rc >= 0) {
+        sparc32_fd_note_open((int)rc, (flags & SP_O_CLOEXEC) != 0U);
+    }
+    return rc;
 }
 
 long sparc32_l2a_open(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t flags,
     uint32_t mode)
 {
-    return sys_openat(ctx, SP_AT_FDCWD, path_va, flags, mode);
+    long rc = sys_openat(ctx, SP_AT_FDCWD, path_va, flags, mode);
+    if (rc >= 0) {
+        sparc32_fd_note_open((int)rc, (flags & SP_O_CLOEXEC) != 0U);
+    }
+    return rc;
 }
 
 long sparc32_l2a_creat(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t mode)
@@ -270,12 +280,20 @@ long sparc32_l2a_creat(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t mode)
     }
     fd = openat(AT_FDCWD, path, O_CREAT | O_WRONLY | O_TRUNC,
         (mode_t)(mode & 0777U));
-    return (fd < 0) ? -(long)errno : (long)fd;
+    if (fd < 0) {
+        return -(long)errno;
+    }
+    sparc32_fd_note_open(fd, false);
+    return (long)fd;
 }
 
 long sparc32_l2a_close(int fd)
 {
-    return (close(fd) != 0) ? -(long)errno : 0;
+    if (close(fd) != 0) {
+        return -(long)errno;
+    }
+    sparc32_fd_note_close(fd);
+    return 0;
 }
 
 long sparc32_l2a_unlink(sparc32_ctx_t *ctx, uint32_t path_va)
@@ -334,20 +352,6 @@ long sparc32_l2a_getegid(void)
 long sparc32_l2a_getppid(void)
 {
     return (long)getppid();
-}
-
-/* R2: dup/dup2 over host fds (the oracle implements both; both engines
- * returned ENOSYS before dispatch existed). */
-long sparc32_l2a_dup(uint32_t fd)
-{
-    int rc = dup((int)(int32_t)fd);
-    return (rc < 0) ? -(long)errno : (long)rc;
-}
-
-long sparc32_l2a_dup2(uint32_t oldfd, uint32_t newfd)
-{
-    int rc = dup2((int)(int32_t)oldfd, (int)(int32_t)newfd);
-    return (rc < 0) ? -(long)errno : (long)rc;
 }
 
 /* readv/writev over guest iovec chains ({BE base, BE len} x iovcnt). */
@@ -840,12 +844,21 @@ long sparc32_l2a_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg)
     switch (cmd) {
     case SP_F_DUPFD:
         rc = fcntl((int)fd, F_DUPFD, (int)arg);
-        return (rc < 0) ? -(long)errno : (long)rc;
+        if (rc < 0) {
+            return -(long)errno;
+        }
+        sparc32_fd_note_open(rc, false);
+        return (long)rc;
     case SP_F_GETFD:
         rc = fcntl((int)fd, F_GETFD);
         return (rc < 0) ? -(long)errno : (long)rc;
     case SP_F_SETFD:
-        return (fcntl((int)fd, F_SETFD, (int)arg) != 0) ? -(long)errno : 0;
+        /* Guest FD_CLOEXEC is bit 0, matching the host (S32-R3-9). */
+        if (fcntl((int)fd, F_SETFD, (int)arg) != 0) {
+            return -(long)errno;
+        }
+        sparc32_fd_note_set_cloexec((int)fd, ((int)arg & FD_CLOEXEC) != 0);
+        return 0;
     case SP_F_GETFL:
         rc = fcntl((int)fd, F_GETFL);
         return (rc < 0) ? -(long)errno : flags_host_to_guest(rc);

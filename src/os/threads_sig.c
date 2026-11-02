@@ -1,5 +1,6 @@
 /*
- * src/os/threads_sig.c — Pending-signal, sigsuspend, and itimer syscalls
+ * src/os/threads_sig.c — Signal syscalls: pending-signal, sigsuspend,
+ * itimer, and the per-thread blocked-mask helpers
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
@@ -22,10 +23,10 @@
 #include "os/syscalls_min.h"
 #include "os/threads.h"
 
-extern uint64_t sparc32_l2a_blocked_mask(void);
-
 /* rt_sigpending(104): kernel-layout BE quad (signals 1..32 in the high
- * word). sigsetsize must be 8 (E05 rule). */
+ * word). sigsetsize must be 8 (E05 rule). Reports the thread bits plus
+ * the unclaimed process queue (S32-R3-7): anything neither delivered
+ * nor discarded yet. */
 long sparc32_thr_rt_sigpending(sparc32_ctx_t *ctx, uint32_t set_va,
     uint32_t sigsetsize)
 {
@@ -38,7 +39,8 @@ long sparc32_thr_rt_sigpending(sparc32_ctx_t *ctx, uint32_t set_va,
     if (sigsetsize != 8U) {
         return -EINVAL;
     }
-    p = __atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE);
+    p = __atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE) |
+        sparc32_thr_process_pending();
     put_be64(out, p);
     if (set_va != 0U) {
         return (long)l2a_store(ctx, set_va, out, sizeof(out));
@@ -69,7 +71,8 @@ long sparc32_thr_rt_sigsuspend(sparc32_ctx_t *ctx, uint32_t set_va,
         return -EFAULT;
     }
     n = ((uint64_t)get_be32(buf) << 32U) | (uint64_t)get_be32(buf + 4);
-    old = ctx->sig_mask | sparc32_l2a_blocked_mask();
+    /* Per-thread mask only (S32-R3-5): no process-global merge. */
+    old = ctx->sig_mask;
     sparc32_l2a_set_blocked_mask(ctx, n);
     sigfillset(&block_set);
     sigdelset(&block_set, SIGBUS);
@@ -79,6 +82,7 @@ long sparc32_thr_rt_sigsuspend(sparc32_ctx_t *ctx, uint32_t set_va,
     sigemptyset(&wait_host_set);
     (void)sigprocmask(SIG_SETMASK, &block_set, &old_host_set);
     for (;;) {
+        /* Phase 1: own thread bits (S32-R3-7). */
         for (s = 1; s <= 64; s++) {
             uint64_t bit = 1ULL << (uint64_t)((uint32_t)(s - 1) % 32U);
             uint32_t handler;
@@ -100,9 +104,34 @@ long sparc32_thr_rt_sigsuspend(sparc32_ctx_t *ctx, uint32_t set_va,
             }
             sparc32_l2a_set_blocked_mask(ctx, old);
             (void)sigprocmask(SIG_SETMASK, &old_host_set, NULL);
+            (void)sparc32_thr_claim_global(s);
             if (!interp_deliver_async_for_syscall(ctx, s, true)) {
                 __atomic_fetch_and(&ctx->pending_signals, ~bit,
                     __ATOMIC_ACQ_REL);
+                return -EINTR;
+            }
+            return 0;
+        }
+        /* Phase 2: single-winner process claims (S32-R3-7); echoes
+         * owned by another thread bit stay with their owner. */
+        for (s = 1; s <= 64; s++) {
+            uint32_t handler;
+            uint32_t restorer;
+            if (sparc32_thr_sig_blocked(ctx, s) != 0) {
+                continue;
+            }
+            if (!sparc32_thr_claim_global(s)) {
+                continue;
+            }
+            if (sparc32_signal_get(s, &handler, &restorer) != 0) {
+                continue;
+            }
+            if (sparc32_thr_thread_has_pending(s)) {
+                continue;
+            }
+            sparc32_l2a_set_blocked_mask(ctx, old);
+            (void)sigprocmask(SIG_SETMASK, &old_host_set, NULL);
+            if (!interp_deliver_async_for_syscall(ctx, s, true)) {
                 return -EINTR;
             }
             return 0;
@@ -155,4 +184,40 @@ long sparc32_thr_setitimer(sparc32_ctx_t *ctx, uint32_t which,
         return (long)l2a_store(ctx, old_va, op, sizeof(op));
     }
     return 0;
+}
+
+/* Per-thread blocked-mask helpers over ctx->sig_mask (kernel layout;
+ * moved from threads.c for the 900-line discipline). */
+uint64_t sparc32_thr_mask_sanitize(uint64_t mask)
+{
+    /* SIGKILL (9) and SIGSTOP (17) are unblockable SPARC signals. */
+    mask &= ~sparc32_thr_sigbit(9);
+    mask &= ~sparc32_thr_sigbit(17);
+    return mask;
+}
+
+int sparc32_thr_sig_blocked(const sparc32_ctx_t *ctx, int sig)
+{
+    uint64_t m;
+    uint32_t w;
+    if (ctx == NULL || sig < 1 || sig > 64) {
+        return 0;
+    }
+    m = ctx->sig_mask;
+    w = ((uint32_t)sig <= 32U) ? (uint32_t)(m >> 32U) : (uint32_t)m;
+    return (int)((w >> ((uint32_t)(sig - 1) % 32U)) & 1U);
+}
+
+void sparc32_thr_sig_set(sparc32_ctx_t *ctx, int sig, bool blocked)
+{
+    uint64_t bit;
+    if (ctx == NULL || sig < 1 || sig > 64) {
+        return;
+    }
+    bit = sparc32_thr_sigbit(sig);
+    if (blocked) {
+        ctx->sig_mask |= bit;
+    } else {
+        ctx->sig_mask &= ~bit;
+    }
 }

@@ -14,12 +14,10 @@ RC1 subset of Phase-4 signals: rt_signal_frame32 construction for
 #include "interp/interp_priv.h"
 #include "os/sigframe_sparc32rt.h"
 #include "os/syscalls_min.h"
+#include "os/threads.h"
 
 #include <stddef.h>
 #include <stdint.h>
-
-/* Process-global mask owned by src/os/syscalls_time.c. */
-extern uint64_t sparc32_l2a_blocked_mask(void);
 
 /* Synchronous fault delivery. Builds the frozen kernel-order
  * rt_signal_frame32 (344 B) + inline sigfpu32 tail (136 B) on the guest
@@ -55,9 +53,11 @@ static uint32_t interp_delivery_sp(sparc32_ctx_t *ctx, uint32_t flags)
         uint32_t asp;
         uint32_t asize;
         int onstack;
-        if (sparc32_sigaltstack_state(&asp, &asize, &onstack) == 0 &&
+        /* Per-thread alternate stack (S32-R3-5): the owning context's
+         * stack only; another thread's stack is never borrowed. */
+        if (sparc32_sigaltstack_state_ctx(ctx, &asp, &asize, &onstack) == 0 &&
             !onstack) {
-            sparc32_sigaltstack_set_onstack(1);
+            sparc32_sigaltstack_set_onstack_ctx(ctx, 1);
             sp = asp + asize;
         }
     }
@@ -84,8 +84,8 @@ static bool interp_frame_fpu(sparc32_ctx_t *ctx, uint32_t fpu_va)
 static void interp_apply_delivery_mask(sparc32_ctx_t *ctx, int signo,
     uint32_t flags, uint64_t sa_mask)
 {
-    uint64_t cur = ctx->sig_mask | sparc32_l2a_blocked_mask();
-    uint64_t next = cur | sa_mask;
+    /* Per-thread mask only (S32-R3-5): no process-global merge. */
+    uint64_t next = ctx->sig_mask | sa_mask;
     if ((flags & (SPARC32_SA_NODEFER | 0x40000000U)) == 0U &&
         signo >= 1 && signo <= 64) {
         uint64_t bit = 1ULL << (uint64_t)((uint32_t)(signo - 1) % 32U);
@@ -108,7 +108,7 @@ static bool interp_frame_stack(sparc32_ctx_t *ctx, uint32_t frame)
     uint32_t qsp;
     uint32_t qsize;
     int onstack;
-    if (sparc32_sigaltstack_state(&qsp, &qsize, &onstack) == 0) {
+    if (sparc32_sigaltstack_state_ctx(ctx, &qsp, &qsize, &onstack) == 0) {
         asp = qsp;
         asize = qsize;
         aflags = (onstack != 0) ? SPARC32_SS_ONSTACK : 0U;
@@ -171,7 +171,8 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
             SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE, 2U)) {
         return false;
     }
-    old_mask = ctx->sig_mask | sparc32_l2a_blocked_mask();
+    /* Per-thread mask only (S32-R3-5): no process-global merge. */
+    old_mask = ctx->sig_mask;
     for (i = 0; i < 8; i++) {
         uint32_t base = frame + (uint32_t)i * 4U;
         if (!interp_st_be(ctx, base, 4U, ctx->r[SPARC32_L0 + (uint32_t)i])) {
@@ -300,7 +301,8 @@ static bool interp_async_build(sparc32_ctx_t *ctx, int signo, uint32_t *frame)
             SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE, 2U)) {
         return false;
     }
-    old_mask = ctx->sig_mask | sparc32_l2a_blocked_mask();
+    /* Per-thread mask only (S32-R3-5): no process-global merge. */
+    old_mask = ctx->sig_mask;
     for (i = 0; i < 8; i++) {
         uint32_t base = fr + (uint32_t)i * 4U;
         if (!interp_st_be(ctx, base, 4U, ctx->r[SPARC32_L0 + (uint32_t)i])) {
@@ -499,9 +501,15 @@ bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
     return true;
 }
 
-/* Safe-point poll: deliver the lowest unblocked pending signal with an
- * installed handler. Sticky bits for handler-less signals are cleared
- * (default dispositions were already applied on the host). */
+/* Safe-point poll (S32-R3-7): thread-directed bits first, then one
+ * process-directed claim per signal. Each host signal invokes the guest
+ * handler exactly once: a thread delivery consumes a possible host-
+ * wakeup echo from the process word, and a claimed process bit whose
+ * echo belongs to another context's thread bit is dropped (the owner's
+ * thread bit still delivers it). Same-number signals merge, matching
+ * kernel semantics. Handler-less signals (default or ignored, S32-R3-6)
+ * are discarded; default actions were already applied by the host
+ * through the mirrored dispositions. Blocked signals stay queued. */
 bool interp_poll_async(sparc32_ctx_t *ctx)
 {
     uint64_t blocked;
@@ -510,7 +518,8 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
     if (ctx == NULL) {
         return false;
     }
-    blocked = ctx->sig_mask | sparc32_l2a_blocked_mask();
+    /* Per-thread mask only (S32-R3-5): no process-global merge. */
+    blocked = ctx->sig_mask;
     p = __atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE);
     for (s = 1; s <= 64; s++) {
         uint64_t bit = 1ULL << (uint64_t)((uint32_t)(s - 1) % 32U);
@@ -534,6 +543,33 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
                     __ATOMIC_ACQ_REL);
                 continue;
             }
+        }
+        /* Consume a possible host-wakeup echo so this thread-directed
+         * signal delivers exactly once. */
+        (void)sparc32_thr_claim_global(s);
+        return interp_try_deliver_async(ctx, s);
+    }
+    for (s = 1; s <= 64; s++) {
+        uint32_t w;
+        uint32_t handler;
+        uint32_t restorer;
+        w = ((uint32_t)s <= 32U) ? (uint32_t)(blocked >> 32U)
+                                 : (uint32_t)blocked;
+        if (((w >> ((uint32_t)(s - 1) % 32U)) & 1U) != 0U) {
+            continue;
+        }
+        /* Single-winner claim: exactly one polling thread delivers
+         * each process-directed signal. */
+        if (!sparc32_thr_claim_global(s)) {
+            continue;
+        }
+        if (sparc32_signal_get(s, &handler, &restorer) != 0) {
+            continue;
+        }
+        /* A surviving thread bit elsewhere owns this echo; the owner
+         * delivers it through the thread path above. */
+        if (sparc32_thr_thread_has_pending(s)) {
+            continue;
         }
         return interp_try_deliver_async(ctx, s);
     }

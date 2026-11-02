@@ -71,6 +71,16 @@ typedef struct rt32_elf_info {
     char     interp_path[256];
 } rt32_elf_info_t;
 
+/* Runtime-mapped span of one PT_LOAD segment (S32-R3-10): the
+ * prepare pass retains the validated geometry so overlap validation
+ * reuses it instead of reparsing the image. */
+typedef struct rt32_elf_span {
+    uint32_t start;
+    uint32_t end;
+} rt32_elf_span_t;
+
+#define RT32_ELF_MAX_SPANS 64U
+
 typedef struct rt32_elf_plan {
     int             exec_fd;
     int             interp_fd;
@@ -78,6 +88,10 @@ typedef struct rt32_elf_plan {
     uint32_t        interp_pie_base;
     rt32_elf_info_t exec_info;
     rt32_elf_info_t interp_info;
+    rt32_elf_span_t exec_spans[RT32_ELF_MAX_SPANS];
+    size_t          exec_nspan;
+    rt32_elf_span_t interp_spans[RT32_ELF_MAX_SPANS];
+    size_t          interp_nspan;
     char            exec_path[256];
 } rt32_elf_plan_t;
 

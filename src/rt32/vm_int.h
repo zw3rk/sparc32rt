@@ -30,6 +30,10 @@ extern uint32_t g_vm_mmap_cursor;
 
 void vm_lock_acquire(void);
 void vm_lock_release(void);
+void vm_lock_acquire_noquiesce(void);
+void vm_lock_release_noquiesce(void);
+void vm_reset_table_locked(void);
+size_t vm_host_page_size(void);
 uint64_t vm_page_align_up(uint64_t v);
 int vm_reserve_prot_none(sparc32_ctx_t *ctx, uint32_t start, uint32_t len);
 void vm_invalidate_jit(sparc32_ctx_t *ctx, uint32_t start, uint32_t end);

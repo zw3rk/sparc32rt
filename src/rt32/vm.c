@@ -40,7 +40,9 @@ typedef struct {
     uint64_t ino;
 } vm_region_meta_t;
 
-static size_t vm_host_page_size(void)
+/* Host page granularity (shared with vm_mmap.c for reserve/mmap
+ * rounding); never smaller than the guest page. */
+size_t vm_host_page_size(void)
 {
     long p = sysconf(_SC_PAGESIZE);
     return (p > (long)SPARC32_PAGE_SIZE) ? (size_t)p : (size_t)SPARC32_PAGE_SIZE;
@@ -111,7 +113,27 @@ void sparc32_vm_access_leave(void)
     }
 }
 
-void vm_lock_acquire(void)
+/* Execution quiescence + fork hooks (S32-R3-2, S32-R3-3):
+ * vm_lock_acquire drains DBT runners under g_dbt_lock before taking
+ * the VM spinlock (lock order g_dbt_lock -> VM spinlock, matching fork
+ * prepare), so no generated guest access is in flight across any host
+ * mapping or permission change. The noquiesce pair serves fork prepare
+ * only, which already holds g_dbt_lock when it runs. */
+#ifdef SPARC32RT_NO_DBT
+static void dbt_quiesce_begin_local(void)
+{
+}
+static void dbt_quiesce_end_local(void)
+{
+}
+#else
+extern void dbt_quiesce_begin(void);
+extern void dbt_quiesce_end(void);
+#define dbt_quiesce_begin_local dbt_quiesce_begin
+#define dbt_quiesce_end_local dbt_quiesce_end
+#endif
+
+void vm_lock_acquire_noquiesce(void)
 {
     atomic_fetch_add_explicit(&g_vm_writer_waiting, 1U, memory_order_acq_rel);
     sparc32_spin_lock(&g_vm_lock);
@@ -121,10 +143,22 @@ void vm_lock_acquire(void)
     }
 }
 
-void vm_lock_release(void)
+void vm_lock_release_noquiesce(void)
 {
     t_vm_lock_held = 0U;
     sparc32_spin_unlock(&g_vm_lock);
+}
+
+void vm_lock_acquire(void)
+{
+    dbt_quiesce_begin_local();
+    vm_lock_acquire_noquiesce();
+}
+
+void vm_lock_release(void)
+{
+    vm_lock_release_noquiesce();
+    dbt_quiesce_end_local();
 }
 
 /* Fork-child reset (Section 3 #1): fork() retains only the calling thread,
@@ -146,28 +180,6 @@ void sparc32_vm_fork_child_reset(void)
 uint64_t vm_page_align_up(uint64_t v)
 {
     return (v + 0xFFFULL) & ~0xFFFULL;
-}
-
-int vm_reserve_prot_none(sparc32_ctx_t *ctx, uint32_t start, uint32_t len)
-{
-    size_t hp = vm_host_page_size();
-    void *res;
-    if (hp > (size_t)SPARC32_PAGE_SIZE) {
-        uint32_t mask = (uint32_t)hp - 1U;
-        uint32_t in_start = (start + mask) & ~mask;
-        uint32_t in_end   = (start + len) & ~mask;
-        if (in_end > in_start) {
-            (void)mprotect(sparc32_guest_ptr(ctx, in_start),
-                           (size_t)(in_end - in_start), PROT_NONE);
-        }
-        return 0;
-    }
-    res = mmap(sparc32_guest_ptr(ctx, start), (size_t)len, PROT_NONE,
-               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    if (res == MAP_FAILED) {
-        return -errno;
-    }
-    return 0;
 }
 
 /* Translation-cache invalidation on guest mm ops (SMC): real since the
@@ -743,14 +755,14 @@ int rt32_vm_record_region(sparc32_ctx_t *ctx, uint32_t start, uint32_t end,
     return rc;
 }
 
-/* Exec teardown: drop every tracked region (Phase 0 has no persistent
- * vDSO page, so exec clears the whole table; the Phase 2 vDSO, if any,
- * re-registers itself at stack setup). */
-void rt32_vm_reset_for_exec(sparc32_ctx_t *ctx)
+/* Exec table teardown (S32-R3-4): close every region backing fd and
+ * clear the table/cursors. The caller (rt32_vm_reset_for_exec in
+ * vm_mmap.c) holds the writer lock across the whole replacement, so
+ * the old image cannot be observed mid-destruction. */
+void vm_reset_table_locked(void)
 {
     size_t i;
 
-    vm_lock_acquire();
     for (i = 0U; i < g_vm_region_count; i++) {
         vm_close_backing_fd(g_vm_region_meta[i].fd);
         g_vm_region_meta[i].fd = -1;
@@ -760,21 +772,6 @@ void rt32_vm_reset_for_exec(sparc32_ctx_t *ctx)
     g_vm_brk_base  = 0U;
     g_vm_brk_curr  = 0U;
     g_vm_mmap_cursor = RT32_MMAP_BASE_32;
-    vm_lock_release();
-
-    /* Kernel exec semantics: the old address space is destroyed. Reset
-     * the window back to PROT_NONE while keeping [G, G+4GiB) reserved. */
-    (void)mmap(sparc32_guest_ptr(ctx, SPARC32_LOW_GUARD_SIZE),
-               (size_t)(RT32_WINDOW_SIZE - (uint64_t)SPARC32_LOW_GUARD_SIZE),
-               PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    vm32_reset();
-
-    ctx->brk_base    = 0U;
-    ctx->brk_curr    = 0U;
-    ctx->mmap_cursor = RT32_MMAP_BASE_32;
-    ctx->region_count = 0U;
-    (void)rt32_vm_record_region(ctx, 0U, SPARC32_LOW_GUARD_SIZE,
-                                0U, 0x32U, "[null_guard]");
 }
 
 uint32_t rt32_vm_brk(sparc32_ctx_t *ctx, uint32_t new_brk)

@@ -189,11 +189,13 @@ static int protect_and_record_seg(sparc32_ctx_t *ctx, uint32_t start, uint32_t e
 }
 
 static int load_elf32_image(sparc32_ctx_t *ctx, int fd, uint32_t default_pie_base,
-                            const char *label, rt32_elf_info_t *out, bool commit)
+                            const char *label, rt32_elf_info_t *out, bool commit,
+                            rt32_elf_span_t *spans_out, size_t *nspan_out)
 {
     struct stat st;
     elf32_ehdr_t ehdr;
     elf32_phdr_t phdrs[64];
+    size_t nspan = 0U;
     size_t phdr_bytes;
     uint32_t min_vaddr = UINT32_MAX;
     uint32_t load_bias = 0U;
@@ -422,6 +424,14 @@ static int load_elf32_image(sparc32_ctx_t *ctx, int fd, uint32_t default_pie_bas
         }
         map_end   = (uint32_t)map_end64;
         map_start = (page_start < highest_mapped_end) ? highest_mapped_end : page_start;
+        /* Retain the validated runtime span (S32-R3-10): [page_start,
+         * map_end) is exactly what the commit phase maps, so the
+         * prepare pass keeps it for overlap validation. */
+        if (spans_out != NULL && nspan < RT32_ELF_MAX_SPANS) {
+            spans_out[nspan].start = page_start;
+            spans_out[nspan].end = map_end;
+            nspan++;
+        }
         if (commit && ctx != NULL) {
             for (r = 0U; r < ctx->region_count; r++) {
                 if (map_start < ctx->regions[r].end && map_end > ctx->regions[r].start) {
@@ -557,6 +567,9 @@ static int load_elf32_image(sparc32_ctx_t *ctx, int fd, uint32_t default_pie_bas
         return -ENOEXEC;
     }
 
+    if (nspan_out != NULL) {
+        *nspan_out = nspan;
+    }
     return 0;
 }
 
@@ -575,92 +588,9 @@ void rt32_elf_plan_close(rt32_elf_plan_t *plan)
     }
 }
 
-/* Runtime-mapped span of one PT_LOAD segment:
- * [start, end) = [page_down(bias+vaddr), page_up(bias+vaddr+memsz)). */
-typedef struct {
-    uint32_t start;
-    uint32_t end;
-} elf_span_t;
-
-#define ELF32_PREPARE_MAX_SEGS 64U
-
-/* Collect the runtime-mapped spans of every PT_LOAD segment (memsz > 0)
- * without touching guest memory. Mirrors the load-bias rule in
- * load_elf32_image (an ET_DYN image below 0x10000 is rebased to pie_base),
- * so the spans match what the commit phase maps. Returns 0 with *out_n
- * spans, or a negative errno-style code on I/O or header failure. The
- * caller has already parsed the image successfully; this re-read only
- * recovers the per-segment geometry that rt32_elf_info_t does not
- * retain. */
-static int elf_collect_spans(int fd, uint32_t pie_base, elf_span_t *spans,
-                             size_t *out_n)
-{
-    struct stat st;
-    elf32_ehdr_t ehdr;
-    elf32_phdr_t phdrs[ELF32_PREPARE_MAX_SEGS];
-    size_t phdr_bytes;
-    uint32_t min_vaddr = UINT32_MAX;
-    uint32_t load_bias = 0U;
-    uint16_t i;
-    size_t n = 0U;
-
-    if (spans == NULL || out_n == NULL) {
-        return -EINVAL;
-    }
-    *out_n = 0U;
-    if (fstat(fd, &st) != 0) {
-        return -errno;
-    }
-    if (pread_full(fd, &ehdr, sizeof(ehdr), 0) != 0) {
-        return -ENOEXEC;
-    }
-    if (ehdr.e_ident[0] != 0x7fU || ehdr.e_ident[1] != 'E' ||
-        ehdr.e_ident[2] != 'L' || ehdr.e_ident[3] != 'F') {
-        return -ENOEXEC;
-    }
-    ehdr_from_be(&ehdr);
-    if (ehdr.e_phentsize != sizeof(elf32_phdr_t) || ehdr.e_phnum == 0U ||
-        ehdr.e_phnum > ELF32_PREPARE_MAX_SEGS) {
-        return -ENOEXEC;
-    }
-    phdr_bytes = (size_t)ehdr.e_phnum * sizeof(elf32_phdr_t);
-    if (pread_full(fd, phdrs, phdr_bytes, (off_t)ehdr.e_phoff) != 0) {
-        return -ENOEXEC;
-    }
-    for (i = 0; i < ehdr.e_phnum; i++) {
-        phdr_from_be(&phdrs[i]);
-        if (phdrs[i].p_type == PT_LOAD && phdrs[i].p_memsz > 0U &&
-            phdrs[i].p_vaddr < min_vaddr) {
-            min_vaddr = phdrs[i].p_vaddr;
-        }
-    }
-    if (min_vaddr == UINT32_MAX) {
-        return -ENOEXEC;
-    }
-    if (ehdr.e_type == ET_DYN && min_vaddr < 0x10000U) {
-        load_bias = pie_base;
-    }
-    for (i = 0; i < ehdr.e_phnum; i++) {
-        uint64_t seg_end64;
-        uint64_t seg_va64;
-        if (phdrs[i].p_type != PT_LOAD || phdrs[i].p_memsz == 0U) {
-            continue;
-        }
-        seg_va64 = (uint64_t)load_bias + (uint64_t)phdrs[i].p_vaddr;
-        seg_end64 = seg_va64 + (uint64_t)phdrs[i].p_memsz;
-        if (seg_end64 > (uint64_t)SPARC32_TASK_SIZE_TOP) {
-            return -ENOEXEC;
-        }
-        spans[n].start = sparc32_page_down((uint32_t)seg_va64);
-        spans[n].end = sparc32_page_up((uint32_t)seg_end64);
-        n++;
-    }
-    *out_n = n;
-    return 0;
-}
-
-/* True interval-overlap test for two mapped spans. */
-static bool elf_spans_overlap(elf_span_t a, elf_span_t b)
+/* True interval-overlap test for two mapped spans (S32-R3-10: the
+ * spans come from the validated plan, not a second parse). */
+static bool elf_spans_overlap(rt32_elf_span_t a, rt32_elf_span_t b)
 {
     return a.start < b.end && b.start < a.end;
 }
@@ -699,7 +629,8 @@ int rt32_elf_prepare(const sparc32_ctx_t *ctx, int exec_fd, const char *path,
 
     rc = load_elf32_image(NULL, out_plan->exec_fd, out_plan->exec_pie_base,
                           out_plan->exec_path[0] ? out_plan->exec_path : "[guest]",
-                          &out_plan->exec_info, false);
+                          &out_plan->exec_info, false,
+                          out_plan->exec_spans, &out_plan->exec_nspan);
     if (rc != 0) {
         rt32_elf_plan_close(out_plan);
         return rc;
@@ -716,41 +647,30 @@ int rt32_elf_prepare(const sparc32_ctx_t *ctx, int exec_fd, const char *path,
             return -err;
         }
         rc = load_elf32_image(NULL, out_plan->interp_fd, out_plan->interp_pie_base,
-                              out_plan->exec_info.interp_path, &out_plan->interp_info, false);
+                              out_plan->exec_info.interp_path, &out_plan->interp_info, false,
+                              out_plan->interp_spans, &out_plan->interp_nspan);
         if (rc != 0) {
             rt32_elf_plan_close(out_plan);
             return rc;
         }
         /* True interval-overlap check between the interpreter and
-         * executable segments: every exec PT_LOAD span is tested against
-         * every interp PT_LOAD span. The old span-edge test (interp bias
-         * below the exec end with the interp end past the exec bias)
-         * falsely rejected a non-rebased interpreter landing in a hole
-         * between executable segments even though no mapped pages
-         * collide. Either span list is non-empty here: both images
-         * parsed with at least one PT_LOAD above. */
+         * executable segments (S32-R3-10): every retained exec PT_LOAD
+         * span is tested against every retained interp PT_LOAD span.
+         * The spans come from the same validated parse that commit
+         * maps, so no second geometry interpretation can drift. The
+         * old span-edge test (interp bias below the exec end with the
+         * interp end past the exec bias) falsely rejected a
+         * non-rebased interpreter landing in a hole between
+         * executable segments even though no mapped pages collide.
+         * Either span list is non-empty here: both images parsed with
+         * at least one PT_LOAD above. */
         {
-            elf_span_t exec_spans[ELF32_PREPARE_MAX_SEGS];
-            elf_span_t interp_spans[ELF32_PREPARE_MAX_SEGS];
-            size_t nexec = 0U;
-            size_t ninterp = 0U;
             size_t i;
             size_t j;
-            rc = elf_collect_spans(out_plan->exec_fd,
-                                   out_plan->exec_pie_base,
-                                   exec_spans, &nexec);
-            if (rc == 0) {
-                rc = elf_collect_spans(out_plan->interp_fd,
-                                       out_plan->interp_pie_base,
-                                       interp_spans, &ninterp);
-            }
-            if (rc != 0) {
-                rt32_elf_plan_close(out_plan);
-                return rc;
-            }
-            for (i = 0U; i < nexec; i++) {
-                for (j = 0U; j < ninterp; j++) {
-                    if (elf_spans_overlap(exec_spans[i], interp_spans[j])) {
+            for (i = 0U; i < out_plan->exec_nspan; i++) {
+                for (j = 0U; j < out_plan->interp_nspan; j++) {
+                    if (elf_spans_overlap(out_plan->exec_spans[i],
+                            out_plan->interp_spans[j])) {
                         rt32_elf_plan_close(out_plan);
                         return -ENOEXEC;
                     }
@@ -783,7 +703,7 @@ int rt32_elf_commit_plan(sparc32_ctx_t *ctx, rt32_elf_plan_t *plan,
 
     rc = load_elf32_image(ctx, plan->exec_fd, plan->exec_pie_base,
                           plan->exec_path[0] ? plan->exec_path : "[guest]",
-                          out_info, true);
+                          out_info, true, NULL, NULL);
     if (rc != 0) {
         rt32_elf_plan_close(plan);
         return rc;
@@ -798,7 +718,8 @@ int rt32_elf_commit_plan(sparc32_ctx_t *ctx, rt32_elf_plan_t *plan,
         rt32_elf_info_t interp_info;
         uint32_t interp_end;
         int irc = load_elf32_image(ctx, plan->interp_fd, plan->interp_pie_base,
-                                   out_info->interp_path, &interp_info, true);
+                                   out_info->interp_path, &interp_info, true,
+                                   NULL, NULL);
         if (irc != 0) {
             rt32_elf_plan_close(plan);
             return irc;

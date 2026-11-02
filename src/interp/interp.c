@@ -41,6 +41,7 @@
 #include "interp/interp_priv.h"
 #include "os/sigframe_sparc32rt.h"
 #include "os/syscalls_min.h"
+#include "os/threads.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -723,6 +724,11 @@ void interp_run(sparc32_ctx_t *ctx)
     }
     ctx->exit_reason = SPARC32_EXIT_NONE;
     while (ctx->exit_reason == SPARC32_EXIT_NONE) {
+        /* Exec retire (S32-R3-4): a sibling's execve replaced the
+         * image; leave through the retire path, never the old code. */
+        if (sparc32_thr_is_retired(ctx)) {
+            sparc32_thr_self_retire(ctx);
+        }
         interp_step(ctx);
     }
 }

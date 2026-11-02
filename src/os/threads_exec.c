@@ -39,9 +39,11 @@ static int thr_ld(sparc32_ctx_t *ctx, uint32_t va, uint32_t *out)
     return 0;
 }
 
-/* execve(59): reload an ELF into the same G window (dispositions reset
- * via sparc32_signal_reset_all; stale handler VAs fault fail-closed).
- * FDs stay open (no CLOEXEC table yet; RC-H). */
+/* execve(59): reload an ELF into the same G window. Sibling guest
+ * threads retire before the old image is destroyed (S32-R3-4); caught
+ * dispositions return to default while ignored ones survive
+ * (sparc32_signal_reset_for_exec); close-on-exec guest descriptors are
+ * swept (S32-R3-9); stale handler VAs fault fail-closed. */
 static int thr_read_cstr(sparc32_ctx_t *ctx, uint32_t va, char *out,
     size_t cap)
 {
@@ -148,11 +150,20 @@ long sparc32_thr_execve(sparc32_ctx_t *ctx, uint32_t path_va,
             thr_free_vec(envp, envc);
             return rc;
         }
-        /* Point of no return: reset signal dispositions and replace the
-         * guest VM image from the retained open descriptors. Any host
-         * mapping failure after destroying the old VM terminates the
-         * process fatally rather than returning to an unmapped caller. */
-        sparc32_signal_reset_all();
+        /* Point of no return: retire sibling guest threads before the
+         * old image is destroyed (S32-R3-4), reset caught dispositions
+         * (ignored survive), drop pending queues, sweep close-on-exec
+         * descriptors (S32-R3-9), and replace the guest VM image from
+         * the retained open descriptors. The plan fds are translator-
+         * owned (never in the guest FD table), so the sweep cannot
+         * close them. Any host mapping failure after destroying the
+         * old VM terminates the process fatally rather than returning
+         * to an unmapped caller. */
+        sparc32_thr_exec_retire_begin(ctx);
+        sparc32_thr_exec_retire_wait(ctx);
+        sparc32_signal_reset_for_exec();
+        sparc32_thr_clear_process_pending();
+        sparc32_fd_cloexec_sweep();
         rt32_vm_reset_for_exec(ctx);
         rc = rt32_elf_commit_plan(ctx, &plan, &info);
         if (rc != 0) {
@@ -184,6 +195,11 @@ long sparc32_thr_execve(sparc32_ctx_t *ctx, uint32_t path_va,
     interp_window_reset();
     ctx->pending_signals = 0U;
     ctx->sig_mask = 0U;
+    /* Exec-reset rule (S32-R3-5): the new image starts with the
+     * alternate stack disabled, like the blocked mask above. */
+    ctx->altstack_flags = 0U;
+    ctx->altstack_sp = 0U;
+    ctx->altstack_size = 0U;
     ctx->sync_sig_delivered = false;
     ctx->sig_last_frame_va = 0U;
     ctx->sig_last_frame_rt = 0U;

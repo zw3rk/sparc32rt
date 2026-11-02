@@ -109,6 +109,49 @@ void dbt_runner_leave(void)
     }
 }
 
+/* VM-mutation quiescence (S32-R3-3): the VM writer path holds g_dbt_lock
+ * across the whole mutation (lock order g_dbt_lock -> VM spinlock,
+ * matching fork prepare), so no generated guest access is in flight
+ * while host mappings or protections change. In-flight runners drain;
+ * new runners block in dbt_runner_enter_locked until dbt_quiesce_end. */
+void dbt_quiesce_begin(void)
+{
+    dbt_lock_acquire();
+    dbt_wait_quiescent_locked();
+}
+
+void dbt_quiesce_end(void)
+{
+    dbt_lock_release();
+}
+
+/* Coordinated fork (S32-R3-2): prepare drains execution under g_dbt_lock
+ * (same order as the VM path: thr_live_lock -> g_dbt_lock -> VM
+ * spinlock), the parent just releases, and the single-threaded child
+ * owns the lock, resets the runner state no vanished thread can drain,
+ * and rebuilds the lock/cond. The COW code arena stays valid. */
+void dbt_fork_prepare(void)
+{
+    dbt_lock_acquire();
+    dbt_wait_quiescent_locked();
+}
+
+void dbt_fork_parent(void)
+{
+    dbt_lock_release();
+}
+
+void dbt_fork_child_reset(void)
+{
+    __atomic_store_n(&g_dbt_active_runners, 0U, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_dbt_writer_waiting, false, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&g_dbt_lock);
+    pthread_mutex_destroy(&g_dbt_lock);
+    pthread_mutex_init(&g_dbt_lock, NULL);
+    pthread_cond_destroy(&g_dbt_quiesce_cv);
+    pthread_cond_init(&g_dbt_quiesce_cv, NULL);
+}
+
 #ifndef __APPLE__
 static size_t dbt_page_span(void)
 {

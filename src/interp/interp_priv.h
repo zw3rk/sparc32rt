@@ -48,13 +48,18 @@ bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
 #define SPARC32_SIGFPU_SIZE 136U
 /* C2-3 signal extensions (implemented in os/syscalls_sig.c, consulted
  * by interp_signal.c delivery): full disposition (handler/restorer/
- * accepted SA_* flags/sa_mask), alternate-stack state, and onstack mark. */
+ * accepted SA_* flags/sa_mask), per-thread alternate-stack state, and
+ * the onstack mark. The legacy global sigaltstack helpers are inert
+ * (they report "no stack"); delivery always uses the _ctx variants. */
 int sparc32_signal_get_full(int sig, uint32_t *handler_va,
     uint32_t *restorer_va, uint32_t *flags);
 int sparc32_signal_get_action(int sig, uint32_t *handler_va,
     uint32_t *restorer_va, uint32_t *flags, uint64_t *sa_mask);
 int sparc32_sigaltstack_state(uint32_t *sp, uint32_t *size, int *onstack);
 void sparc32_sigaltstack_set_onstack(int onstack);
+int sparc32_sigaltstack_state_ctx(const sparc32_ctx_t *ctx, uint32_t *sp,
+    uint32_t *size, int *onstack);
+void sparc32_sigaltstack_set_onstack_ctx(sparc32_ctx_t *ctx, int onstack);
 void sparc32_l2a_set_blocked_mask(sparc32_ctx_t *ctx, uint64_t mask);
 /* Flush-windows trap (ta 3, C2-3): spill every cached caller window to
  * its recorded stack slot so setjmp/longjmp and signal frames observe

@@ -30,14 +30,26 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx);
 #define SPARC_SIG_UNBLOCK 2U
 #define SPARC_SIG_SETMASK 4U
 
+/* Signal disposition kinds (S32-R3-6): the table distinguishes default,
+ * ignored, and caught instead of collapsing DFL/IGN into "absent". */
+#define SPARC32_SIG_DISP_DFL 0
+#define SPARC32_SIG_DISP_IGN 1
+#define SPARC32_SIG_DISP_CAUGHT 2
+
 /* Look up the installed old-style handler for sig (1..31). Returns 0 with
- * the handler/restorer VAs filled when installed, -1 otherwise. Phase-1
+ * the handler/restorer VAs filled when caught, -1 otherwise. Phase-1
  * sync delivery (interp_try_deliver_sync) consults this. */
 int sparc32_signal_get(int sig, uint32_t *handler_va, uint32_t *restorer_va);
 
-/* Drop every installed disposition (execve(59): Linux resets caught
- * signals to SIG_DFL across exec, so stale handler VAs must not fire
- * in the new image). */
+/* Current disposition kind for sig (one of SPARC32_SIG_DISP_*). */
+int sparc32_signal_disposition(int sig);
+
+/* Drop every installed disposition (process teardown path). */
 void sparc32_signal_reset_all(void);
+
+/* execve(59) disposition reset: caught signals return to SIG_DFL with
+ * the host disposition synced back; ignored dispositions survive, and
+ * the blocked mask plus pending queues are left untouched. */
+void sparc32_signal_reset_for_exec(void);
 
 #endif /* SPARC32RT_OS_SYSCALLS_MIN_H */
