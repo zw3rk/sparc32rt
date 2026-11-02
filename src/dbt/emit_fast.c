@@ -148,10 +148,11 @@ static void f_emit_slowcall(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
     b->nzcv_valid = 0;
 }
 
-/* Note: stores to code-bearing pages funnel to the canonical helper
- * below without cache invalidation. Flushing the arena from inside
- * emitted code could clobber the running block; guest-store SMC keeps
- * the pre-existing (approximate) semantics. */
+/* Note: stores to code-bearing pages lack VM32_PROT_FAST_WRITE and
+ * therefore take the slow helper path (interp_mem_wr), which invalidates
+ * translated code overlapping the written range via
+ * sparc32_dbt_invalidate_range() and exits with SPARC32_EXIT_BRANCH so
+ * the dispatcher re-translates coherent code on the next step. */
 
 /* P13-4 single-lookup prot check against the x25-cached table (3
  * insns): lsr vpn; ldrb [x25, vpn]; tbz bit,slow. Loads test bit 0

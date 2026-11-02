@@ -176,11 +176,10 @@ static int sys_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v);
 #if defined(__linux__)
 static int sys_ld_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t *out)
 {
-    const uint8_t *p;
-    if (guest_range_ok_prot(va, 4U, 1U) != 0) {
+    uint8_t p[4];
+    if (l2a_load(ctx, va, p, 4U) != 0) {
         return -EFAULT;
     }
-    p = (const uint8_t *)sparc32_guest_ptr(ctx, va);
     *out = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
         ((uint32_t)p[2] << 8) | (uint32_t)p[3];
     return 0;
@@ -203,23 +202,69 @@ long sparc32_sys_rt_sigreturn(sparc32_ctx_t *ctx);
 
 static long sys_read(sparc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t count)
 {
+    uint8_t sbuf[4096];
+    uint8_t *buf = sbuf;
     ssize_t n;
+    int rc;
     if (guest_range_ok_prot(buf_va, count, 2U) != 0) {
         return -EFAULT;
     }
-    n = read((int)fd, sparc32_guest_ptr(ctx, buf_va), (size_t)count);
-    if (n > 0 && vm32_range_has_code(buf_va, (size_t)n)) {
-        vm_invalidate_jit(ctx, buf_va, buf_va + (uint32_t)n);
+    if (count == 0U) {
+        return host_ret(read((int)fd, sbuf, 0U));
+    }
+    if (count > sizeof(sbuf)) {
+        buf = (uint8_t *)malloc((size_t)count);
+        if (buf == NULL) {
+            return -ENOMEM;
+        }
+    }
+    n = read((int)fd, buf, (size_t)count);
+    if (n > 0) {
+        rc = l2a_store(ctx, buf_va, buf, (uint64_t)n);
+        if (rc != 0) {
+            if (buf != sbuf) {
+                free(buf);
+            }
+            return rc;
+        }
+    }
+    if (buf != sbuf) {
+        free(buf);
     }
     return host_ret(n);
 }
 
 static long sys_write(sparc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t count)
 {
-    if (guest_range_ok_prot(buf_va, count, 1U) != 0) {
+    uint8_t sbuf[4096];
+    uint8_t *buf = sbuf;
+    ssize_t n;
+    if (count == 0U) {
+        if (guest_range_ok_prot(buf_va, 0U, 1U) != 0) {
+            return -EFAULT;
+        }
+        return host_ret(write((int)fd, sbuf, 0U));
+    }
+    if (count > sizeof(sbuf)) {
+        if (guest_range_ok_prot(buf_va, count, 1U) != 0) {
+            return -EFAULT;
+        }
+        buf = (uint8_t *)malloc((size_t)count);
+        if (buf == NULL) {
+            return -ENOMEM;
+        }
+    }
+    if (l2a_load(ctx, buf_va, buf, count) != 0) {
+        if (buf != sbuf) {
+            free(buf);
+        }
         return -EFAULT;
     }
-    return host_ret(write((int)fd, sparc32_guest_ptr(ctx, buf_va), (size_t)count));
+    n = write((int)fd, buf, (size_t)count);
+    if (buf != sbuf) {
+        free(buf);
+    }
+    return host_ret(n);
 }
 
 static long sys_brk(sparc32_ctx_t *ctx, uint32_t new_brk)
@@ -754,6 +799,10 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         break;
     case (long)SPARC32__NR_rt_sigsuspend:
         ret = sparc32_thr_rt_sigsuspend(ctx, o0, o1);
+        if (ret == 0) {
+            ctx->syscalls_executed++;
+            return 0;
+        }
         break;
     case (long)SPARC32__NR_setitimer:
         ret = sparc32_thr_setitimer(ctx, o0, o1, o2);

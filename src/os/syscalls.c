@@ -12,6 +12,7 @@
 #include <sys/syscall.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -74,34 +75,7 @@
 #define L2A_IOV_MAX 1024U
 #define L2A_IOV_BATCH 32U
 
-/* BE words, range model, and guest stores live in os/l2a_access.h. */
-
-/* NUL-terminated guest string -> out (0 ok, -EFAULT/-ENAMETOOLONG). */
-static long l2a_copy_cstring(sparc32_ctx_t *ctx, uint32_t va, char *out,
-    uint32_t cap)
-{
-    uint32_t i;
-    if (cap == 0U || l2a_range_ok_prot(va, 1U, 1U) != 0) {
-        return (cap == 0U) ? -ENAMETOOLONG : -EFAULT;
-    }
-    for (i = 0U; i < cap; i++) {
-        uint32_t a = va + i;
-        const uint8_t *p;
-        if (a < va) {
-            return -ENAMETOOLONG;
-        }
-        if (l2a_range_ok_prot(a, 1U, 1U) != 0) {
-            return -EFAULT;
-        }
-        p = (const uint8_t *)sparc32_guest_ptr(ctx, a);
-        out[i] = (char)*p;
-        if (*p == 0U) {
-            return 0;
-        }
-    }
-    out[cap - 1U] = '\0';
-    return -ENAMETOOLONG;
-}
+/* BE words, range model, guest stores, and l2a_copy_cstring live in os/l2a_access.h. */
 
 /* Sysroot fallback (C2-3): absolute guest paths that miss on the host
  * retry under ctx->sysroot (dynamic loader DT_NEEDED + PT_INTERP
@@ -396,15 +370,22 @@ static long sys_rwvec(sparc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
         struct iovec host[L2A_IOV_BATCH];
         uint32_t gbase[L2A_IOV_BATCH];
         uint32_t glen[L2A_IOV_BATCH];
+        uint8_t sbuf[4096];
+        uint8_t *stage = sbuf;
         uint64_t want = 0ULL;
+        uint64_t off = 0ULL;
         uint32_t n = 0U;
         uint32_t j;
         ssize_t rc;
         for (j = 0U; j < L2A_IOV_BATCH && i + j < iovcnt; j++) {
-            const uint8_t *e = (const uint8_t *)sparc32_guest_ptr(ctx,
-                iov_va + (uint32_t)((i + j) * 8U));
-            uint32_t base = get_be32(e);
-            uint32_t len = get_be32(e + 4);
+            uint8_t e[8];
+            uint32_t base;
+            uint32_t len;
+            if (l2a_load(ctx, iov_va + (uint32_t)((i + j) * 8U), e, 8U) != 0) {
+                return (total != 0ULL) ? (long)total : -EFAULT;
+            }
+            base = get_be32(e);
+            len = get_be32(e + 4);
             if (l2a_range_ok_prot(base, len, buf_prot) != 0) {
                 return (total != 0ULL) ? (long)total : -EFAULT;
             }
@@ -413,26 +394,48 @@ static long sys_rwvec(sparc32_ctx_t *ctx, uint32_t fd, uint32_t iov_va,
             }
             gbase[n] = base;
             glen[n] = len;
-            host[n].iov_base = sparc32_guest_ptr(ctx, base);
-            host[n].iov_len = (size_t)len;
             n++; want += (uint64_t)len;
         }
         if (n == 0U) {
             i += L2A_IOV_BATCH;
             continue;
         }
+        if (want > sizeof(sbuf)) {
+            stage = (uint8_t *)malloc((size_t)want);
+            if (stage == NULL) {
+                return (total != 0ULL) ? (long)total : -ENOMEM;
+            }
+        }
+        for (j = 0U; j < n; j++) {
+            host[j].iov_base = stage + off;
+            host[j].iov_len = (size_t)glen[j];
+            if (is_write && l2a_load(ctx, gbase[j], stage + off, glen[j]) != 0) {
+                if (stage != sbuf) { free(stage); }
+                return (total != 0ULL) ? (long)total : -EFAULT;
+            }
+            off += (uint64_t)glen[j];
+        }
         rc = is_write ? writev((int)fd, host, (int)n)
                       : readv((int)fd, host, (int)n);
         if (rc < 0) {
-            return (total != 0ULL) ? (long)total : -(long)errno;
+            int err = errno;
+            if (stage != sbuf) { free(stage); }
+            return (total != 0ULL) ? (long)total : -(long)err;
         }
         if (!is_write && rc > 0) {
-            for (j = 0U; j < n; j++) {
-                if (vm32_range_has_code(gbase[j], glen[j])) {
-                    vm_invalidate_jit(ctx, gbase[j], gbase[j] + glen[j]);
+            uint64_t rem = (uint64_t)rc;
+            off = 0ULL;
+            for (j = 0U; j < n && rem > 0ULL; j++) {
+                uint64_t chunk = (rem < (uint64_t)glen[j]) ? rem : (uint64_t)glen[j];
+                if (l2a_store(ctx, gbase[j], stage + off, chunk) != 0) {
+                    if (stage != sbuf) { free(stage); }
+                    return (total != 0ULL) ? (long)total : -EFAULT;
                 }
+                off += (uint64_t)glen[j];
+                rem -= chunk;
             }
         }
+        if (stage != sbuf) { free(stage); }
         total += (uint64_t)rc;
         i += L2A_IOV_BATCH;
         if ((uint64_t)rc < want) {

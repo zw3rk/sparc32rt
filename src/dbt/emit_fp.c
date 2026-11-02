@@ -447,10 +447,9 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
     if (fp_guard_fast(ec) != 0) {
         return -1;
     }
-    if (!b->fpsr_dirty) {
-        fp_fpsr_clear(b);
-        b->fpsr_dirty = true;
-    }
+    sparc32_emit_fp_flush(b);
+    fp_fpsr_clear(b);
+    b->fpsr_dirty = true;
 
     switch (opf) {
     case 0x041U: case 0x042U: base = 0x1E202800U; break;

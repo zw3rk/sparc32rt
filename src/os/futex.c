@@ -96,12 +96,11 @@ static int64_t futex_emu_now_ns(void)
 
 static uint32_t futex_emu_read(sparc32_ctx_t *ctx, uint32_t uaddr, int *ok)
 {
-    const uint8_t *p;
-    if (l2a_range_ok(uaddr, 4U) != 0) {
+    uint8_t p[4];
+    if (l2a_load(ctx, uaddr, p, sizeof(p)) != 0) {
         *ok = 0;
         return 0U;
     }
-    p = (const uint8_t *)sparc32_guest_ptr(ctx, uaddr);
     *ok = 1;
     return get_be32(p);
 }
@@ -217,13 +216,12 @@ long sparc32_l2a_futex_emu32(sparc32_ctx_t *ctx, uint32_t uaddr,
         return sparc32_futex_wait_emu(ctx, uaddr, val, 0LL, 0LL, 0, 0);
     }
     {
-        const uint8_t *tp;
+        uint8_t tp[8];
         int64_t sec;
         int64_t nsec;
-        if (l2a_range_ok(timeout_va, 8U) != 0) {
+        if (l2a_load(ctx, timeout_va, tp, sizeof(tp)) != 0) {
             return -SP_EFAULT;
         }
-        tp = (const uint8_t *)sparc32_guest_ptr(ctx, timeout_va);
         sec = (int64_t)(int32_t)get_be32(tp);
         nsec = (int64_t)(int32_t)get_be32(tp + 4);
         return sparc32_futex_wait_emu(ctx, uaddr, val, sec, nsec, 1,
@@ -268,13 +266,12 @@ long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
 #endif
     }
     {
-        const uint8_t *tp;
+        uint8_t tp[16];
         uint64_t sec;
         uint64_t nsec;
-        if (l2a_range_ok(timeout_va, 16U) != 0) {
+        if (l2a_load(ctx, timeout_va, tp, sizeof(tp)) != 0) {
             return -SP_EFAULT;
         }
-        tp = (const uint8_t *)sparc32_guest_ptr(ctx, timeout_va);
         sec = ((uint64_t)get_be32(tp) << 32) | (uint64_t)get_be32(tp + 4);
         nsec = ((uint64_t)get_be32(tp + 8) << 32) | (uint64_t)get_be32(tp + 12);
         if ((sec >> 63) != 0U || (nsec >> 63) != 0U) {

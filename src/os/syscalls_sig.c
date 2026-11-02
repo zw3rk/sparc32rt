@@ -31,11 +31,11 @@ static int sig_range_ok_prot(uint32_t va, uint32_t len, uint32_t req_prot)
 
 static int sig_ld_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t *out)
 {
-    const uint8_t *p;
-    if (sig_range_ok_prot(va, 4U, 1U) != 0) {
-        return -EFAULT;
+    uint8_t p[4];
+    int rc = l2a_load(ctx, va, p, sizeof(p));
+    if (rc != 0) {
+        return rc;
     }
-    p = (const uint8_t *)sparc32_guest_ptr(ctx, va);
     *out = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
         ((uint32_t)p[2] << 8) | (uint32_t)p[3];
     return 0;
@@ -65,37 +65,40 @@ static struct {
 
 int sparc32_signal_get(int sig, uint32_t *handler_va, uint32_t *restorer_va)
 {
-    if (sig < 1 || sig > 64 || !sigact[sig].installed) {
+    if (sig < 1 || sig > 64 ||
+        !__atomic_load_n(&sigact[sig].installed, __ATOMIC_ACQUIRE)) {
         return -1;
     }
-    *handler_va = sigact[sig].handler;
-    *restorer_va = sigact[sig].restorer;
+    *handler_va = __atomic_load_n(&sigact[sig].handler, __ATOMIC_RELAXED);
+    *restorer_va = __atomic_load_n(&sigact[sig].restorer, __ATOMIC_RELAXED);
     return 0;
 }
 
 int sparc32_signal_get_full(int sig, uint32_t *handler_va,
     uint32_t *restorer_va, uint32_t *flags)
 {
-    if (sig < 1 || sig > 64 || !sigact[sig].installed) {
+    if (sig < 1 || sig > 64 ||
+        !__atomic_load_n(&sigact[sig].installed, __ATOMIC_ACQUIRE)) {
         return -1;
     }
-    *handler_va = sigact[sig].handler;
-    *restorer_va = sigact[sig].restorer;
-    *flags = sigact[sig].flags;
+    *handler_va = __atomic_load_n(&sigact[sig].handler, __ATOMIC_RELAXED);
+    *restorer_va = __atomic_load_n(&sigact[sig].restorer, __ATOMIC_RELAXED);
+    *flags = __atomic_load_n(&sigact[sig].flags, __ATOMIC_RELAXED);
     return 0;
 }
 
 int sparc32_signal_get_action(int sig, uint32_t *handler_va,
     uint32_t *restorer_va, uint32_t *flags, uint64_t *sa_mask)
 {
-    if (sig < 1 || sig > 64 || !sigact[sig].installed) {
+    if (sig < 1 || sig > 64 ||
+        !__atomic_load_n(&sigact[sig].installed, __ATOMIC_ACQUIRE)) {
         return -1;
     }
-    *handler_va = sigact[sig].handler;
-    *restorer_va = sigact[sig].restorer;
-    *flags = sigact[sig].flags;
+    *handler_va = __atomic_load_n(&sigact[sig].handler, __ATOMIC_RELAXED);
+    *restorer_va = __atomic_load_n(&sigact[sig].restorer, __ATOMIC_RELAXED);
+    *flags = __atomic_load_n(&sigact[sig].flags, __ATOMIC_RELAXED);
     if (sa_mask != NULL) {
-        *sa_mask = sigact[sig].sa_mask;
+        *sa_mask = __atomic_load_n(&sigact[sig].sa_mask, __ATOMIC_RELAXED);
     }
     return 0;
 }
@@ -105,34 +108,35 @@ int sparc32_sigaltstack_state(uint32_t *sp, uint32_t *size, int *onstack)
     if (sp == NULL || size == NULL || onstack == NULL) {
         return -1;
     }
-    if (!sigalt.enabled) {
+    if (!__atomic_load_n(&sigalt.enabled, __ATOMIC_ACQUIRE)) {
         return -1;
     }
-    *sp = sigalt.sp;
-    *size = sigalt.size;
-    *onstack = sigalt.onstack;
+    *sp = __atomic_load_n(&sigalt.sp, __ATOMIC_RELAXED);
+    *size = __atomic_load_n(&sigalt.size, __ATOMIC_RELAXED);
+    *onstack = __atomic_load_n(&sigalt.onstack, __ATOMIC_RELAXED);
     return 0;
 }
 
 void sparc32_sigaltstack_set_onstack(int onstack)
 {
-    sigalt.onstack = (onstack != 0) ? 1 : 0;
+    __atomic_store_n(&sigalt.onstack, (onstack != 0) ? 1 : 0,
+        __ATOMIC_RELEASE);
 }
 
 void sparc32_signal_reset_all(void)
 {
     int sig;
     for (sig = 1; sig <= 64; sig++) {
-        sigact[sig].installed = 0;
-        sigact[sig].handler = 0U;
-        sigact[sig].restorer = 0U;
-        sigact[sig].flags = 0U;
-        sigact[sig].sa_mask = 0ULL;
+        __atomic_store_n(&sigact[sig].installed, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&sigact[sig].handler, 0U, __ATOMIC_RELAXED);
+        __atomic_store_n(&sigact[sig].restorer, 0U, __ATOMIC_RELAXED);
+        __atomic_store_n(&sigact[sig].flags, 0U, __ATOMIC_RELAXED);
+        __atomic_store_n(&sigact[sig].sa_mask, 0ULL, __ATOMIC_RELAXED);
     }
-    sigalt.sp = 0U;
-    sigalt.size = 0U;
-    sigalt.enabled = 0;
-    sigalt.onstack = 0;
+    __atomic_store_n(&sigalt.enabled, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&sigalt.onstack, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&sigalt.sp, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&sigalt.size, 0U, __ATOMIC_RELAXED);
 }
 
 long sparc32_sys_rt_sigaction(sparc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
@@ -182,10 +186,16 @@ long sparc32_sys_rt_sigaction(sparc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
             return -EINVAL;
         }
         if (oact_va != 0U) {
-            uint32_t oh = sigact[sig].installed ? sigact[sig].handler : 0U;
-            uint32_t of = sigact[sig].installed ? sigact[sig].flags : 0U;
-            uint32_t or_va = sigact[sig].installed ? sigact[sig].restorer : 0U;
-            uint64_t om = sigact[sig].installed ? sigact[sig].sa_mask : 0ULL;
+            int inst = __atomic_load_n(&sigact[sig].installed,
+                __ATOMIC_ACQUIRE);
+            uint32_t oh = inst ?
+                __atomic_load_n(&sigact[sig].handler, __ATOMIC_RELAXED) : 0U;
+            uint32_t of = inst ?
+                __atomic_load_n(&sigact[sig].flags, __ATOMIC_RELAXED) : 0U;
+            uint32_t or_va = inst ?
+                __atomic_load_n(&sigact[sig].restorer, __ATOMIC_RELAXED) : 0U;
+            uint64_t om = inst ?
+                __atomic_load_n(&sigact[sig].sa_mask, __ATOMIC_RELAXED) : 0ULL;
             (void)sig_st_be32(ctx, oact_va, oh);
             (void)sig_st_be32(ctx, oact_va + 4U, of);
             (void)sig_st_be32(ctx, oact_va + 8U, or_va);
@@ -193,25 +203,31 @@ long sparc32_sys_rt_sigaction(sparc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
             (void)sig_st_be32(ctx, oact_va + 16U, (uint32_t)om);
         }
         if (handler == 0U || handler == 1U) {
-            sigact[sig].installed = 0;
-            sigact[sig].handler = handler;
-            sigact[sig].restorer = 0U;
-            sigact[sig].flags = 0U;
-            sigact[sig].sa_mask = 0ULL;
+            __atomic_store_n(&sigact[sig].installed, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&sigact[sig].handler, handler, __ATOMIC_RELAXED);
+            __atomic_store_n(&sigact[sig].restorer, 0U, __ATOMIC_RELAXED);
+            __atomic_store_n(&sigact[sig].flags, 0U, __ATOMIC_RELAXED);
+            __atomic_store_n(&sigact[sig].sa_mask, 0ULL, __ATOMIC_RELAXED);
         } else {
-            sigact[sig].handler = handler;
-            sigact[sig].restorer = restorer;
-            sigact[sig].flags = flags;
-            sigact[sig].sa_mask = sa_mask;
-            sigact[sig].installed = 1;
+            __atomic_store_n(&sigact[sig].handler, handler, __ATOMIC_RELAXED);
+            __atomic_store_n(&sigact[sig].restorer, restorer,
+                __ATOMIC_RELAXED);
+            __atomic_store_n(&sigact[sig].flags, flags, __ATOMIC_RELAXED);
+            __atomic_store_n(&sigact[sig].sa_mask, sa_mask, __ATOMIC_RELAXED);
+            __atomic_store_n(&sigact[sig].installed, 1, __ATOMIC_RELEASE);
         }
         return 0;
     }
     if (oact_va != 0U) {
-        uint32_t oh = sigact[sig].installed ? sigact[sig].handler : 0U;
-        uint32_t of = sigact[sig].installed ? sigact[sig].flags : 0U;
-        uint32_t or_va = sigact[sig].installed ? sigact[sig].restorer : 0U;
-        uint64_t om = sigact[sig].installed ? sigact[sig].sa_mask : 0ULL;
+        int inst = __atomic_load_n(&sigact[sig].installed, __ATOMIC_ACQUIRE);
+        uint32_t oh = inst ?
+            __atomic_load_n(&sigact[sig].handler, __ATOMIC_RELAXED) : 0U;
+        uint32_t of = inst ?
+            __atomic_load_n(&sigact[sig].flags, __ATOMIC_RELAXED) : 0U;
+        uint32_t or_va = inst ?
+            __atomic_load_n(&sigact[sig].restorer, __ATOMIC_RELAXED) : 0U;
+        uint64_t om = inst ?
+            __atomic_load_n(&sigact[sig].sa_mask, __ATOMIC_RELAXED) : 0ULL;
         (void)sig_st_be32(ctx, oact_va, oh);
         (void)sig_st_be32(ctx, oact_va + 4U, of);
         (void)sig_st_be32(ctx, oact_va + 8U, or_va);
@@ -225,12 +241,16 @@ long sparc32_sys_sigaltstack(sparc32_ctx_t *ctx, uint32_t uss_va,
     uint32_t uoss_va)
 {
     if (uoss_va != 0U) {
-        uint32_t cur_flags = !sigalt.enabled ? SPARC_SS_DISABLE
-            : (sigalt.onstack ? SPARC_SS_ONSTACK : 0U);
+        int en = __atomic_load_n(&sigalt.enabled, __ATOMIC_ACQUIRE);
+        int on = __atomic_load_n(&sigalt.onstack, __ATOMIC_RELAXED);
+        uint32_t cur_sp = __atomic_load_n(&sigalt.sp, __ATOMIC_RELAXED);
+        uint32_t cur_sz = __atomic_load_n(&sigalt.size, __ATOMIC_RELAXED);
+        uint32_t cur_flags = !en ? SPARC_SS_DISABLE
+            : (on ? SPARC_SS_ONSTACK : 0U);
         if (sig_range_ok_prot(uoss_va, 12U, 2U) != 0 ||
-            sig_st_be32(ctx, uoss_va, sigalt.sp) != 0 ||
+            sig_st_be32(ctx, uoss_va, cur_sp) != 0 ||
             sig_st_be32(ctx, uoss_va + 4U, cur_flags) != 0 ||
-            sig_st_be32(ctx, uoss_va + 8U, sigalt.size) != 0) {
+            sig_st_be32(ctx, uoss_va + 8U, cur_sz) != 0) {
             return -EFAULT;
         }
     }
@@ -245,16 +265,16 @@ long sparc32_sys_sigaltstack(sparc32_ctx_t *ctx, uint32_t uss_va,
             return -EFAULT;
         }
         if (flags == SPARC_SS_DISABLE) {
-            sigalt.enabled = 0;
-            sigalt.onstack = 0;
-            sigalt.sp = 0U;
-            sigalt.size = 0U;
+            __atomic_store_n(&sigalt.enabled, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&sigalt.onstack, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&sigalt.sp, 0U, __ATOMIC_RELAXED);
+            __atomic_store_n(&sigalt.size, 0U, __ATOMIC_RELAXED);
             return 0;
         }
         if (flags != 0U && flags != SPARC_SS_ONSTACK) {
             return -EINVAL;
         }
-        if (sigalt.onstack) {
+        if (__atomic_load_n(&sigalt.onstack, __ATOMIC_ACQUIRE)) {
             return -EPERM;
         }
         if (size < SPARC_MINSIGSTKSZ) {
@@ -263,9 +283,9 @@ long sparc32_sys_sigaltstack(sparc32_ctx_t *ctx, uint32_t uss_va,
         if (sig_range_ok_prot(sp, size, 2U) != 0) {
             return -EFAULT;
         }
-        sigalt.sp = sp;
-        sigalt.size = size;
-        sigalt.enabled = 1;
+        __atomic_store_n(&sigalt.sp, sp, __ATOMIC_RELAXED);
+        __atomic_store_n(&sigalt.size, size, __ATOMIC_RELAXED);
+        __atomic_store_n(&sigalt.enabled, 1, __ATOMIC_RELEASE);
     }
     return 0;
 }

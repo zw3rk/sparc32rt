@@ -93,13 +93,20 @@ static inline bool sparc32_atomic_ldstub(sparc32_ctx_t *ctx, uint32_t va,
 {
     uint8_t *cell;
     uint8_t old;
-    void *hva = sparc32_atomic_hva(ctx, va, 1U, 3U);
+    bool has_code;
+    void *hva;
+    sparc32_vm_access_enter();
+    hva = sparc32_atomic_hva(ctx, va, 1U, 3U);
     if (hva == NULL) {
+        sparc32_vm_access_leave();
         return false;
     }
     cell = (uint8_t *)hva;
     old = __atomic_exchange_n(cell, (uint8_t)0xFFU, __ATOMIC_SEQ_CST);
-    if (vm32_range_has_code(va, 1U)) {
+    vm32_note_page_write(va, 1U);
+    has_code = vm32_range_has_code(va, 1U);
+    sparc32_vm_access_leave();
+    if (has_code) {
         vm_invalidate_jit(ctx, va, va + 1U);
     }
     interp_wreg(ctx, rd, (uint32_t)old);
@@ -117,13 +124,20 @@ static inline bool sparc32_atomic_swap(sparc32_ctx_t *ctx, uint32_t va,
     uint32_t new_cell = sparc32_be_cell_encode(old_rd);
     uint32_t old_cell;
     uint32_t *cell;
-    void *hva = sparc32_atomic_hva(ctx, va, 4U, 3U);
+    bool has_code;
+    void *hva;
+    sparc32_vm_access_enter();
+    hva = sparc32_atomic_hva(ctx, va, 4U, 3U);
     if (hva == NULL) {
+        sparc32_vm_access_leave();
         return false;
     }
     cell = (uint32_t *)hva;
     old_cell = __atomic_exchange_n(cell, new_cell, __ATOMIC_SEQ_CST);
-    if (vm32_range_has_code(va, 4U)) {
+    vm32_note_page_write(va, 4U);
+    has_code = vm32_range_has_code(va, 4U);
+    sparc32_vm_access_leave();
+    if (has_code) {
         vm_invalidate_jit(ctx, va, va + 4U);
     }
     interp_wreg(ctx, rd, sparc32_be_cell_decode(old_cell));
@@ -143,16 +157,23 @@ static inline bool sparc32_atomic_casa(sparc32_ctx_t *ctx, uint32_t va,
     uint32_t expected = sparc32_be_cell_encode(cmp);
     uint32_t desired = sparc32_be_cell_encode(old_rd);
     uint32_t *cell;
-    void *hva = sparc32_atomic_hva(ctx, va, 4U, 3U);
+    bool has_code = false;
+    void *hva;
+    sparc32_vm_access_enter();
+    hva = sparc32_atomic_hva(ctx, va, 4U, 3U);
     if (hva == NULL) {
+        sparc32_vm_access_leave();
         return false;
     }
     cell = (uint32_t *)hva;
     if (__atomic_compare_exchange_n(cell, &expected, desired, false,
             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-        if (vm32_range_has_code(va, 4U)) {
-            vm_invalidate_jit(ctx, va, va + 4U);
-        }
+        vm32_note_page_write(va, 4U);
+        has_code = vm32_range_has_code(va, 4U);
+    }
+    sparc32_vm_access_leave();
+    if (has_code) {
+        vm_invalidate_jit(ctx, va, va + 4U);
     }
     interp_wreg(ctx, rd, sparc32_be_cell_decode(expected));
     return true;

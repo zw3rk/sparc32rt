@@ -206,9 +206,6 @@ static void vmf_shrink_entry(vm_inode_shared_t *e, uint64_t new_size,
         for (f = glo; f < ghi; f += 4096U) {
             vm32_page_revert_clean((uint32_t)f);
         }
-        if (ghi > glo) {
-            vm32_tlb_invalidate(glo, ghi - glo);
-        }
     }
 }
 

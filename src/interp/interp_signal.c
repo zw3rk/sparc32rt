@@ -411,7 +411,7 @@ static void interp_async_commit(sparc32_ctx_t *ctx, int signo, uint32_t frame)
     if ((uint32_t)signo <= 32U) {
         bit <<= 32U;
     }
-    ctx->pending_signals &= ~bit;
+    __atomic_fetch_and(&ctx->pending_signals, ~bit, __ATOMIC_ACQ_REL);
     (void)sparc32_signal_get_action(signo, &handler, &restorer, &flags,
         &sa_mask);
     interp_apply_delivery_mask(ctx, signo, flags, sa_mask);
@@ -436,16 +436,11 @@ bool interp_try_deliver_async(sparc32_ctx_t *ctx, int signo)
     return true;
 }
 
-/* In-dispatch delivery for sigsuspend(107) ONLY (kill and friends use
- * late delivery: the tail would clobber handler %o0 with the syscall
- * return). The interrupted trap already completed, so the frame records
- * the post-syscall resume point (npc/npc+4, what the tail will commit),
- * not the trap — the handler sigreturns past the syscall, matching
- * Linux. The dispatch tail commits pc = npc; npc += 4, so pre-point npc
- * at the handler (pc one slot behind is dead state). The tail then
- * overwrites %o0 with EINTR and sets C — exactly the post-handler
- * state the test asserts — while the frame psr carries C for the
- * sigreturn restore. */
+/* In-dispatch delivery for sigsuspend(107) ONLY. The interrupted trap
+ * already completed, so the frame records the post-syscall resume point
+ * (npc/npc+4) together with %o0=EINTR (4) and PSR.C=1 for sigreturn
+ * restore, while live ctx enters the handler directly with %o0=signo,
+ * pc=handler, and npc=handler+4 (S32-R2-11). */
 bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
     bool carry)
 {
@@ -488,7 +483,7 @@ bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
             return false;
         }
     }
-    ctx->pending_signals &= ~bit;
+    __atomic_fetch_and(&ctx->pending_signals, ~bit, __ATOMIC_ACQ_REL);
     (void)sparc32_signal_get_action(signo, &handler, &restorer, &flags,
         &sa_mask);
     interp_apply_delivery_mask(ctx, signo, flags, sa_mask);
@@ -497,8 +492,8 @@ bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
     ctx->r[SPARC32_O1] = frame + 0x60U;
     ctx->r[SPARC32_O2] = frame + 0xe0U;
     ctx->r[SPARC32_O7] = restorer;
-    ctx->npc = handler;
-    ctx->pc = handler - 4U;
+    ctx->pc = handler;
+    ctx->npc = handler + 4U;
     ctx->sig_last_frame_va = frame;
     ctx->exit_reason = SPARC32_EXIT_NONE;
     return true;
@@ -516,7 +511,7 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
         return false;
     }
     blocked = ctx->sig_mask | sparc32_l2a_blocked_mask();
-    p = ctx->pending_signals;
+    p = __atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE);
     for (s = 1; s <= 64; s++) {
         uint64_t bit = 1ULL << (uint64_t)((uint32_t)(s - 1) % 32U);
         uint32_t w;
@@ -535,7 +530,8 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
             uint32_t handler;
             uint32_t restorer;
             if (sparc32_signal_get(s, &handler, &restorer) != 0) {
-                ctx->pending_signals &= ~bit;
+                __atomic_fetch_and(&ctx->pending_signals, ~bit,
+                    __ATOMIC_ACQ_REL);
                 continue;
             }
         }

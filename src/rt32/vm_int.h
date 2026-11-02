@@ -50,6 +50,9 @@ bool vm_check_mapped_range_ext_locked(uint32_t start, uint32_t end,
                                       uint32_t *out_prot, uint32_t *out_flags,
                                       char *out_name, size_t name_sz,
                                       int *out_fd, uint32_t *out_pgoff);
+int vm_dup_backing_fd(int fd);
+void vm_close_backing_fd(int fd);
+bool vm_can_split_range_locked(uint32_t start, uint32_t end, bool is_mprotect);
 int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va);
 int vm_munmap_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len);
 void vm_unmap_regions_pub(uint32_t unmap_start, uint32_t unmap_end);

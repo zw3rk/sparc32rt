@@ -304,6 +304,32 @@ int rt_host_unmap(void *host_addr, size_t len)
  * becomes host-exec (W^X; guest data pages stay data, JIT code lives in
  * its own MAP_JIT arena).
  */
+int rt_host_create_shared_mem(const char *name, size_t size,
+    int *out_host_fd)
+{
+    char tmpl[] = "/tmp/sparc32rt-shm-XXXXXX";
+    int fd;
+    int rc;
+    (void)name;
+    if (out_host_fd == NULL || size == 0u) {
+        return -EINVAL;
+    }
+    fd = mkstemp(tmpl);
+    if (fd < 0) {
+        return -errno;
+    }
+    (void)unlink(tmpl);
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    rc = ftruncate(fd, (off_t)size);
+    if (rc != 0) {
+        rc = -errno;
+        close(fd);
+        return rc;
+    }
+    *out_host_fd = fd;
+    return 0;
+}
+
 int rt_host_map_file(void *hint_addr, size_t len, int linux_prot, int shared,
     int fixed, int host_fd, uint64_t aligned_file_offset,
     void **out_host_addr)
@@ -329,7 +355,8 @@ int rt_host_map_file(void *hint_addr, size_t len, int linux_prot, int shared,
         prot |= PROT_READ;
     }
     if (fixed != 0 && hint_addr != NULL &&
-        (((uintptr_t)hint_addr % hp) != 0u || (len % hp) != 0u ||
+        (((uintptr_t)hint_addr % hp) != 0u ||
+         (shared == 0 && (len % hp) != 0u) ||
          (aligned_file_offset % (uint64_t)hp) != 0u)) {
         uintptr_t start = (uintptr_t)hint_addr;
         uintptr_t end = start + len;

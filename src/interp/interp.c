@@ -587,8 +587,12 @@ static void interp_cti(sparc32_ctx_t *ctx, uint32_t pc,
         uint32_t b = (d->is_imm != 0U) ? (uint32_t)d->simm
                                        : ctx->r[d->rs2];
         target = ctx->r[d->rs1] + b;
-        /* Link write deferred past the delay slot: a faulting delay
-         * leaves rd pristine (precise fault state, dbt parity). */
+        if ((target & 3U) != 0U) {
+            ctx->exit_reason = SPARC32_EXIT_FAULT;
+            ctx->fault_addr = target;
+            return;
+        }
+        interp_wreg(ctx, d->rd, pc);
     }
 
     /* Delay runs unless annulled away (E02): taken BA,a always skips;
@@ -615,6 +619,10 @@ static void interp_cti(sparc32_ctx_t *ctx, uint32_t pc,
                 taken ? 1U : 0U, target, npc);
     }
     if (sparc32_fetch_decode(ctx, npc, &dd) != 0) {
+        if (d->cls == (uint32_t)SPARC32_OP_JMPL) {
+            ctx->pc = npc;
+            ctx->npc = target;
+        }
         return;
     }
     if (interp_is_cti(&dd)) {
@@ -627,14 +635,11 @@ static void interp_cti(sparc32_ctx_t *ctx, uint32_t pc,
         if (d->cls == (uint32_t)SPARC32_OP_JMPL) {
             /* Faulting JMPL delay: resume at the delay insn with the
              * recorded transfer target as npc (dbt recovers the same
-             * target via aot_delay_target_get). rd stays pristine. */
+             * target via aot_delay_target_get). rd already holds pc. */
             ctx->pc = npc;
             ctx->npc = target;
         }
         return;
-    }
-    if (d->cls == (uint32_t)SPARC32_OP_JMPL) {
-        interp_wreg(ctx, d->rd, pc);
     }
     if (taken) {
         ctx->pc = target;

@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifndef MAP_ANONYMOUS
@@ -35,6 +36,8 @@
 typedef struct {
     int      fd;
     uint32_t pgoff;
+    uint64_t dev;
+    uint64_t ino;
 } vm_region_meta_t;
 
 static size_t vm_host_page_size(void)
@@ -44,6 +47,10 @@ static size_t vm_host_page_size(void)
 }
 
 static _Atomic uint32_t g_vm_lock = 0U;
+static _Atomic uint32_t g_vm_readers = 0U;
+static _Atomic uint32_t g_vm_writer_waiting = 0U;
+static _Thread_local uint32_t t_vm_lock_held = 0U;
+static _Thread_local uint32_t t_vm_read_depth = 0U;
 static sparc32_ctx_t   *g_vm_root_ctx = NULL;
 static uint32_t         g_vm_brk_base = 0U;
 static uint32_t         g_vm_brk_curr = 0U;
@@ -52,30 +59,71 @@ static sparc32_region_t g_vm_regions[SPARC32_MAX_REGIONS];
 static vm_region_meta_t g_vm_region_meta[SPARC32_MAX_REGIONS];
 static size_t           g_vm_region_count = 0U;
 
-static int vm_dup_backing_fd(int fd)
+int vm_dup_backing_fd(int fd)
 {
     int dup_fd;
     if (fd < 0) {
         return -1;
     }
     dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 512);
-    return (dup_fd >= 0) ? dup_fd : fd;
+    if (dup_fd < 0) {
+        dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    }
+    return dup_fd;
 }
 
-static void vm_close_backing_fd(int fd)
+void vm_close_backing_fd(int fd)
 {
-    if (fd >= 512) {
+    if (fd >= 0) {
         (void)close(fd);
+    }
+}
+
+void sparc32_vm_access_enter(void)
+{
+    if (t_vm_lock_held != 0U || t_vm_read_depth++ > 0U) {
+        return;
+    }
+    for (;;) {
+        while (atomic_load_explicit(&g_vm_writer_waiting,
+                   memory_order_acquire) != 0U ||
+               atomic_load_explicit(&g_vm_lock,
+                   memory_order_acquire) != 0U) {
+        }
+        atomic_fetch_add_explicit(&g_vm_readers, 1U, memory_order_acq_rel);
+        if (atomic_load_explicit(&g_vm_writer_waiting,
+                memory_order_acquire) == 0U &&
+            atomic_load_explicit(&g_vm_lock,
+                memory_order_acquire) == 0U) {
+            return;
+        }
+        atomic_fetch_sub_explicit(&g_vm_readers, 1U, memory_order_release);
+    }
+}
+
+void sparc32_vm_access_leave(void)
+{
+    if (t_vm_lock_held != 0U) {
+        return;
+    }
+    if (t_vm_read_depth > 0U && --t_vm_read_depth == 0U) {
+        atomic_fetch_sub_explicit(&g_vm_readers, 1U, memory_order_release);
     }
 }
 
 void vm_lock_acquire(void)
 {
+    atomic_fetch_add_explicit(&g_vm_writer_waiting, 1U, memory_order_acq_rel);
     sparc32_spin_lock(&g_vm_lock);
+    t_vm_lock_held = 1U;
+    atomic_fetch_sub_explicit(&g_vm_writer_waiting, 1U, memory_order_release);
+    while (atomic_load_explicit(&g_vm_readers, memory_order_acquire) != 0U) {
+    }
 }
 
 void vm_lock_release(void)
 {
+    t_vm_lock_held = 0U;
     sparc32_spin_unlock(&g_vm_lock);
 }
 
@@ -213,6 +261,15 @@ static int vm_insert_region_raw_ext(uint32_t start, uint32_t end,
     }
     g_vm_region_meta[pos].fd    = vm_dup_backing_fd(fd);
     g_vm_region_meta[pos].pgoff = (fd >= 0) ? pgoff : 0U;
+    g_vm_region_meta[pos].dev   = 0ULL;
+    g_vm_region_meta[pos].ino   = 0ULL;
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0) {
+            g_vm_region_meta[pos].dev = (uint64_t)st.st_dev;
+            g_vm_region_meta[pos].ino = (uint64_t)st.st_ino;
+        }
+    }
     return 0;
 }
 
@@ -232,6 +289,7 @@ static void vm_coalesce_regions_locked(void)
         uint32_t prev_pages = (prev->end - prev->start) / SPARC32_PAGE_SIZE;
         bool same_backing = (prev_m->fd < 0 && curr_m->fd < 0) ||
             (prev_m->fd >= 0 && curr_m->fd >= 0 &&
+             prev_m->dev == curr_m->dev && prev_m->ino == curr_m->ino &&
              curr_m->pgoff == prev_m->pgoff + prev_pages);
         if (prev->end == curr->start && prev->prot == curr->prot &&
             prev->flags == curr->flags && strcmp(prev->name, curr->name) == 0 &&
@@ -247,6 +305,31 @@ static void vm_coalesce_regions_locked(void)
         }
     }
     g_vm_region_count = dst + 1U;
+}
+
+bool vm_can_split_range_locked(uint32_t start, uint32_t end, bool is_mprotect)
+{
+    size_t extra = 0U;
+    size_t removed = 0U;
+    size_t i;
+
+    vm_coalesce_regions_locked();
+    for (i = 0U; i < g_vm_region_count; i++) {
+        const sparc32_region_t *r = &g_vm_regions[i];
+        if (r->end <= start || r->start >= end) {
+            continue;
+        }
+        if (!is_mprotect && r->start >= start && r->end <= end) {
+            removed++;
+            continue;
+        }
+        if (r->start < start && r->end > end) {
+            extra += is_mprotect ? 2U : 1U;
+        } else if (is_mprotect && (r->start < start || r->end > end)) {
+            extra += 1U;
+        }
+    }
+    return (g_vm_region_count - removed + extra) <= SPARC32_MAX_REGIONS;
 }
 
 static void vm_unmap_regions_locked(uint32_t unmap_start, uint32_t unmap_end)
@@ -334,7 +417,6 @@ int vm_record_region_ext_locked(uint32_t start, uint32_t end,
         for (va = start & ~(uint32_t)0xFFFU; va < end; va += SPARC32_PAGE_SIZE) {
             vm32_publish_page(va, prot & 0x7U, vm32_page_state(va));
         }
-        vm32_tlb_invalidate(start, end - start);
     }
     return rc;
 }
@@ -483,6 +565,7 @@ bool vm_check_mapped_range_locked(uint32_t start, uint32_t end,
 
 int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)
 {
+    uint64_t hp_align = (uint64_t)vm_host_page_size() - 1ULL;
     uint64_t cursor_cand;
     uint64_t cand;
     size_t i;
@@ -492,7 +575,7 @@ int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)
         return -1;
     }
 
-    cursor_cand = vm_page_align_up((uint64_t)g_vm_mmap_cursor);
+    cursor_cand = (vm_page_align_up((uint64_t)g_vm_mmap_cursor) + hp_align) & ~hp_align;
     if (cursor_cand < (uint64_t)RT32_MMAP_BASE_32) {
         cursor_cand = (uint64_t)RT32_MMAP_BASE_32;
     }
@@ -505,7 +588,7 @@ int vm_find_free_gap_locked(uint64_t aligned_len, uint32_t *out_va)
     cand = (uint64_t)RT32_MMAP_BASE_32;
     for (i = 0U; i < g_vm_region_count; i++) {
         uint64_t r_start = (uint64_t)g_vm_regions[i].start;
-        uint64_t r_end   = vm_page_align_up((uint64_t)g_vm_regions[i].end);
+        uint64_t r_end   = (vm_page_align_up((uint64_t)g_vm_regions[i].end) + hp_align) & ~hp_align;
         if (r_end <= cand) {
             continue;
         }
@@ -759,7 +842,6 @@ uint32_t rt32_vm_brk(sparc32_ctx_t *ctx, uint32_t new_brk)
             for (va = new_page; va < old_page; va += SPARC32_PAGE_SIZE) {
                 vm32_publish_page(va, 0U, 0U);
             }
-            vm32_tlb_invalidate(new_page, len);
         }
     }
 

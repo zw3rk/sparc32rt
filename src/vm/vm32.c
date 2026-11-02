@@ -56,30 +56,44 @@ static uint64_t g_vm32_base = 0u;
 /* Per-4 KiB guest page protection (Linux PROT bits) and state bits. */
 static uint8_t *g_vm32_prot = NULL;
 static uint8_t *g_vm32_state = NULL;
-static uint64_t g_vm32_code_mask[4096];
+static uint64_t *g_vm32_code_mask = NULL;
 
 /* P13-4 JIT-visible alias of g_vm32_prot. trampoline_a64.S loads this
  * pointer into callee-saved x25 once per block entry, so every inline
  * load/store probes the table with a single LDRB (no MOVZ/MOVK). */
 uint8_t *g_vm32_prot_jit = NULL;
 
-/* P13-4 bit 3 (VM32_PROT_FAST_WRITE): 1 iff the page is writable
- * ((prot & 2) != 0) and holds no translated code
- * ((state & RT_PAGE_HAS_CODE) == 0), so an inline store needs one
- * TBZ instead of a prot check plus a code-bitmap check. */
+/* P13-4 bit 3 (VM32_PROT_FAST_WRITE): 1 iff the page is writable,
+ * promoted past RT_PAGE_COW_CLEAN, and holds no translated code or
+ * reservations (rt_write_tag_allowed), so an inline store needs one
+ * TBZ instead of a prot check plus a code/COW bitmap check. */
 #define VM32_PROT_FAST_WRITE 0x08u
 
 /* Centralize every g_vm32_prot/g_vm32_state mutation through this
  * helper so bit 3 never goes stale (P13-4 invariant 8). */
 static inline void vm32_sync_fast_write(uint32_t vpn)
 {
-    uint8_t p = g_vm32_prot[vpn];
-    uint8_t s = g_vm32_state[vpn];
-    if (((p & 2u) != 0u) && ((s & (uint8_t)RT_PAGE_HAS_CODE) == 0u)) {
-        g_vm32_prot[vpn] = (uint8_t)(p | VM32_PROT_FAST_WRITE);
-    } else {
-        g_vm32_prot[vpn] = (uint8_t)(p & (uint8_t)~VM32_PROT_FAST_WRITE);
+    uint8_t p = __atomic_load_n(&g_vm32_prot[vpn], __ATOMIC_ACQUIRE) & 0x7u;
+    uint8_t s = __atomic_load_n(&g_vm32_state[vpn], __ATOMIC_ACQUIRE);
+    if (rt_write_tag_allowed((uint32_t)s, (uint32_t)p)) {
+        p = (uint8_t)(p | VM32_PROT_FAST_WRITE);
     }
+    __atomic_store_n(&g_vm32_prot[vpn], p, __ATOMIC_RELEASE);
+}
+
+static uint64_t vm32_line_mask_in_page(uint32_t vpn, uint32_t gva, size_t len)
+{
+    uint32_t page_base = vpn * (uint32_t)VM32_GUEST_PAGE;
+    uint32_t page_end = page_base + (uint32_t)VM32_GUEST_PAGE;
+    uint32_t lo = (gva > page_base) ? gva : page_base;
+    uint64_t end64 = (uint64_t)gva + (uint64_t)len;
+    uint32_t hi = (end64 < (uint64_t)page_end) ? (uint32_t)end64 : page_end;
+    uint32_t l0 = (lo & 0xFFFu) >> 6u;
+    uint32_t l1 = ((hi - 1u) & 0xFFFu) >> 6u;
+    if (l1 - l0 >= 63u) {
+        return ~UINT64_C(0);
+    }
+    return ((UINT64_C(1) << (l1 - l0 + 1u)) - 1ULL) << l0;
 }
 
 /* Current regime (valid after vm32_reserve/vm32_attach). */
@@ -94,8 +108,8 @@ bool vm32_ready(void)
     return g_vm32_ready;
 }
 
-/* Allocate the per-4 KiB protection/state tables (shared by the fresh
- * reserve path and the adopt path below). */
+/* Allocate the per-4 KiB protection/state/code-mask tables (shared by the
+ * fresh reserve path and the adopt path below). */
 static int vm32_alloc_tables(void)
 {
     if (g_vm32_prot == NULL) {
@@ -107,6 +121,17 @@ static int vm32_alloc_tables(void)
     if (g_vm32_state == NULL) {
         g_vm32_state = (uint8_t *)calloc((size_t)VM32_PAGE_COUNT, 1u);
         if (g_vm32_state == NULL) {
+            free(g_vm32_prot);
+            g_vm32_prot = NULL;
+            return -1;
+        }
+    }
+    if (g_vm32_code_mask == NULL) {
+        g_vm32_code_mask = (uint64_t *)calloc((size_t)VM32_PAGE_COUNT,
+            sizeof(uint64_t));
+        if (g_vm32_code_mask == NULL) {
+            free(g_vm32_state);
+            g_vm32_state = NULL;
             free(g_vm32_prot);
             g_vm32_prot = NULL;
             return -1;
@@ -192,7 +217,10 @@ void vm32_reset(void)
     if (g_vm32_state != NULL) {
         memset(g_vm32_state, 0, (size_t)VM32_PAGE_COUNT);
     }
-    memset(g_vm32_code_mask, 0, sizeof(g_vm32_code_mask));
+    if (g_vm32_code_mask != NULL) {
+        memset(g_vm32_code_mask, 0,
+            (size_t)VM32_PAGE_COUNT * sizeof(uint64_t));
+    }
 }
 
 /* Canonical host address: every engine addresses HVA = G + gva. */
@@ -208,11 +236,20 @@ void *vm32_hva(const sparc32_ctx_t *ctx, uint32_t gva)
 void vm32_publish_page(uint32_t gva, uint32_t prot, uint32_t state)
 {
     uint64_t vpn = (uint64_t)(gva / VM32_GUEST_PAGE);
+    uint8_t keep;
     if (!g_vm32_ready || vpn >= (uint64_t)VM32_PAGE_COUNT) {
         return;
     }
-    g_vm32_prot[vpn] = (uint8_t)(prot & 7u);
-    g_vm32_state[vpn] = (uint8_t)(state & 0xFFu);
+    keep = (prot == 0u && state == 0u) ? 0u
+        : (__atomic_load_n(&g_vm32_state[vpn], __ATOMIC_ACQUIRE) &
+           (uint8_t)(RT_PAGE_HAS_CODE | RT_PAGE_HAS_SW_RESERVATION));
+    if (prot == 0u && state == 0u) {
+        __atomic_store_n(&g_vm32_code_mask[vpn], 0ULL, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&g_vm32_prot[vpn], (uint8_t)(prot & 7u),
+        __ATOMIC_RELEASE);
+    __atomic_store_n(&g_vm32_state[vpn],
+        (uint8_t)((state & 0xFFu) | (uint32_t)keep), __ATOMIC_RELEASE);
     vm32_sync_fast_write((uint32_t)vpn);
 }
 
@@ -228,7 +265,7 @@ uint32_t vm32_page_state(uint32_t gva)
     if (!g_vm32_ready || vpn >= (uint64_t)VM32_PAGE_COUNT) {
         return 0u;
     }
-    return (uint32_t)g_vm32_state[vpn];
+    return (uint32_t)__atomic_load_n(&g_vm32_state[vpn], __ATOMIC_ACQUIRE);
 }
 
 void vm32_page_revert_clean(uint32_t gva)
@@ -238,22 +275,40 @@ void vm32_page_revert_clean(uint32_t gva)
     if (!g_vm32_ready || vpn >= (uint64_t)VM32_PAGE_COUNT) {
         return;
     }
-    state = g_vm32_state[vpn];
+    state = __atomic_load_n(&g_vm32_state[vpn], __ATOMIC_ACQUIRE);
     if ((state & (uint8_t)RT_PAGE_COW_DIRTY) == 0u) {
         return;
     }
     state &= (uint8_t)~RT_PAGE_COW_DIRTY;
     state |= (uint8_t)RT_PAGE_COW_CLEAN;
-    g_vm32_state[vpn] = state;
+    __atomic_store_n(&g_vm32_state[vpn], state, __ATOMIC_RELEASE);
     vm32_sync_fast_write((uint32_t)vpn);
 }
 
-/* Retained no-op hook for VM lifecycle callers; permissions live in
- * g_vm32_prot / g_vm32_prot_jit and take effect immediately. */
-void vm32_tlb_invalidate(uint32_t start, uint32_t len)
+/* Promote any RT_PAGE_COW_CLEAN page covered by [gva, gva + len) to
+ * RT_PAGE_COW_DIRTY on write and refresh VM32_PROT_FAST_WRITE. */
+void vm32_note_page_write(uint32_t gva, size_t len)
 {
-    (void)start;
-    (void)len;
+    uint64_t first;
+    uint64_t last;
+    uint64_t vpn;
+    if (!g_vm32_ready || len == 0u) {
+        return;
+    }
+    first = (uint64_t)(gva / VM32_GUEST_PAGE);
+    last = ((uint64_t)gva + (uint64_t)len - 1u) / (uint64_t)VM32_GUEST_PAGE;
+    if (last >= (uint64_t)VM32_PAGE_COUNT) {
+        last = (uint64_t)VM32_PAGE_COUNT - 1u;
+    }
+    for (vpn = first; vpn <= last; vpn++) {
+        uint8_t state = __atomic_load_n(&g_vm32_state[vpn], __ATOMIC_ACQUIRE);
+        if ((state & (uint8_t)RT_PAGE_COW_CLEAN) != 0u) {
+            state = (uint8_t)((state & (uint8_t)~RT_PAGE_COW_CLEAN) |
+                (uint8_t)RT_PAGE_COW_DIRTY);
+            __atomic_store_n(&g_vm32_state[vpn], state, __ATOMIC_RELEASE);
+            vm32_sync_fast_write((uint32_t)vpn);
+        }
+    }
 }
 
 /*
@@ -266,20 +321,9 @@ void vm32_note_code_page(uint32_t gva, uint32_t len)
     uint64_t first;
     uint64_t last;
     uint64_t vpn;
-    uint64_t lfirst;
-    uint64_t llast;
-    uint64_t line;
     uint32_t eff_len = (len == 0u) ? 1u : len;
-    if (!g_vm32_ready) {
+    if (!g_vm32_ready || g_vm32_code_mask == NULL) {
         return;
-    }
-    lfirst = (uint64_t)(gva >> 6);
-    llast = ((uint64_t)gva + (uint64_t)eff_len - 1u) >> 6;
-    for (line = lfirst; line <= llast; line++) {
-        uint32_t pv = (uint32_t)(line >> 6) & 4095u;
-        uint32_t bit = (uint32_t)line & 63u;
-        __atomic_or_fetch(&g_vm32_code_mask[pv], (uint64_t)1u << bit,
-            __ATOMIC_RELEASE);
     }
     first = (uint64_t)(gva / VM32_GUEST_PAGE);
     last = ((uint64_t)gva + (uint64_t)eff_len - 1u) /
@@ -288,7 +332,11 @@ void vm32_note_code_page(uint32_t gva, uint32_t len)
         last = (uint64_t)VM32_PAGE_COUNT - 1u;
     }
     for (vpn = first; vpn <= last; vpn++) {
-        g_vm32_state[vpn] |= (uint8_t)RT_PAGE_HAS_CODE;
+        uint64_t mask = vm32_line_mask_in_page((uint32_t)vpn, gva,
+            (size_t)eff_len);
+        __atomic_fetch_or(&g_vm32_code_mask[vpn], mask, __ATOMIC_RELEASE);
+        __atomic_fetch_or(&g_vm32_state[vpn], (uint8_t)RT_PAGE_HAS_CODE,
+            __ATOMIC_RELEASE);
         vm32_sync_fast_write((uint32_t)vpn);
     }
 }
@@ -298,7 +346,7 @@ void vm32_clear_code_range(uint32_t start, uint32_t end)
     uint64_t first;
     uint64_t last;
     uint64_t vpn;
-    if (!g_vm32_ready || end <= start) {
+    if (!g_vm32_ready || g_vm32_code_mask == NULL || end <= start) {
         return;
     }
     first = (uint64_t)(start / VM32_GUEST_PAGE);
@@ -307,9 +355,9 @@ void vm32_clear_code_range(uint32_t start, uint32_t end)
         last = (uint64_t)VM32_PAGE_COUNT - 1u;
     }
     for (vpn = first; vpn <= last; vpn++) {
-        g_vm32_state[vpn] &= (uint8_t)~RT_PAGE_HAS_CODE;
-        __atomic_store_n(&g_vm32_code_mask[(uint32_t)vpn & 4095u], 0ULL,
+        __atomic_fetch_and(&g_vm32_state[vpn], (uint8_t)~RT_PAGE_HAS_CODE,
             __ATOMIC_RELEASE);
+        __atomic_store_n(&g_vm32_code_mask[vpn], 0ULL, __ATOMIC_RELEASE);
         vm32_sync_fast_write((uint32_t)vpn);
     }
 }
@@ -319,22 +367,9 @@ bool vm32_range_has_code(uint32_t gva, size_t len)
     uint64_t first;
     uint64_t last;
     uint64_t vpn;
-    if (!g_vm32_ready || g_vm32_state == NULL || len == 0u) {
+    if (!g_vm32_ready || g_vm32_state == NULL || g_vm32_code_mask == NULL ||
+        len == 0u) {
         return false;
-    }
-    if (len <= 64u && (((gva ^ (gva + (uint32_t)len - 1u)) >> 12) == 0u)) {
-        uint32_t pv = gva >> 12;
-        uint64_t mask;
-        uint32_t b0;
-        uint32_t b1;
-        if ((g_vm32_state[pv] & (uint8_t)RT_PAGE_HAS_CODE) == 0u) {
-            return false;
-        }
-        mask = __atomic_load_n(&g_vm32_code_mask[pv & 4095u], __ATOMIC_ACQUIRE);
-        b0 = (gva >> 6) & 63u;
-        b1 = ((gva + (uint32_t)len - 1u) >> 6) & 63u;
-        return (((mask >> b0) & 1ULL) != 0ULL) ||
-            (((mask >> b1) & 1ULL) != 0ULL);
     }
     first = (uint64_t)(gva / VM32_GUEST_PAGE);
     last = ((uint64_t)gva + (uint64_t)len - 1u) / (uint64_t)VM32_GUEST_PAGE;
@@ -342,8 +377,14 @@ bool vm32_range_has_code(uint32_t gva, size_t len)
         last = (uint64_t)VM32_PAGE_COUNT - 1u;
     }
     for (vpn = first; vpn <= last; vpn++) {
-        if ((g_vm32_state[vpn] & (uint8_t)RT_PAGE_HAS_CODE) != 0u) {
-            return true;
+        uint8_t st = __atomic_load_n(&g_vm32_state[vpn], __ATOMIC_ACQUIRE);
+        if ((st & (uint8_t)RT_PAGE_HAS_CODE) != 0u) {
+            uint64_t mask = vm32_line_mask_in_page((uint32_t)vpn, gva, len);
+            uint64_t code_mask = __atomic_load_n(&g_vm32_code_mask[vpn],
+                __ATOMIC_ACQUIRE);
+            if ((code_mask & mask) != 0ULL) {
+                return true;
+            }
         }
     }
     return false;

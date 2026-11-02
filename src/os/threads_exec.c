@@ -14,10 +14,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "sparc32rt.h"
 
 #include "interp/interp.h"
+#include "os/l2a_access.h"
 #include "os/syscalls_min.h"
 #include "os/threads.h"
 #include "rt32/rt32.h"
@@ -26,21 +28,14 @@
 #define THR_EXEC_ARGS_MAX 256U
 #define THR_EXEC_STR_MAX 4096U
 
-/* Big-endian guest word load (moved with the exec block; sole user). */
-static uint32_t thr_ld_be32(const sparc32_ctx_t *ctx, uint32_t va)
-{
-    const uint8_t *p = (const uint8_t *)sparc32_guest_ptr(ctx, va);
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-}
-
 /* Checked guest word load (moved with the exec block; sole user). */
 static int thr_ld(sparc32_ctx_t *ctx, uint32_t va, uint32_t *out)
 {
-    if (sparc32_thr_range_ok(va, 4U) != 0) {
+    uint8_t p[4];
+    if (l2a_load(ctx, va, p, 4U) != 0) {
         return -EFAULT;
     }
-    *out = thr_ld_be32(ctx, va);
+    *out = get_be32(p);
     return 0;
 }
 
@@ -50,21 +45,8 @@ static int thr_ld(sparc32_ctx_t *ctx, uint32_t va, uint32_t *out)
 static int thr_read_cstr(sparc32_ctx_t *ctx, uint32_t va, char *out,
     size_t cap)
 {
-    size_t n = 0U;
-    for (;;) {
-        uint8_t c;
-        if (sparc32_thr_range_ok(va + (uint32_t)n, 1U) != 0) {
-            return -EFAULT;
-        }
-        c = *(const uint8_t *)sparc32_guest_ptr(ctx, va + (uint32_t)n);
-        if (n + 1U >= cap) {
-            return -ENAMETOOLONG;
-        }
-        out[n++] = (char)c;
-        if (c == 0) {
-            return 0;
-        }
-    }
+    long rc = l2a_copy_cstring(ctx, va, out, (uint32_t)cap);
+    return (int)rc;
 }
 
 static void thr_free_vec(char **v, size_t n);
@@ -155,28 +137,35 @@ long sparc32_thr_execve(sparc32_ctx_t *ctx, uint32_t path_va,
         thr_free_vec(argv, argc);
         return rc;
     }
-    /* Validate target ELF + PT_INTERP non-destructively before mutating
-     * signal dispositions or tearing down the caller's address space. */
-    rc = rt32_elf_validate(ctx, path);
-    if (rc != 0) {
-        thr_free_vec(argv, argc);
-        thr_free_vec(envp, envc);
-        return rc;
-    }
-    /* New image: no handlers (Linux resets caught signals to SIG_DFL). */
-    sparc32_signal_reset_all();
-    rt32_vm_reset_for_exec(ctx);
-    rc = rt32_elf_load(ctx, -1, path, &info);
-    if (rc != 0) {
-        thr_free_vec(argv, argc);
-        thr_free_vec(envp, envc);
-        return rc;
+    /* Prepare and retain validated ELF + PT_INTERP descriptors and load
+     * biases before mutating signal dispositions or tearing down the
+     * caller's address space. */
+    {
+        rt32_elf_plan_t plan;
+        rc = rt32_elf_prepare(ctx, -1, path, &plan);
+        if (rc != 0) {
+            thr_free_vec(argv, argc);
+            thr_free_vec(envp, envc);
+            return rc;
+        }
+        /* Point of no return: reset signal dispositions and replace the
+         * guest VM image from the retained open descriptors. Any host
+         * mapping failure after destroying the old VM terminates the
+         * process fatally rather than returning to an unmapped caller. */
+        sparc32_signal_reset_all();
+        rt32_vm_reset_for_exec(ctx);
+        rc = rt32_elf_commit_plan(ctx, &plan, &info);
+        if (rc != 0) {
+            thr_free_vec(argv, argc);
+            thr_free_vec(envp, envc);
+            _exit(127);
+        }
     }
     rc = rt32_stack_setup(ctx, &info, (int)argc, argv, envp, &sp);
     thr_free_vec(argv, argc);
     thr_free_vec(envp, envc);
     if (rc != 0) {
-        return -ENOMEM;
+        _exit(127);
     }
     /* Fresh-process CPU state (mirrors main.c load_guest entry). */
     for (i = 0U; i < 32U; i++) {

@@ -315,12 +315,14 @@ void vm32_reset(void);
 void vm32_publish_page(uint32_t gva, uint32_t prot, uint32_t state);
 uint32_t vm32_page_state(uint32_t gva);
 void vm32_page_revert_clean(uint32_t gva);
-void vm32_tlb_invalidate(uint32_t start, uint32_t len);
+void vm32_note_page_write(uint32_t gva, size_t len);
 void vm32_note_code_page(uint32_t gva, uint32_t len);
 void vm32_clear_code_range(uint32_t start, uint32_t end);
 bool vm32_range_has_code(uint32_t gva, size_t len);
 const uint8_t *sparc32_vm_prot_base(void);
 const uint8_t *sparc32_vm_state_base(void);
+void sparc32_vm_access_enter(void);
+void sparc32_vm_access_leave(void);
 void vm_file_note_mutation(uint64_t dev, uint64_t ino, int host_fd,
     uint64_t new_size);
 void vm_file_note_mapping(uint64_t dev, uint64_t ino, int host_fd,

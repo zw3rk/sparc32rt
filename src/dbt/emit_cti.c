@@ -25,11 +25,6 @@
 #define ES2   17u /* w17: scratch */
 #define EKEEP 22u /* w22: value keeper across delay slots (JMPL target) */
 
-static uint32_t cti_reg_off(uint32_t r)
-{
-    return (r & 31u) * 4u;
-}
-
 static void cti_ldgreg(a64_buf_t *b, unsigned wd, uint32_t rs)
 {
     a64_gpr_load(b, wd, rs);
@@ -255,18 +250,22 @@ int sparc32_emit_call(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     ec->fault_pc = pc;
     if ((pc & 0xFFFu) == 0xFFCu) {
         a64_emit_mov_pc32(b, ES0, pc);
-        a64_emit_str_imm_w(b, ES0, A64_XCTX, cti_reg_off(SPARC32_O7));
+        cti_stgreg(b, SPARC32_O7, ES0);
         b->is_call = true;
         return e_page_final(ec, npc, target);
     }
     if (ec->delay == NULL || ec->delay->cls == (uint32_t)SPARC32_OP_CALL ||
         ec->delay->cls == (uint32_t)SPARC32_OP_BRANCH ||
         ec->delay->cls == (uint32_t)SPARC32_OP_JMPL ||
-        ec->delay->cls == (uint32_t)SPARC32_OP_TRAP) {
+        ec->delay->cls == (uint32_t)SPARC32_OP_TRAP ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_FBRANCH ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_PRIV ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_ILLEGAL ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_FPU) {
         return sparc32_emit_exit_singlestep(ec, pc);
     }
     a64_emit_mov_pc32(b, ES0, pc);
-    a64_emit_str_imm_w(b, ES0, A64_XCTX, cti_reg_off(SPARC32_O7));
+    cti_stgreg(b, SPARC32_O7, ES0);
     b->nzcv_valid = 0;
     b->is_call = true;
     rc = e_emit_delay(ec, npc);
@@ -301,6 +300,7 @@ int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     a64_buf_t *b = ec->buf;
     uint32_t pc = ec->pc;
     uint32_t npc = pc + 4u;
+    size_t p_aligned;
     int rc;
 
     ec->fault_pc = pc;
@@ -310,10 +310,28 @@ int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     if (ec->delay == NULL || ec->delay->cls == (uint32_t)SPARC32_OP_CALL ||
         ec->delay->cls == (uint32_t)SPARC32_OP_BRANCH ||
         ec->delay->cls == (uint32_t)SPARC32_OP_JMPL ||
-        ec->delay->cls == (uint32_t)SPARC32_OP_TRAP) {
+        ec->delay->cls == (uint32_t)SPARC32_OP_TRAP ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_FBRANCH ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_PRIV ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_ILLEGAL ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_FPU) {
         return sparc32_emit_exit_singlestep(ec, pc);
     }
     cti_ea_into(b, EKEEP, d);
+    /* Validate 4-byte alignment of target before committing rd or running
+     * the delay slot; misaligned targets exit via SINGLE_STEP at pc so the
+     * interpreter raises the precise alignment fault at JMPL. */
+    a64_emit_mov_imm32(b, ES0, 3u);
+    a64_emit_and_reg_w(b, false, ES0, EKEEP, ES0, A64_SHIFT_LSL, 0u);
+    p_aligned = a64_emit_cbz_w_placeholder(b, false, ES0);
+    if (sparc32_emit_exit_singlestep(ec, pc) != 0) {
+        return -1;
+    }
+    a64_patch_cbz_w(b, p_aligned, b->count);
+    if (d->rd != 0u) {
+        a64_emit_mov_pc32(b, ES0, pc);
+        cti_stgreg(b, d->rd, ES0);
+    }
     if (e_delay_needs_jmpl_record(ec->delay) != 0) {
         a64_jmpl_record(b, EKEEP, ES2, ES0);
     }
@@ -324,10 +342,6 @@ int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     rc = e_emit_delay(ec, npc);
     if (rc != 0) {
         return rc;
-    }
-    if (d->rd != 0u) {
-        a64_emit_mov_pc32(b, ES0, pc);
-        cti_stgreg(b, d->rd, ES0);
     }
     a64_emit_exit_branch_reg(b, EKEEP);
     return b->overflow ? -1 : 0;

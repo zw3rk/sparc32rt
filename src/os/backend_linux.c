@@ -148,7 +148,7 @@ int rt_host_map_file(void *hint_addr, size_t len, int linux_prot, int shared,
 int rt_host_create_shared_mem(const char *name, size_t size,
     int *out_host_fd)
 {
-    char anon[64];
+    char tmpl[] = "/tmp/sparc32rt-shm-XXXXXX";
     int fd;
     int rc;
     (void)name;
@@ -169,12 +169,12 @@ int rt_host_create_shared_mem(const char *name, size_t size,
         return 0;
     }
 #endif
-    snprintf(anon, sizeof anon, "/sparc32rt-%d", (int)getpid());
-    fd = shm_open(anon, O_RDWR | O_CREAT | O_EXCL, 0600);
+    fd = mkstemp(tmpl);
     if (fd < 0) {
         return -errno;
     }
-    shm_unlink(anon);
+    (void)unlink(tmpl);
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
     rc = ftruncate(fd, (off_t)size);
     if (rc != 0) {
         rc = -errno;

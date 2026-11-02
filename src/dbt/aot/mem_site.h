@@ -7,10 +7,6 @@
  *
  * Implements UNIFICATION-PLAN.md Rev 4 sections 4.3/4.4 for sparc32rt:
  *
- * - rt_tlb_entry_t: 32-byte Soft-TLB entry (read_tag/addend/write_tag/
- *   reserved). Regime A2 binds x20 to &ctx->tlb[0] and emits the 7-insn
- *   load/store fast path; the position-independent record below keeps a
- *   signal rewind anchor (seq_start_offset) for every site.
  * - dbt_mem_site_t: 24-byte purely-relative site record serialized into
  *   AOT block payloads (section 4.3). npc_mode resolves the post-fault
  *   guest NPC; RT_NPC_DYNAMIC_CTX covers SPARC JMPL (and MIPS JR on the
@@ -20,9 +16,9 @@
  *   validate the whole span before committing any register, so no unwind
  *   is ever needed; the helper below serves the single-access
  *   pre-commit case shared with the sibling lanes.
- * - Write-tag discipline (section 4.4): write_tag is valid only when the
- *   page is writable, promoted past PAGE_COW_CLEAN, and carries neither
- *   PAGE_HAS_CODE nor PAGE_HAS_SW_RESERVATION.
+ * - Write-tag discipline (section 4.4): VM32_PROT_FAST_WRITE is valid only
+ *   when the page is writable, promoted past PAGE_COW_CLEAN, and carries
+ *   neither PAGE_HAS_CODE nor PAGE_HAS_SW_RESERVATION.
  *
  * sparc32rt.h is Coordinator-frozen, so the run-time JMPL delay target
  * is NOT a ctx field here: aot_sites.c keeps a small side table keyed by
@@ -37,22 +33,6 @@
 #include <stdint.h>
 
 #include "sparc32rt.h"
-
-/* Soft-TLB geometry (Rev 4 section 4.3.1). */
-#define RT_TLB_BITS 12u
-#define RT_TLB_SIZE (1u << RT_TLB_BITS)
-#define RT_TLB_INVALID_TAG (~UINT64_C(0))
-
-/* 32-byte Soft-TLB entry (read_tag/addend/write_tag/reserved). */
-typedef struct {
-    uint64_t read_tag; /* Offset 0: (gva & ~0xFFF) when readable, else ~0 */
-    uintptr_t addend; /* Offset 8: host_page_base - (gva & ~0xFFF) */
-    uint64_t write_tag; /* Offset 16: writable & promoted & no code/resv */
-    uint64_t flags_reserved; /* Offset 24: zero, keeps 32B alignment */
-} rt_tlb_entry_t;
-
-_Static_assert(sizeof(rt_tlb_entry_t) == 32,
-    "Soft-TLB entry must be 32 bytes");
 
 /* Post-fault NPC resolution modes (Rev 4 section 4.3.3). */
 typedef enum {

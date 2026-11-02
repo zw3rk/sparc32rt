@@ -68,14 +68,14 @@ static void thr_register(sparc32_ctx_t *ctx)
     }
     pthread_mutex_lock(&thr_live_lock);
     for (i = 0U; i < THR_MAX_LIVE; i++) {
-        if (thr_live[i] == ctx) {
+        if (__atomic_load_n(&thr_live[i], __ATOMIC_RELAXED) == ctx) {
             pthread_mutex_unlock(&thr_live_lock);
             return;
         }
     }
     for (i = 0U; i < THR_MAX_LIVE; i++) {
-        if (thr_live[i] == NULL) {
-            thr_live[i] = ctx;
+        if (__atomic_load_n(&thr_live[i], __ATOMIC_RELAXED) == NULL) {
+            __atomic_store_n(&thr_live[i], ctx, __ATOMIC_RELEASE);
             break;
         }
     }
@@ -87,34 +87,32 @@ static void thr_deregister(sparc32_ctx_t *ctx)
     size_t i;
     pthread_mutex_lock(&thr_live_lock);
     for (i = 0U; i < THR_MAX_LIVE; i++) {
-        if (thr_live[i] == ctx) {
-            thr_live[i] = NULL;
+        if (__atomic_load_n(&thr_live[i], __ATOMIC_RELAXED) == ctx) {
+            __atomic_store_n(&thr_live[i], NULL, __ATOMIC_RELEASE);
         }
     }
     pthread_mutex_unlock(&thr_live_lock);
 }
 
 /* Host async note: set the kernel-layout pending bit on every live ctx.
- * Plain loads/stores only; signals without a guest handler are left for
+ * Atomic loads/stores only; signals without a guest handler are left for
  * the default path in thr_host_handler. */
 void sparc32_thr_note_signal(int sig)
 {
     uint64_t bit;
+    uint64_t mask;
     size_t i;
     if (sig < 1 || sig > 64) {
         return;
     }
     bit = 1ULL << (uint64_t)((uint32_t)(sig - 1) % 32U);
+    mask = ((uint32_t)sig <= 32U) ? (bit << 32U) : bit;
     for (i = 0U; i < THR_MAX_LIVE; i++) {
-        sparc32_ctx_t *c = thr_live[i];
+        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i], __ATOMIC_ACQUIRE);
         if (c == NULL) {
             continue;
         }
-        if ((uint32_t)sig <= 32U) {
-            c->pending_signals |= bit << 32U;
-        } else {
-            c->pending_signals |= bit;
-        }
+        __atomic_fetch_or(&c->pending_signals, mask, __ATOMIC_RELEASE);
     }
 }
 
@@ -147,21 +145,25 @@ void sparc32_threads_ensure_init(sparc32_ctx_t *ctx)
     };
     size_t i;
     thr_register(ctx);
-    if (thr_init_done) {
+    if (__atomic_load_n(&thr_init_done, __ATOMIC_ACQUIRE)) {
         return;
     }
-    thr_init_done = true;
-    for (i = 0U; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
-        struct sigaction sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = thr_host_handler;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = SA_RESTART;
-        if (sigs[i] == 9 || sigs[i] == 19) {
-            continue;
+    pthread_mutex_lock(&thr_live_lock);
+    if (!__atomic_load_n(&thr_init_done, __ATOMIC_RELAXED)) {
+        for (i = 0U; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = thr_host_handler;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = SA_RESTART;
+            if (sigs[i] == 9 || sigs[i] == 19) {
+                continue;
+            }
+            (void)sigaction(sigs[i], &sa, NULL);
         }
-        (void)sigaction(sigs[i], &sa, NULL);
+        __atomic_store_n(&thr_init_done, true, __ATOMIC_RELEASE);
     }
+    pthread_mutex_unlock(&thr_live_lock);
 }
 
 int sparc32_thr_sig_blocked(const sparc32_ctx_t *ctx, int sig)
@@ -288,7 +290,7 @@ long sparc32_thr_fork(sparc32_ctx_t *ctx)
         return -(long)errno;
     }
     if (pid == 0) {
-        ctx->pending_signals = 0U;
+        __atomic_store_n(&ctx->pending_signals, 0ULL, __ATOMIC_RELAXED);
         ctx->sig_last_frame_va = 0U;
         ctx->r[SPARC32_O1] = 1U;
         return 0;
@@ -619,16 +621,14 @@ static long thr_kill_tid(sparc32_ctx_t *ctx, uint32_t tgid,
         bool found = ((int32_t)tid == thr_gettid() ||
             (pid_t)(int32_t)tid == getpid());
         for (i = 0U; i < THR_MAX_LIVE; i++) {
-            sparc32_ctx_t *c = thr_live[i];
+            sparc32_ctx_t *c = __atomic_load_n(&thr_live[i], __ATOMIC_ACQUIRE);
             if (c != NULL && c->host_tid == (int32_t)tid) {
                 found = true;
                 if (sig >= 1U && sig <= 64U) {
                     uint64_t bit = 1ULL << (uint64_t)((sig - 1U) % 32U);
-                    if (sig <= 32U) {
-                        c->pending_signals |= bit << 32U;
-                    } else {
-                        c->pending_signals |= bit;
-                    }
+                    uint64_t mask = (sig <= 32U) ? (bit << 32U) : bit;
+                    __atomic_fetch_or(&c->pending_signals, mask,
+                        __ATOMIC_RELEASE);
                 }
             }
         }

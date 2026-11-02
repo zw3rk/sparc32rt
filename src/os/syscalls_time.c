@@ -118,10 +118,10 @@ long sparc32_l2a_clock_nanosleep(sparc32_ctx_t *ctx, uint32_t clk_id,
     if (flags != 0U && flags != 1U) {
         return -EINVAL;
     }
-    if (l2a_range_ok(req_va, sizeof(b)) != 0) {
+    if (l2a_load(ctx, req_va, b, sizeof(b)) != 0) {
         return -EFAULT;
     }
-    rp = (const uint8_t *)sparc32_guest_ptr(ctx, req_va);
+    rp = b;
     sec = ((uint64_t)get_be32(rp) << 32) | (uint64_t)get_be32(rp + 4);
     nsec = get_be32(rp + 8);
     if (nsec >= 1000000000U) {
@@ -233,7 +233,8 @@ long sparc32_l2a_clock_gettime64(sparc32_ctx_t *ctx, uint32_t clk_id,
 long sparc32_l2a_getrandom(sparc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
     uint32_t flags)
 {
-    int64_t rc;
+    uint8_t kbuf[256];
+    uint32_t done = 0U;
     if ((flags & ~(SP_GRND_NONBLOCK | SP_GRND_RANDOM | SP_GRND_INSECURE)) !=
         0U) {
         return -EINVAL;
@@ -244,15 +245,24 @@ long sparc32_l2a_getrandom(sparc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
     if (len == 0U) {
         return 0;
     }
-    /* Host entropy through the backend hook (Rev 4 section 6): Linux
-     * forwards flags to getrandom(2); Darwin drains getentropy(2). The
-     * hook returns -errno on failure, bytes filled on success. */
-    rc = rt_host_getrandom(sparc32_guest_ptr(ctx, buf_va), (size_t)len,
-        (unsigned int)flags);
-    if (rc > 0 && vm32_range_has_code(buf_va, (size_t)rc)) {
-        vm_invalidate_jit(ctx, buf_va, buf_va + (uint32_t)rc);
+    while (done < len) {
+        uint32_t step = ((len - done) > sizeof(kbuf)) ? (uint32_t)sizeof(kbuf) : (len - done);
+        int64_t rc = rt_host_getrandom(kbuf, (size_t)step, (unsigned int)flags);
+        if (rc < 0) {
+            return (done != 0U) ? (long)done : (long)rc;
+        }
+        if (rc == 0) {
+            break;
+        }
+        if (l2a_store(ctx, buf_va + done, kbuf, (uint64_t)rc) != 0) {
+            return (done != 0U) ? (long)done : -EFAULT;
+        }
+        done += (uint32_t)rc;
+        if ((uint32_t)rc < step) {
+            break;
+        }
     }
-    return (long)rc;
+    return (long)done;
 }
 
 long sparc32_l2a_futex(sparc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
@@ -277,13 +287,12 @@ long sparc32_l2a_futex(sparc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
         struct timespec ts;
         struct timespec *tsp = NULL;
         if (timeout_va != 0U) {
-            const uint8_t *tp;
+            uint8_t tp[8];
             int64_t sec;
             int64_t nsec;
-            if (l2a_range_ok(timeout_va, 8U) != 0) {
+            if (l2a_load(ctx, timeout_va, tp, sizeof(tp)) != 0) {
                 return -EFAULT;
             }
-            tp = (const uint8_t *)sparc32_guest_ptr(ctx, timeout_va);
             sec = (int64_t)(int32_t)get_be32(tp);
             nsec = (int64_t)(int32_t)get_be32(tp + 4);
             if (sec < 0 || nsec < 0 || nsec >= 1000000000LL) {
@@ -319,12 +328,11 @@ long sparc32_l2a_rt_sigprocmask(sparc32_ctx_t *ctx, uint32_t how,
     put_be32(old, (uint32_t)(cur >> 32U));
     put_be32(old + 4, (uint32_t)cur);
     if (set_va != 0U) {
-        const uint8_t *p;
+        uint8_t p[8];
         uint64_t n;
-        if (l2a_range_ok(set_va, 8U) != 0) {
+        if (l2a_load(ctx, set_va, p, sizeof(p)) != 0) {
             return -EFAULT;
         }
-        p = (const uint8_t *)sparc32_guest_ptr(ctx, set_va);
         n = ((uint64_t)get_be32(p) << 32U) | (uint64_t)get_be32(p + 4);
         switch (how) {
         case SPARC_SIG_BLOCK: cur |= n; break;

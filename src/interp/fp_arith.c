@@ -135,8 +135,16 @@ uint64_t fp_f64_quiet(uint64_t v)
  * ties keep rs1. Sign follows the winner. */
 uint32_t fp_f32_pick_nan(uint32_t a, uint32_t b)
 {
-    uint32_t pa = a & FP_F32_FRAC_MASK;
-    uint32_t pb = b & FP_F32_FRAC_MASK;
+    uint32_t pa;
+    uint32_t pb;
+    if (!fp_f32_isnan(a)) {
+        return b;
+    }
+    if (!fp_f32_isnan(b)) {
+        return a;
+    }
+    pa = a & FP_F32_FRAC_MASK;
+    pb = b & FP_F32_FRAC_MASK;
     if (pb > pa) {
         return b;
     }
@@ -145,8 +153,16 @@ uint32_t fp_f32_pick_nan(uint32_t a, uint32_t b)
 
 uint64_t fp_f64_pick_nan(uint64_t a, uint64_t b)
 {
-    uint64_t pa = a & FP_D64_FRAC_MASK;
-    uint64_t pb = b & FP_D64_FRAC_MASK;
+    uint64_t pa;
+    uint64_t pb;
+    if (!fp_f64_isnan(a)) {
+        return b;
+    }
+    if (!fp_f64_isnan(b)) {
+        return a;
+    }
+    pa = a & FP_D64_FRAC_MASK;
+    pb = b & FP_D64_FRAC_MASK;
     if (pb > pa) {
         return b;
     }
@@ -364,37 +380,90 @@ static bool fp_f64_nan2(sparc32_ctx_t *ctx, uint64_t a, uint64_t b,
     return false;
 }
 
-/* Report overflow/underflow/inexact for a computed result r against the
- * exact long-double value q. Callers handle invalid/DZ first and exact
- * infinities (exact, no flags) before reaching here. */
-static void fp_flags_f32(sparc32_ctx_t *ctx, float r, long double q)
+/* Apply FSR.RD directed rounding and raise OFC/UFC/NXC for a round-to-nearest
+ * result fr given the exact error sign err (sign(exact - fr), 0 iff exact). */
+static uint32_t fp_finish_f32(sparc32_ctx_t *ctx, float fr, double err,
+    uint32_t zero_sign)
 {
-    if (!isfinite(r)) {
+    uint32_t rd = fp_rd(ctx);
+    if (!isfinite(fr)) {
         fp_raise(ctx, FP_FSR_OFC_BIT | FP_FSR_NXC_BIT);
-        return;
+        if (rd == FP_RD_RZ) {
+            return (fr > 0.0F) ? 0x7F7FFFFFU : 0xFF7FFFFFU;
+        }
+        if (rd == FP_RD_RM && fr > 0.0F) {
+            return 0x7F7FFFFFU;
+        }
+        if (rd == FP_RD_RP && fr < 0.0F) {
+            return 0xFF7FFFFFU;
+        }
+        return (fr > 0.0F) ? 0x7F800000U : 0xFF800000U;
     }
-    if ((fpclassify(r) == FP_SUBNORMAL || r == 0.0F) && q != 0.0L) {
+    if (err == 0.0) {
+        return (fr == 0.0F) ? zero_sign : fp_f32_to_u32(fr);
+    }
+    if (fr == 0.0F) {
+        fr = (err < 0.0) ? -0.0F : 0.0F;
+    }
+    if (rd == FP_RD_RP && err > 0.0) {
+        fr = nextafterf(fr, (float)INFINITY);
+    } else if (rd == FP_RD_RM && err < 0.0) {
+        fr = nextafterf(fr, -(float)INFINITY);
+    } else if (rd == FP_RD_RZ &&
+        ((fr > 0.0F && err < 0.0) || (fr < 0.0F && err > 0.0))) {
+        fr = nextafterf(fr, 0.0F);
+    }
+    if (!isfinite(fr)) {
+        fp_raise(ctx, FP_FSR_OFC_BIT | FP_FSR_NXC_BIT);
+    } else if (fpclassify(fr) == FP_SUBNORMAL || fr == 0.0F) {
         fp_raise(ctx, FP_FSR_UFC_BIT | FP_FSR_NXC_BIT);
-        return;
-    }
-    if ((long double)r != q) {
+    } else {
         fp_raise(ctx, FP_FSR_NXC_BIT);
     }
+    return fp_f32_to_u32(fr);
 }
 
-static void fp_flags_f64(sparc32_ctx_t *ctx, double r, long double q)
+static uint64_t fp_finish_f64(sparc32_ctx_t *ctx, double fr, double err,
+    uint64_t zero_sign)
 {
-    if (!isfinite(r)) {
+    uint32_t rd = fp_rd(ctx);
+    if (!isfinite(fr)) {
         fp_raise(ctx, FP_FSR_OFC_BIT | FP_FSR_NXC_BIT);
-        return;
+        if (rd == FP_RD_RZ) {
+            return (fr > 0.0) ?
+                0x7FEFFFFFFFFFFFFFULL : 0xFFEFFFFFFFFFFFFFULL;
+        }
+        if (rd == FP_RD_RM && fr > 0.0) {
+            return 0x7FEFFFFFFFFFFFFFULL;
+        }
+        if (rd == FP_RD_RP && fr < 0.0) {
+            return 0xFFEFFFFFFFFFFFFFULL;
+        }
+        return (fr > 0.0) ?
+            0x7FF0000000000000ULL : 0xFFF0000000000000ULL;
     }
-    if ((fpclassify(r) == FP_SUBNORMAL || r == 0.0) && q != 0.0L) {
+    if (err == 0.0) {
+        return (fr == 0.0) ? zero_sign : fp_f64_to_u64(fr);
+    }
+    if (fr == 0.0) {
+        fr = (err < 0.0) ? -0.0 : 0.0;
+    }
+    if (rd == FP_RD_RP && err > 0.0) {
+        fr = nextafter(fr, (double)INFINITY);
+    } else if (rd == FP_RD_RM && err < 0.0) {
+        fr = nextafter(fr, -(double)INFINITY);
+    } else if (rd == FP_RD_RZ &&
+        ((fr > 0.0 && err < 0.0) || (fr < 0.0 && err > 0.0))) {
+        fr = nextafter(fr, 0.0);
+    }
+    if (!isfinite(fr)) {
+        fp_raise(ctx, FP_FSR_OFC_BIT | FP_FSR_NXC_BIT);
+    } else if (fpclassify(fr) == FP_SUBNORMAL || fr == 0.0) {
         fp_raise(ctx, FP_FSR_UFC_BIT | FP_FSR_NXC_BIT);
-        return;
-    }
-    if ((long double)r != q) {
+    } else {
         fp_raise(ctx, FP_FSR_NXC_BIT);
     }
+    return fp_f64_to_u64(fr);
 }
 
 uint32_t fp_add_f32(sparc32_ctx_t *ctx, uint32_t a, uint32_t b)
@@ -406,18 +475,30 @@ uint32_t fp_add_f32(sparc32_ctx_t *ctx, uint32_t a, uint32_t b)
     if (fp_f32_nan2(ctx, a, b, &r)) {
         return r;
     }
-    if (isinf(fa) && isinf(fb) && ((a ^ b) & 0x80000000U) != 0U) {
-        fp_raise(ctx, FP_FSR_NVC_BIT);
-        return FP_F32_CANON_NAN;
+    if (isinf(fa) && isinf(fb)) {
+        if (((a ^ b) & 0x80000000U) != 0U) {
+            fp_raise(ctx, FP_FSR_NVC_BIT);
+            return FP_F32_CANON_NAN;
+        }
+        return a;
+    }
+    if (isinf(fa)) {
+        return a;
+    }
+    if (isinf(fb)) {
+        return b;
     }
     {
         float fr = fa + fb;
-        long double q = (long double)fa + (long double)fb;
-        if ((long double)fr == q) {
-            return fp_f32_to_u32(fr);
-        }
-        fp_flags_f32(ctx, fr, q);
-        return fp_f32_to_u32(fr);
+        double da = (double)fa;
+        double db = (double)fb;
+        double s = da + db;
+        double v = s - da;
+        double err = (s - (double)fr) + ((da - (s - v)) + (db - v));
+        uint32_t zsign = (((a ^ b) & 0x80000000U) != 0U) ?
+            ((fp_rd(ctx) == FP_RD_RM) ? 0x80000000U : 0U) :
+            (a & 0x80000000U);
+        return fp_finish_f32(ctx, fr, err, zsign);
     }
 }
 
@@ -430,18 +511,27 @@ uint64_t fp_add_f64(sparc32_ctx_t *ctx, uint64_t a, uint64_t b)
     if (fp_f64_nan2(ctx, a, b, &r)) {
         return r;
     }
-    if (isinf(fa) && isinf(fb) && ((a ^ b) & 0x8000000000000000ULL) != 0ULL) {
-        fp_raise(ctx, FP_FSR_NVC_BIT);
-        return FP_F64_CANON_NAN;
+    if (isinf(fa) && isinf(fb)) {
+        if (((a ^ b) & 0x8000000000000000ULL) != 0ULL) {
+            fp_raise(ctx, FP_FSR_NVC_BIT);
+            return FP_F64_CANON_NAN;
+        }
+        return a;
+    }
+    if (isinf(fa)) {
+        return a;
+    }
+    if (isinf(fb)) {
+        return b;
     }
     {
         double fr = fa + fb;
-        long double q = (long double)fa + (long double)fb;
-        if ((long double)fr == q) {
-            return fp_f64_to_u64(fr);
-        }
-        fp_flags_f64(ctx, fr, q);
-        return fp_f64_to_u64(fr);
+        double v = fr - fa;
+        double err = isfinite(fr) ? ((fa - (fr - v)) + (fb - v)) : 0.0;
+        uint64_t zsign = (((a ^ b) & 0x8000000000000000ULL) != 0ULL) ?
+            ((fp_rd(ctx) == FP_RD_RM) ? 0x8000000000000000ULL : 0ULL) :
+            (a & 0x8000000000000000ULL);
+        return fp_finish_f64(ctx, fr, err, zsign);
     }
 }
 
@@ -454,18 +544,31 @@ uint32_t fp_sub_f32(sparc32_ctx_t *ctx, uint32_t a, uint32_t b)
     if (fp_f32_nan2(ctx, a, b, &r)) {
         return r;
     }
-    if (isinf(fa) && isinf(fb) && ((a ^ b) & 0x80000000U) == 0U) {
-        fp_raise(ctx, FP_FSR_NVC_BIT);
-        return FP_F32_CANON_NAN;
+    if (isinf(fa) && isinf(fb)) {
+        if (((a ^ b) & 0x80000000U) == 0U) {
+            fp_raise(ctx, FP_FSR_NVC_BIT);
+            return FP_F32_CANON_NAN;
+        }
+        return a;
+    }
+    if (isinf(fa)) {
+        return a;
+    }
+    if (isinf(fb)) {
+        return b ^ 0x80000000U;
     }
     {
         float fr = fa - fb;
-        long double q = (long double)fa - (long double)fb;
-        if ((long double)fr == q) {
-            return fp_f32_to_u32(fr);
-        }
-        fp_flags_f32(ctx, fr, q);
-        return fp_f32_to_u32(fr);
+        double da = (double)fa;
+        double db = -(double)fb;
+        double s = da + db;
+        double v = s - da;
+        double err = (s - (double)fr) + ((da - (s - v)) + (db - v));
+        uint32_t nb = b ^ 0x80000000U;
+        uint32_t zsign = (((a ^ nb) & 0x80000000U) != 0U) ?
+            ((fp_rd(ctx) == FP_RD_RM) ? 0x80000000U : 0U) :
+            (a & 0x80000000U);
+        return fp_finish_f32(ctx, fr, err, zsign);
     }
 }
 
@@ -478,19 +581,29 @@ uint64_t fp_sub_f64(sparc32_ctx_t *ctx, uint64_t a, uint64_t b)
     if (fp_f64_nan2(ctx, a, b, &r)) {
         return r;
     }
-    if (isinf(fa) && isinf(fb) &&
-        ((a ^ b) & 0x8000000000000000ULL) == 0ULL) {
-        fp_raise(ctx, FP_FSR_NVC_BIT);
-        return FP_F64_CANON_NAN;
+    if (isinf(fa) && isinf(fb)) {
+        if (((a ^ b) & 0x8000000000000000ULL) == 0ULL) {
+            fp_raise(ctx, FP_FSR_NVC_BIT);
+            return FP_F64_CANON_NAN;
+        }
+        return a;
+    }
+    if (isinf(fa)) {
+        return a;
+    }
+    if (isinf(fb)) {
+        return b ^ 0x8000000000000000ULL;
     }
     {
         double fr = fa - fb;
-        long double q = (long double)fa - (long double)fb;
-        if ((long double)fr == q) {
-            return fp_f64_to_u64(fr);
-        }
-        fp_flags_f64(ctx, fr, q);
-        return fp_f64_to_u64(fr);
+        double nb = -fb;
+        double v = fr - fa;
+        double err = isfinite(fr) ? ((fa - (fr - v)) + (nb - v)) : 0.0;
+        uint64_t nb_bits = b ^ 0x8000000000000000ULL;
+        uint64_t zsign = (((a ^ nb_bits) & 0x8000000000000000ULL) != 0ULL) ?
+            ((fp_rd(ctx) == FP_RD_RM) ? 0x8000000000000000ULL : 0ULL) :
+            (a & 0x8000000000000000ULL);
+        return fp_finish_f64(ctx, fr, err, zsign);
     }
 }
 
@@ -499,26 +612,25 @@ uint32_t fp_mul_f32(sparc32_ctx_t *ctx, uint32_t a, uint32_t b)
     float fa = fp_u32_to_f32(a);
     float fb = fp_u32_to_f32(b);
     uint32_t r;
+    uint32_t sign = (a ^ b) & 0x80000000U;
     fp_clear_cexc(ctx);
     if (fp_f32_nan2(ctx, a, b, &r)) {
         return r;
     }
-    if (isinf(fa) && fb == 0.0F) {
+    if ((isinf(fa) && fb == 0.0F) || (isinf(fb) && fa == 0.0F)) {
         fp_raise(ctx, FP_FSR_NVC_BIT);
         return FP_F32_CANON_NAN;
     }
-    if (isinf(fb) && fa == 0.0F) {
-        fp_raise(ctx, FP_FSR_NVC_BIT);
-        return FP_F32_CANON_NAN;
+    if (isinf(fa) || isinf(fb)) {
+        return sign | FP_F32_EXP_MASK;
+    }
+    if (fa == 0.0F || fb == 0.0F) {
+        return sign;
     }
     {
         float fr = fa * fb;
-        long double q = (long double)fa * (long double)fb;
-        if ((long double)fr == q) {
-            return fp_f32_to_u32(fr);
-        }
-        fp_flags_f32(ctx, fr, q);
-        return fp_f32_to_u32(fr);
+        double err = ((double)fa * (double)fb) - (double)fr;
+        return fp_finish_f32(ctx, fr, err, sign);
     }
 }
 
@@ -527,26 +639,37 @@ uint64_t fp_mul_f64(sparc32_ctx_t *ctx, uint64_t a, uint64_t b)
     double fa = fp_u64_to_f64(a);
     double fb = fp_u64_to_f64(b);
     uint64_t r;
+    uint64_t sign = (a ^ b) & 0x8000000000000000ULL;
     fp_clear_cexc(ctx);
     if (fp_f64_nan2(ctx, a, b, &r)) {
         return r;
     }
-    if (isinf(fa) && fb == 0.0) {
+    if ((isinf(fa) && fb == 0.0) || (isinf(fb) && fa == 0.0)) {
         fp_raise(ctx, FP_FSR_NVC_BIT);
         return FP_F64_CANON_NAN;
     }
-    if (isinf(fb) && fa == 0.0) {
-        fp_raise(ctx, FP_FSR_NVC_BIT);
-        return FP_F64_CANON_NAN;
+    if (isinf(fa) || isinf(fb)) {
+        return sign | FP_D64_EXP_MASK;
+    }
+    if (fa == 0.0 || fb == 0.0) {
+        return sign;
     }
     {
         double fr = fa * fb;
-        long double q = (long double)fa * (long double)fb;
-        if ((long double)fr == q) {
-            return fp_f64_to_u64(fr);
+        double err = 0.0;
+        if (isfinite(fr)) {
+            if (fr == 0.0) {
+                err = (sign != 0ULL) ? -1.0 : 1.0;
+            } else {
+                int ea = 0;
+                int eb = 0;
+                double ma = frexp(fa, &ea);
+                double mb = frexp(fb, &eb);
+                double mr = ldexp(fr, -(ea + eb));
+                err = fma(ma, mb, -mr);
+            }
         }
-        fp_flags_f64(ctx, fr, q);
-        return fp_f64_to_u64(fr);
+        return fp_finish_f64(ctx, fr, err, sign);
     }
 }
 
@@ -555,6 +678,7 @@ uint32_t fp_div_f32(sparc32_ctx_t *ctx, uint32_t a, uint32_t b)
     float fa = fp_u32_to_f32(a);
     float fb = fp_u32_to_f32(b);
     uint32_t r;
+    uint32_t sign = (a ^ b) & 0x80000000U;
     fp_clear_cexc(ctx);
     if (fp_f32_nan2(ctx, a, b, &r)) {
         return r;
@@ -565,31 +689,25 @@ uint32_t fp_div_f32(sparc32_ctx_t *ctx, uint32_t a, uint32_t b)
             return FP_F32_CANON_NAN;
         }
         if (!isinf(fa)) {
-            uint32_t sign = (a ^ b) & 0x80000000U;
             fp_raise(ctx, FP_FSR_DZC_BIT);
-            return sign | FP_F32_EXP_MASK;
         }
-        /* inf / 0 is exact infinity: no exception (IEEE 754). */
-        return ((a ^ b) & 0x80000000U) | FP_F32_EXP_MASK;
+        return sign | FP_F32_EXP_MASK;
     }
     if (isinf(fa) && isinf(fb)) {
         fp_raise(ctx, FP_FSR_NVC_BIT);
         return FP_F32_CANON_NAN;
     }
+    if (isinf(fa)) {
+        return sign | FP_F32_EXP_MASK;
+    }
+    if (fa == 0.0F || isinf(fb)) {
+        return sign;
+    }
     {
         float fr = fa / fb;
-        if (fa == 0.0F) {
-            return fp_f32_to_u32(fr);
-        }
-        if ((long double)fr * (long double)fb == (long double)fa) {
-            return fp_f32_to_u32(fr);
-        }
-        if (!isnormal(fr)) {
-            fp_raise(ctx, FP_FSR_UFC_BIT | FP_FSR_NXC_BIT);
-            return fp_f32_to_u32(fr);
-        }
-        fp_raise(ctx, FP_FSR_NXC_BIT);
-        return fp_f32_to_u32(fr);
+        double rem = (double)fa - ((double)fr * (double)fb);
+        double err = (fb > 0.0F) ? rem : -rem;
+        return fp_finish_f32(ctx, fr, err, sign);
     }
 }
 
@@ -598,6 +716,7 @@ uint64_t fp_div_f64(sparc32_ctx_t *ctx, uint64_t a, uint64_t b)
     double fa = fp_u64_to_f64(a);
     double fb = fp_u64_to_f64(b);
     uint64_t r;
+    uint64_t sign = (a ^ b) & 0x8000000000000000ULL;
     fp_clear_cexc(ctx);
     if (fp_f64_nan2(ctx, a, b, &r)) {
         return r;
@@ -608,30 +727,37 @@ uint64_t fp_div_f64(sparc32_ctx_t *ctx, uint64_t a, uint64_t b)
             return FP_F64_CANON_NAN;
         }
         if (!isinf(fa)) {
-            uint64_t sign = (a ^ b) & 0x8000000000000000ULL;
             fp_raise(ctx, FP_FSR_DZC_BIT);
-            return sign | FP_D64_EXP_MASK;
         }
-        return ((a ^ b) & 0x8000000000000000ULL) | FP_D64_EXP_MASK;
+        return sign | FP_D64_EXP_MASK;
     }
     if (isinf(fa) && isinf(fb)) {
         fp_raise(ctx, FP_FSR_NVC_BIT);
         return FP_F64_CANON_NAN;
     }
+    if (isinf(fa)) {
+        return sign | FP_D64_EXP_MASK;
+    }
+    if (fa == 0.0 || isinf(fb)) {
+        return sign;
+    }
     {
         double fr = fa / fb;
-        if (fa == 0.0) {
-            return fp_f64_to_u64(fr);
+        double err = 0.0;
+        if (isfinite(fr)) {
+            if (fr == 0.0) {
+                err = (sign != 0ULL) ? -1.0 : 1.0;
+            } else {
+                int ea = 0;
+                int eb = 0;
+                double ma = frexp(fa, &ea);
+                double mb = frexp(fb, &eb);
+                double mr = ldexp(fr, -(ea - eb));
+                double rem = fma(-mr, mb, ma);
+                err = (fb > 0.0) ? rem : -rem;
+            }
         }
-        if ((long double)fr * (long double)fb == (long double)fa) {
-            return fp_f64_to_u64(fr);
-        }
-        if (!isnormal(fr)) {
-            fp_raise(ctx, FP_FSR_UFC_BIT | FP_FSR_NXC_BIT);
-            return fp_f64_to_u64(fr);
-        }
-        fp_raise(ctx, FP_FSR_NXC_BIT);
-        return fp_f64_to_u64(fr);
+        return fp_finish_f64(ctx, fr, err, sign);
     }
 }
 
@@ -650,13 +776,13 @@ uint32_t fp_sqrt_f32(sparc32_ctx_t *ctx, uint32_t a)
         fp_raise(ctx, FP_FSR_NVC_BIT);
         return FP_F32_CANON_NAN;
     }
+    if (fa == 0.0F || isinf(fa)) {
+        return a;
+    }
     {
         float fr = sqrtf(fa);
-        if ((long double)fr * (long double)fr == (long double)fa) {
-            return fp_f32_to_u32(fr);
-        }
-        fp_flags_f32(ctx, fr, sqrtl((long double)fa));
-        return fp_f32_to_u32(fr);
+        double err = (double)fa - ((double)fr * (double)fr);
+        return fp_finish_f32(ctx, fr, err, a & 0x80000000U);
     }
 }
 
@@ -675,13 +801,22 @@ uint64_t fp_sqrt_f64(sparc32_ctx_t *ctx, uint64_t a)
         fp_raise(ctx, FP_FSR_NVC_BIT);
         return FP_F64_CANON_NAN;
     }
+    if (fa == 0.0 || isinf(fa)) {
+        return a;
+    }
     {
         double fr = sqrt(fa);
-        if ((long double)fr * (long double)fr == (long double)fa) {
-            return fp_f64_to_u64(fr);
+        int ea = 0;
+        double ma = frexp(fa, &ea);
+        double mr;
+        double err;
+        if ((ea & 1) != 0) {
+            ma *= 2.0;
+            ea -= 1;
         }
-        fp_flags_f64(ctx, fr, sqrtl((long double)fa));
-        return fp_f64_to_u64(fr);
+        mr = ldexp(fr, -(ea / 2));
+        err = fma(-mr, mr, ma);
+        return fp_finish_f64(ctx, fr, err, a & 0x8000000000000000ULL);
     }
 }
 

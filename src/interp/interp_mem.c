@@ -29,22 +29,26 @@ bool interp_range_ok(const sparc32_ctx_t *ctx, uint32_t va,
     uint32_t len, uint32_t need)
 {
     uint64_t end = (uint64_t)va + (uint64_t)len;
-    /* O(1) fast path: a short span inside one 4K page consults the
-     * published per-page prot table (kept in sync with regions[] by
-     * every vm_mmap commit/unmap/mprotect). A miss falls through to
-     * the region walk below. */
-    if (len != 0U && len <= 64U &&
-        (((va ^ (va + len - 1U)) >> 12) == 0U)) {
-        const uint8_t *prot = sparc32_vm_prot_base();
-        if (prot != NULL &&
-            (((uint32_t)prot[va >> 12] & need) == need)) {
-            return true;
-        }
-    }
+    const uint8_t *prot;
     uint32_t cur = va;
     size_t i;
     if (len == 0U || end > (uint64_t)SPARC32_TASK_SIZE_TOP) {
         return false;
+    }
+    prot = sparc32_vm_prot_base();
+    if (prot != NULL) {
+        uint32_t pg = va >> 12;
+        uint32_t end_pg = (uint32_t)((end - 1ULL) >> 12);
+        for (;;) {
+            uint8_t p = __atomic_load_n(&prot[pg], __ATOMIC_ACQUIRE);
+            if (((uint32_t)p & need) != need) {
+                return false;
+            }
+            if (pg == end_pg) {
+                return true;
+            }
+            pg++;
+        }
     }
     for (i = 0; i < ctx->region_count && (uint64_t)cur < end; i++) {
         const sparc32_region_t *r = &ctx->regions[i];
@@ -81,33 +85,42 @@ bool interp_mem_rd(sparc32_ctx_t *ctx, uint32_t va, void *dst,
         ctx->fault_addr = va;
         return false;
     }
+    sparc32_vm_access_enter();
     if (!interp_range_ok(ctx, va, len, 1U)) {
+        sparc32_vm_access_leave();
         ctx->exit_reason = SPARC32_EXIT_FAULT;
         ctx->fault_addr = va;
         return false;
     }
     memcpy(dst, sparc32_guest_ptr(ctx, va), (size_t)len);
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    sparc32_vm_access_leave();
     return true;
 }
 
 bool interp_mem_wr(sparc32_ctx_t *ctx, uint32_t va, const void *src,
     uint32_t len)
 {
+    bool has_code;
     if (!interp_aligned(va, len)) {
         ctx->exit_reason = SPARC32_EXIT_FAULT;
         ctx->fault_addr = va;
         return false;
     }
+    sparc32_vm_access_enter();
     if (!interp_range_ok(ctx, va, len, 2U)) {
+        sparc32_vm_access_leave();
         ctx->exit_reason = SPARC32_EXIT_FAULT;
         ctx->fault_addr = va;
         return false;
     }
     __atomic_thread_fence(__ATOMIC_RELEASE);
     memcpy(sparc32_guest_ptr(ctx, va), src, (size_t)len);
+    vm32_note_page_write(va, (size_t)len);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (vm32_range_has_code(va, (size_t)len)) {
+    has_code = vm32_range_has_code(va, (size_t)len);
+    sparc32_vm_access_leave();
+    if (has_code) {
         vm_invalidate_jit(ctx, va, va + len);
     }
     return true;

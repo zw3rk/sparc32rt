@@ -307,13 +307,19 @@ void sparc32_dbt_invalidate_range(sparc32_ctx_t *ctx, uint32_t start,
             invalidated = true;
         }
     }
-    if (end - start >= SPARC32_PAGE_SIZE) {
+    {
         uint32_t lo = sparc32_page_down(start);
         uint32_t hi = sparc32_page_up(end);
         if (hi < end) {
             hi = UINT32_MAX;
         }
         vm32_clear_code_range(lo, hi);
+        for (i = 0U; i < DBT_CACHE_SIZE; i++) {
+            const dbt_block_t *b = &g_blocks[i];
+            if (b->valid && b->end_pc > lo && b->start_pc < hi) {
+                vm32_note_code_page(b->start_pc, b->end_pc - b->start_pc);
+            }
+        }
     }
     if (invalidated) {
         dbt_bump_epoch_locked();

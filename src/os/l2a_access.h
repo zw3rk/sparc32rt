@@ -90,21 +90,77 @@ static inline int l2a_range_ok(uint32_t va, uint64_t len)
     return l2a_range_ok_prot(va, len, 1U);
 }
 
+static inline int l2a_load(const sparc32_ctx_t *ctx, uint32_t va, void *dst,
+    uint64_t len)
+{
+    sparc32_vm_access_enter();
+    if (l2a_range_ok_prot(va, len, 1U) != 0) {
+        sparc32_vm_access_leave();
+        return -EFAULT;
+    }
+    if (len != 0U) {
+        memcpy(dst, sparc32_guest_ptr(ctx, va), (size_t)len);
+    }
+    sparc32_vm_access_leave();
+    return 0;
+}
+
 static inline int l2a_store(sparc32_ctx_t *ctx, uint32_t va, const void *src,
     uint64_t len)
 {
+    bool has_code = false;
+    sparc32_vm_access_enter();
     if (l2a_range_ok_prot(va, len, 2U) != 0) {
+        sparc32_vm_access_leave();
         return -EFAULT;
     }
     if (len != 0U) {
         memcpy(sparc32_guest_ptr(ctx, va), src, (size_t)len);
-        if (vm32_range_has_code(va, (size_t)len)) {
-            uint64_t end = (uint64_t)va + len;
-            vm_invalidate_jit(ctx, va,
-                (end > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)end);
-        }
+        vm32_note_page_write(va, (size_t)len);
+        has_code = vm32_range_has_code(va, (size_t)len);
+    }
+    sparc32_vm_access_leave();
+    if (has_code) {
+        uint64_t end = (uint64_t)va + len;
+        vm_invalidate_jit(ctx, va,
+            (end > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)end);
     }
     return 0;
+}
+
+static inline long l2a_copy_cstring(sparc32_ctx_t *ctx, uint32_t va, char *out,
+    uint32_t cap)
+{
+    uint32_t i;
+    if (cap == 0U) {
+        return -ENAMETOOLONG;
+    }
+    sparc32_vm_access_enter();
+    if (l2a_range_ok_prot(va, 1U, 1U) != 0) {
+        sparc32_vm_access_leave();
+        return -EFAULT;
+    }
+    for (i = 0U; i < cap; i++) {
+        uint32_t a = va + i;
+        const uint8_t *p;
+        if (a < va) {
+            sparc32_vm_access_leave();
+            return -ENAMETOOLONG;
+        }
+        if (l2a_range_ok_prot(a, 1U, 1U) != 0) {
+            sparc32_vm_access_leave();
+            return -EFAULT;
+        }
+        p = (const uint8_t *)sparc32_guest_ptr(ctx, a);
+        out[i] = (char)*p;
+        if (*p == 0U) {
+            sparc32_vm_access_leave();
+            return 0;
+        }
+    }
+    sparc32_vm_access_leave();
+    out[cap - 1U] = '\0';
+    return -ENAMETOOLONG;
 }
 
 #endif /* SPARC32RT_OS_L2A_ACCESS_H */
