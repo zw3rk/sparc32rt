@@ -22,8 +22,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
+#include "dbt/aot/aot_cache.h"
 #include "dbt/aot/mem_site.h"
 
 #define AOT_CACHE_MAGIC 0x53335254414f5434ULL /* "SRT3AOT4" */
@@ -171,4 +174,120 @@ uint32_t sparc32_aot_cache_blocks(void)
 uint32_t sparc32_aot_cache_sites(void)
 {
     return g_aot_has_cache ? g_aot_cache.site_count : 0u;
+}
+
+int sparc32_aot_cache_record(uint32_t guest_pc_base, uint32_t guest_len,
+    uint64_t guest_hash)
+{
+    uint32_t i;
+    aot_block_desc_t *b;
+    (void)guest_hash;
+    if (!g_aot_has_cache) {
+        return -1;
+    }
+    for (i = 0u; i < g_aot_cache.block_count; i++) {
+        if (g_aot_cache.blocks[i].guest_pc_base == guest_pc_base) {
+            return 0;
+        }
+    }
+    if (g_aot_cache.block_count >= (uint32_t)AOT_CACHE_MAX_BLOCKS) {
+        return -1;
+    }
+    b = &g_aot_cache.blocks[g_aot_cache.block_count++];
+    b->guest_pc_base = guest_pc_base;
+    b->guest_len = guest_len;
+    b->site_count = 0u;
+    b->code_offset = 0u;
+    b->code_len = 0u;
+    return 0;
+}
+
+static void aot_resolve_path(const char *path, char *out, size_t cap)
+{
+    struct stat st;
+    if (path == NULL || out == NULL || cap == 0u) {
+        if (out != NULL && cap > 0u) {
+            out[0] = '\0';
+        }
+        return;
+    }
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        (void)snprintf(out, cap, "%s/sparc32-aot.cache", path);
+    } else {
+        (void)snprintf(out, cap, "%s", path);
+    }
+}
+
+int sparc32_aot_cache_save(const char *path)
+{
+    char resolved[512];
+    aot_file_header_t hdr;
+    FILE *fp;
+    if (!g_aot_has_cache || path == NULL || path[0] == '\0') {
+        return -1;
+    }
+    aot_resolve_path(path, resolved, sizeof(resolved));
+    if (resolved[0] == '\0') {
+        return -1;
+    }
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = (uint64_t)AOT_CACHE_MAGIC;
+    hdr.format = (uint32_t)AOT_CACHE_FORMAT;
+    hdr.block_count = g_aot_cache.block_count;
+    hdr.code_generation = g_aot_cache.code_generation;
+    memcpy(hdr.authority, g_aot_cache.authority, sizeof(hdr.authority));
+    fp = fopen(resolved, "wb");
+    if (fp == NULL) {
+        return -1;
+    }
+    if (fwrite(&hdr, sizeof(hdr), 1u, fp) != 1u) {
+        fclose(fp);
+        return -1;
+    }
+    if (g_aot_cache.block_count > 0u &&
+        fwrite(g_aot_cache.blocks, sizeof(aot_block_desc_t),
+            g_aot_cache.block_count, fp) != g_aot_cache.block_count) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    return 0;
+}
+
+int sparc32_aot_cache_load(const char *path, sparc32_aot_hash_fn hash_fn,
+    void *opaque)
+{
+    char resolved[512];
+    aot_file_header_t hdr;
+    FILE *fp;
+    uint32_t n;
+    (void)hash_fn;
+    (void)opaque;
+    if (path == NULL || path[0] == '\0') {
+        return -1;
+    }
+    (void)sparc32_aot_cache_init(SPARC32_AOT_AUTHORITY,
+        SPARC32_AOT_CODE_GENERATION);
+    aot_resolve_path(path, resolved, sizeof(resolved));
+    fp = fopen(resolved, "rb");
+    if (fp == NULL) {
+        return -1;
+    }
+    if (fread(&hdr, 1u, sizeof(hdr), fp) != sizeof(hdr) ||
+        sparc32_aot_cache_check_header(&hdr, sizeof(hdr),
+            SPARC32_AOT_CODE_GENERATION) != 0 ||
+        hdr.block_count > (uint32_t)AOT_CACHE_MAX_BLOCKS) {
+        fclose(fp);
+        return -1;
+    }
+    n = hdr.block_count;
+    if (n > 0u && fread(g_aot_cache.blocks, sizeof(aot_block_desc_t),
+            n, fp) != n) {
+        g_aot_cache.block_count = 0u;
+        fclose(fp);
+        return -1;
+    }
+    g_aot_cache.block_count = n;
+    fclose(fp);
+    return (int)n;
 }

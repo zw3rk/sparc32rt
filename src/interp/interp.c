@@ -678,11 +678,23 @@ void interp_step(sparc32_ctx_t *ctx)
     }
     if (d.cls == (uint32_t)SPARC32_OP_TRAP) {
         /* Ticc has no delay slot; 0x10 with a true condition is the
-         * syscall gate (E04), any other true trap number -> EXIT_TRAP. */
+         * syscall gate (E04), 0x03 flushes register windows to the
+         * guest stack (C2-3: uClibc setjmp), any other true trap
+         * number -> EXIT_TRAP. */
         uint32_t b = (d.is_imm != 0U) ? (uint32_t)d.simm
                                       : ctx->r[d.rs2];
         if (interp_eval_cond(d.cond, ctx->psr)) {
-            interp_trap_taken(ctx, (ctx->r[d.rs1] + b) & 0x7FU);
+            uint32_t num = (ctx->r[d.rs1] + b) & 0x7FU;
+            if (num == 3U) {
+                if (!interp_flush_windows(ctx)) {
+                    ctx->r[0] = 0U;
+                    return;
+                }
+                ctx->pc = ctx->npc;
+                ctx->npc += 4U;
+            } else {
+                interp_trap_taken(ctx, num);
+            }
         } else {
             ctx->pc = ctx->npc;
             ctx->npc += 4U;

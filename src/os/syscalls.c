@@ -64,12 +64,6 @@
 #define SP_F_GETFL 3U
 #define SP_F_SETFL 4U
 
-#define SP_FIONREAD 0x4004667fU
-#define SP_TCGETS 0x80245408U
-
-#define SP_FUTEX_WAIT 0U
-#define SP_FUTEX_WAKE 1U
-
 #define SP_AT_FDCWD ((int32_t)-100)
 #define SP_AT_SYMLINK_NOFOLLOW 0x100U
 #define SP_AT_NO_AUTOMOUNT 0x800U
@@ -79,13 +73,6 @@
 #define L2A_PATH_MAX 4096U
 #define L2A_IOV_MAX 1024U
 #define L2A_IOV_BATCH 32U
-
-static uint32_t l2a_blocked[2] = { 0U, 0U };
-
-uint64_t sparc32_l2a_blocked_mask(void)
-{
-    return ((uint64_t)l2a_blocked[0] << 32) | (uint64_t)l2a_blocked[1];
-}
 
 /* BE words, range model, and guest stores live in os/l2a_access.h. */
 
@@ -113,12 +100,31 @@ static long l2a_copy_cstring(sparc32_ctx_t *ctx, uint32_t va, char *out,
     return -ENAMETOOLONG;
 }
 
-static int l2a_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
+/* Sysroot fallback (C2-3): absolute guest paths that miss on the host
+ * retry under ctx->sysroot (dynamic loader DT_NEEDED + PT_INTERP
+ * dependencies live there; guest /tmp and relative paths stay on the
+ * host). Mirrors the ppc64rt "fallback on miss" contract. Returns 0 and
+ * fills out on success, -1 when no sysroot applies. /proc stays with
+ * the procfs layer (never remapped). */
+static int sys_path_sysroot(const sparc32_ctx_t *ctx, const char *path,
+    char *out, size_t cap)
 {
-    if (l2a_range_ok(va, 4U) != 0) {
-        return -EFAULT;
+    size_t rn;
+    size_t pn;
+    if (ctx == NULL || ctx->sysroot == NULL || ctx->sysroot[0] == '\0' ||
+        path == NULL || path[0] != '/' || out == NULL || cap == 0U) {
+        return -1;
     }
-    put_be32((uint8_t *)sparc32_guest_ptr(ctx, va), v);
+    if (strncmp(path, "/proc/", 6U) == 0) {
+        return -1;
+    }
+    rn = strlen(ctx->sysroot);
+    pn = strlen(path);
+    if (rn == 0U || rn + pn + 1U > cap) {
+        return -1;
+    }
+    memcpy(out, ctx->sysroot, rn);
+    memcpy(out + rn, path, pn + 1U);
     return 0;
 }
 
@@ -142,6 +148,23 @@ static long narrow_s32(int64_t v)
 {
     return (v >= -2147483648LL && v <= 2147483647LL) ? (long)(int32_t)v
                                                     : -EOVERFLOW;
+}
+
+/* Identity fold (C2-3): host dev_t/ino_t routinely exceed the SPARC
+ * old-ABI 16/32-bit identity fields (Darwin reports dev 0x100000e),
+ * which strict narrowing turns into EOVERFLOW on every library stat.
+ * Folding keeps a stable per-file identity instead of failing the
+ * lookup; semantic fields (uid/gid/mode/size/times) keep strict
+ * narrowing above. The 104 B stat64 layout carries full-width
+ * identities and is unaffected. */
+static uint16_t fold_dev16(uint64_t v)
+{
+    return (uint16_t)((v ^ (v >> 16U) ^ (v >> 32U)) & 0xFFFFULL);
+}
+
+static uint32_t fold_ino32(uint64_t v)
+{
+    return (uint32_t)((v ^ (v >> 32U)) & 0xFFFFFFFFULL);
 }
 
 /* Host stat times: macOS uses st_*timespec, Linux st_*tim. */
@@ -230,6 +253,21 @@ static long sys_openat(sparc32_ctx_t *ctx, int32_t dirfd, uint32_t path_va,
     /* L5a hook: /proc/self/<name> served from translator state, all else host. */
     rc = rt32_procfs_openat(ctx, (dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)dirfd,
         path, host_flags, (mode_t)(mode & 0777U));
+    if (rc == -(long)ENOENT && dirfd == SP_AT_FDCWD) {
+        /* C2-3 sysroot fallback: absolute loader/library paths that
+         * miss on the host retry under --sysroot. */
+        char alt[L2A_PATH_MAX];
+        if (sys_path_sysroot(ctx, path, alt, sizeof(alt)) == 0) {
+            int fd = openat(AT_FDCWD, alt, host_flags,
+                (mode_t)(mode & 0777U));
+            if (fd >= 0) {
+                return (long)fd;
+            }
+            if (errno != ENOENT) {
+                return -(long)errno;
+            }
+        }
+    }
     return rc;
 }
 
@@ -413,13 +451,17 @@ static long store_stat32(sparc32_ctx_t *ctx, uint32_t va, const struct stat *h)
     int64_t sec;
     int64_t nsec;
     memset(b, 0, sizeof(b));
-    PUT16(offsetof(sparc32_stat_t, st_dev), narrow_u16((uint64_t)h->st_dev));
-    PUT32(offsetof(sparc32_stat_t, st_ino), narrow_u32((uint64_t)h->st_ino));
+    /* Identity fields fold (C2-3); semantic fields narrow strictly. */
+    put_be16(b + offsetof(sparc32_stat_t, st_dev),
+        fold_dev16((uint64_t)h->st_dev));
+    put_be32(b + offsetof(sparc32_stat_t, st_ino),
+        fold_ino32((uint64_t)h->st_ino));
     put_be32(b + offsetof(sparc32_stat_t, st_mode), (uint32_t)h->st_mode);
     PUT16(offsetof(sparc32_stat_t, st_nlink), narrow_s16((int64_t)h->st_nlink));
     PUT16(offsetof(sparc32_stat_t, st_uid), narrow_u16((uint64_t)h->st_uid));
     PUT16(offsetof(sparc32_stat_t, st_gid), narrow_u16((uint64_t)h->st_gid));
-    PUT16(offsetof(sparc32_stat_t, st_rdev), narrow_u16((uint64_t)h->st_rdev));
+    put_be16(b + offsetof(sparc32_stat_t, st_rdev),
+        fold_dev16((uint64_t)h->st_rdev));
     PUT32(offsetof(sparc32_stat_t, st_size), narrow_s32((int64_t)h->st_size));
     l2a_host_times(h, 0, &sec, &nsec);
     PUT32(offsetof(sparc32_stat_t, st_atime), narrow_s32(sec));
@@ -474,7 +516,14 @@ static long sys_stat_path(sparc32_ctx_t *ctx, const char *path, int dirfd,
 {
     struct stat h;
     if (fstatat(dirfd, path, &h, nofollow ? AT_SYMLINK_NOFOLLOW : 0) != 0) {
-        return -(long)errno;
+        /* C2-3 sysroot fallback (absolute paths only). */
+        char alt[L2A_PATH_MAX];
+        if (errno != ENOENT || dirfd != AT_FDCWD ||
+            sys_path_sysroot(ctx, path, alt, sizeof(alt)) != 0 ||
+            fstatat(AT_FDCWD, alt, &h,
+                nofollow ? AT_SYMLINK_NOFOLLOW : 0) != 0) {
+            return -(long)errno;
+        }
     }
     return is64 ? store_stat64(ctx, buf_va, &h) : store_stat32(ctx, buf_va, &h);
 }
@@ -555,7 +604,13 @@ long sparc32_l2a_fstatat64(sparc32_ctx_t *ctx, uint32_t dirfd,
 #endif
     host_dirfd = ((int32_t)dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)(int32_t)dirfd;
     if (fstatat(host_dirfd, path, &h, host_flags) != 0) {
-        return -(long)errno;
+        /* C2-3 sysroot fallback (absolute paths only). */
+        char alt[L2A_PATH_MAX];
+        if (errno != ENOENT || host_dirfd != AT_FDCWD ||
+            sys_path_sysroot(ctx, path, alt, sizeof(alt)) != 0 ||
+            fstatat(AT_FDCWD, alt, &h, host_flags) != 0) {
+            return -(long)errno;
+        }
     }
     return store_stat64(ctx, buf_va, &h);
 }
@@ -630,7 +685,14 @@ long sparc32_l2a_statx(sparc32_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
     memset(&h, 0, sizeof(h));
     if (syscall(SYS_statx, host_dirfd, path, host_flags, (unsigned int)mask,
             &h) != 0) {
-        return ((long)errno == 0) ? -ENOSYS : -(long)errno;
+        /* C2-3 sysroot fallback (absolute paths only). */
+        char alt[L2A_PATH_MAX];
+        if (((long)errno == 0) || host_dirfd != AT_FDCWD ||
+            sys_path_sysroot(ctx, path, alt, sizeof(alt)) != 0 ||
+            syscall(SYS_statx, AT_FDCWD, alt, host_flags, (unsigned int)mask,
+                &h) != 0) {
+            return ((long)errno == 0) ? -ENOSYS : -(long)errno;
+        }
     }
     memset(b, 0, sizeof(b));
     put_be32(b + STX_OFF_MASK, h.stx_mask);
@@ -655,9 +717,85 @@ long sparc32_l2a_statx(sparc32_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
     put_be64(b + STX_OFF_MNTID, h.stx_mnt_id);
     return l2a_store(ctx, buf_va, b, sizeof(b));
 #else
-    (void)ctx; (void)dirfd; (void)path_va;
-    (void)flags; (void)mask; (void)buf_va;
-    return -ENOSYS;
+    /* Portable statx via host fstatat (C2-3): hosts without SYS_statx
+     * (macOS) serve STATX_BASIC_STATS from a host fstatat. uClibc
+     * fstat/stat call statx with no fallback, so ENOSYS here breaks
+     * every libc guest on such hosts. Birth time, device numbers, and
+     * mount id are zero (regular-file guests never read them). */
+    {
+        enum {
+            SP_STX_BASIC_STATS = 0x7FFU
+        };
+        char ppath[L2A_PATH_MAX];
+        struct stat h;
+        uint8_t b[STX_SIZE];
+        int host_flags = 0;
+        int host_dirfd;
+        int64_t sec;
+        int64_t nsec;
+        long rc = l2a_copy_cstring(ctx, path_va, ppath, L2A_PATH_MAX);
+        if (rc != 0) {
+            return rc;
+        }
+        if ((flags & ~(SP_AT_SYMLINK_NOFOLLOW | SP_AT_NO_AUTOMOUNT |
+                SP_AT_EMPTY_PATH | SP_AT_STATX_SYNC_TYPE)) != 0U) {
+            return -EINVAL;
+        }
+        if ((flags & SP_AT_SYMLINK_NOFOLLOW) != 0U) {
+            host_flags |= AT_SYMLINK_NOFOLLOW;
+        }
+#ifdef AT_NO_AUTOMOUNT
+        if ((flags & SP_AT_NO_AUTOMOUNT) != 0U) {
+            host_flags |= AT_NO_AUTOMOUNT;
+        }
+#endif
+#ifdef AT_EMPTY_PATH
+        if ((flags & SP_AT_EMPTY_PATH) != 0U) {
+            host_flags |= AT_EMPTY_PATH;
+        }
+#endif
+        host_dirfd =
+            ((int32_t)dirfd == SP_AT_FDCWD) ? AT_FDCWD : (int)(int32_t)dirfd;
+        /* AT_EMPTY_PATH with an empty path operates on dirfd itself
+         * (uClibc fstat/stat); hosts without AT_EMPTY_PATH (macOS)
+         * serve that via fstat on the file descriptor. */
+        if (ppath[0] == '\0' && host_dirfd != AT_FDCWD &&
+            (flags & SP_AT_EMPTY_PATH) != 0U) {
+            if (fstat(host_dirfd, &h) != 0) {
+                return -(long)errno;
+            }
+        } else if (fstatat(host_dirfd, ppath, &h, host_flags) != 0) {
+            /* C2-3 sysroot fallback (absolute paths only). */
+            char alt[L2A_PATH_MAX];
+            if (errno != ENOENT || host_dirfd != AT_FDCWD ||
+                sys_path_sysroot(ctx, ppath, alt, sizeof(alt)) != 0 ||
+                fstatat(AT_FDCWD, alt, &h, host_flags) != 0) {
+                return -(long)errno;
+            }
+        }
+        memset(b, 0, sizeof(b));
+        put_be32(b + STX_OFF_MASK, mask & SP_STX_BASIC_STATS);
+        put_be32(b + STX_OFF_BLKSIZE, (uint32_t)h.st_blksize);
+        put_be64(b + STX_OFF_ATTR, 0U);
+        put_be32(b + STX_OFF_NLINK, (uint32_t)h.st_nlink);
+        put_be32(b + STX_OFF_UID, (uint32_t)h.st_uid);
+        put_be32(b + STX_OFF_GID, (uint32_t)h.st_gid);
+        put_be16(b + STX_OFF_MODE, (uint16_t)h.st_mode);
+        put_be64(b + STX_OFF_INO, (uint64_t)h.st_ino);
+        put_be64(b + STX_OFF_SIZE, (uint64_t)(int64_t)h.st_size);
+        put_be64(b + STX_OFF_BLOCKS, (uint64_t)h.st_blocks);
+        put_be64(b + STX_OFF_ATTRMASK, 0U);
+        l2a_host_times(&h, 0, &sec, &nsec);
+        put_be64(b + STX_OFF_ATIME, (sec < 0) ? 0U : (uint64_t)sec);
+        put_be32(b + STX_OFF_ATIME + 8, (uint32_t)nsec);
+        l2a_host_times(&h, 1, &sec, &nsec);
+        put_be64(b + STX_OFF_MTIME, (sec < 0) ? 0U : (uint64_t)sec);
+        put_be32(b + STX_OFF_MTIME + 8, (uint32_t)nsec);
+        l2a_host_times(&h, 2, &sec, &nsec);
+        put_be64(b + STX_OFF_CTIME, (sec < 0) ? 0U : (uint64_t)sec);
+        put_be32(b + STX_OFF_CTIME + 8, (uint32_t)nsec);
+        return l2a_store(ctx, buf_va, b, sizeof(b));
+    }
 #endif
 }
 
@@ -709,104 +847,4 @@ long sparc32_l2a_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg)
     default:
         return -EINVAL;
     }
-}
-
-/* futex WAIT/WAKE via host futex. BE guest words: WAIT expectation is
- * swapped once for the LE host compare; WAKE counts pass through. */
-long sparc32_l2a_futex(sparc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
-    uint32_t val, uint32_t timeout_va)
-{
-#if defined(__linux__) && defined(SYS_futex)
-    uint32_t *host_ptr;
-    long rc;
-    if ((op & 127U) != SP_FUTEX_WAIT && (op & 127U) != SP_FUTEX_WAKE) {
-        return -ENOSYS;
-    }
-    if (l2a_range_ok(uaddr, 4U) != 0) {
-        return -EFAULT;
-    }
-    host_ptr = (uint32_t *)sparc32_guest_ptr(ctx, uaddr);
-    if ((op & 127U) == SP_FUTEX_WAKE) {
-        rc = syscall(SYS_futex, host_ptr, (int)op, (int)val, NULL, NULL, 0);
-        return (rc < 0) ? -(long)errno : rc;
-    } {
-        uint32_t swapped = ((val & 0xFFU) << 24) | ((val & 0xFF00U) << 8) |
-            ((val & 0xFF0000U) >> 8) | ((val & 0xFF000000U) >> 24);
-        struct timespec ts;
-        struct timespec *tsp = NULL;
-        if (timeout_va != 0U) {
-            const uint8_t *tp;
-            int64_t sec;
-            int64_t nsec;
-            if (l2a_range_ok(timeout_va, 8U) != 0) {
-                return -EFAULT;
-            }
-            tp = (const uint8_t *)sparc32_guest_ptr(ctx, timeout_va);
-            sec = (int64_t)(int32_t)get_be32(tp);
-            nsec = (int64_t)(int32_t)get_be32(tp + 4);
-            if (sec < 0 || nsec < 0 || nsec >= 1000000000LL) {
-                return -EINVAL;
-            }
-            ts.tv_sec = (time_t)sec;
-            ts.tv_nsec = (long)nsec;
-            tsp = &ts;
-        }
-        rc = syscall(SYS_futex, host_ptr, (int)op, (int)swapped, tsp, NULL, 0);
-        return (rc < 0) ? -(long)errno : rc;
-    }
-#else
-    (void)ctx; (void)uaddr; (void)op; (void)val; (void)timeout_va;
-    return -ENOSYS;
-#endif
-}
-
-/* rt_sigprocmask bookkeeping only; delivery stays Phase 1/4 machinery. */
-long sparc32_l2a_rt_sigprocmask(sparc32_ctx_t *ctx, uint32_t how,
-    uint32_t set_va, uint32_t oset_va, uint32_t sigsetsize)
-{
-    uint8_t old[8];
-    if (sigsetsize != 8U) {
-        return -EINVAL;
-    }
-    put_be32(old, l2a_blocked[0]);
-    put_be32(old + 4, l2a_blocked[1]);
-    if (set_va != 0U) {
-        const uint8_t *p;
-        uint32_t n0;
-        uint32_t n1;
-        if (l2a_range_ok(set_va, 8U) != 0) {
-            return -EFAULT;
-        }
-        p = (const uint8_t *)sparc32_guest_ptr(ctx, set_va);
-        n0 = get_be32(p);
-        n1 = get_be32(p + 4);
-        switch (how) {
-        case SPARC_SIG_BLOCK: l2a_blocked[0] |= n0; l2a_blocked[1] |= n1; break;
-        case SPARC_SIG_UNBLOCK:
-            l2a_blocked[0] &= ~n0; l2a_blocked[1] &= ~n1; break;
-        case SPARC_SIG_SETMASK: l2a_blocked[0] = n0; l2a_blocked[1] = n1; break;
-        default: return -EINVAL;
-        }
-    } else if (how != SPARC_SIG_BLOCK && how != SPARC_SIG_UNBLOCK &&
-        how != SPARC_SIG_SETMASK) {
-        return -EINVAL;
-    }
-    return (oset_va != 0U) ? l2a_store(ctx, oset_va, old, sizeof(old)) : 0;
-}
-
-/* FIONREAD via the host; TCGETS answers as an isatty query; else ENOTTY. */
-long sparc32_l2a_ioctl(sparc32_ctx_t *ctx, uint32_t fd, uint32_t request,
-    uint32_t arg_va)
-{
-    if (request == SP_FIONREAD) {
-        int n = 0;
-        if (l2a_range_ok(arg_va, 4U) != 0) {
-            return -EFAULT;
-        }
-        if (ioctl((int)fd, FIONREAD, &n) != 0) {
-            return -(long)errno;
-        }
-        return l2a_st_be32(ctx, arg_va, (uint32_t)n);
-    }
-    return (request == SP_TCGETS) ? (isatty((int)fd) ? 0 : -ENOTTY) : -ENOTTY;
 }

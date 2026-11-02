@@ -41,7 +41,7 @@
 /* Translation limits (lane card: up to 64 guest insns per block, stopping
  * at control transfers or guest page boundaries). */
 #define DBT_MAX_INSNS_PER_BLOCK 64U
-#define DBT_CACHE_SIZE          1024U
+#define DBT_CACHE_SIZE          16384U
 #define DBT_CODE_ARENA_SIZE     (4U * 1024U * 1024U)
 
 /* Words of RW staging reserved per translation. Single-insn step

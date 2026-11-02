@@ -14,6 +14,8 @@ G-window loads/stores with region coverage checks, shared by the
 
 #include <string.h>
 
+sparc32_ldstub_lock_t g_sparc32_ldstub_lock;
+
 void interp_wreg(sparc32_ctx_t *ctx, uint32_t rd, uint32_t v)
 {
     if (rd != 0U) {
@@ -105,6 +107,13 @@ bool interp_mem_wr(sparc32_ctx_t *ctx, uint32_t va, const void *src,
         return false;
     }
     memcpy(sparc32_guest_ptr(ctx, va), src, (size_t)len);
+    if (__atomic_load_n(&g_sparc32_ldstub_lock.va, __ATOMIC_RELAXED) == va &&
+        __atomic_load_n(&g_sparc32_ldstub_lock.owner, __ATOMIC_RELAXED) ==
+            (uintptr_t)ctx) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_sparc32_ldstub_lock.va, 0U, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_sparc32_ldstub_lock.owner, 0U, __ATOMIC_RELEASE);
+    }
     return true;
 }
 

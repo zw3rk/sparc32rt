@@ -26,7 +26,7 @@ static inline void put_be16(uint8_t *p, uint16_t v)
     p[1] = (uint8_t)v;
 }
 
-static void put_be32(uint8_t *p, uint32_t v)
+static inline void put_be32(uint8_t *p, uint32_t v)
 {
     p[0] = (uint8_t)(v >> 24);
     p[1] = (uint8_t)(v >> 16);
@@ -34,20 +34,20 @@ static void put_be32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)v;
 }
 
-static void put_be64(uint8_t *p, uint64_t v)
+static inline void put_be64(uint8_t *p, uint64_t v)
 {
     put_be32(p, (uint32_t)(v >> 32));
     put_be32(p + 4, (uint32_t)v);
 }
 
-static uint32_t get_be32(const uint8_t *p)
+static inline uint32_t get_be32(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
         ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
 /* Bounds check for [va, va+len): reject 32-bit wrap + low guard (L1c model). */
-static int l2a_range_ok(uint32_t va, uint64_t len)
+static inline int l2a_range_ok(uint32_t va, uint64_t len)
 {
     if (len == 0U) {
         return 0;
@@ -58,7 +58,7 @@ static int l2a_range_ok(uint32_t va, uint64_t len)
     return (va < SPARC32_LOW_GUARD_SIZE) ? -EFAULT : 0;
 }
 
-static int l2a_store(sparc32_ctx_t *ctx, uint32_t va, const void *src,
+static inline int l2a_store(sparc32_ctx_t *ctx, uint32_t va, const void *src,
     uint64_t len)
 {
     if (l2a_range_ok(va, len) != 0) {

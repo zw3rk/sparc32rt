@@ -102,6 +102,19 @@ static uint32_t rt_trap(sparc32_ctx_t *ctx, uint32_t num, uint32_t pc)
     return SPARC32_EXIT_TRAP;
 }
 
+/* Flush-windows runtime (ta 3, C2-3): shares interp_flush_windows with
+ * the interpreter (one window model for difftest parity). Returns
+ * SPARC32_EXIT_NONE when the stacks published cleanly, else the fault
+ * exit the memory layer already recorded in ctx. */
+static uint32_t sparc32_rt_flush_windows(sparc32_ctx_t *ctx)
+{
+    if (interp_flush_windows(ctx)) {
+        ctx->exit_reason = SPARC32_EXIT_NONE;
+        return SPARC32_EXIT_NONE;
+    }
+    return ctx->exit_reason;
+}
+
 static int rt_asi_ok(uint32_t asi)
 {
     const char *e;

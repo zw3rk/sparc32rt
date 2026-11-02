@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
@@ -21,6 +22,32 @@
 #include "sparc32rt.h"
 #include "os/backend.h"
 #include "os/l2a_access.h"
+#include "os/sigframe_sparc32rt.h"
+#include "os/syscalls_min.h"
+
+#define SP_FIONREAD 0x4004667fU
+#define SP_TCGETS 0x80245408U
+#define SP_FUTEX_WAIT 0U
+#define SP_FUTEX_WAKE 1U
+
+long sparc32_l2a_futex_emu32(sparc32_ctx_t *ctx, uint32_t uaddr,
+    uint32_t op, uint32_t val, uint32_t timeout_va);
+
+static uint32_t l2a_blocked[2] = { 0U, 0U };
+
+uint64_t sparc32_l2a_blocked_mask(void)
+{
+    return ((uint64_t)l2a_blocked[0] << 32) | (uint64_t)l2a_blocked[1];
+}
+
+static int l2a_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
+{
+    if (l2a_range_ok(va, 4U) != 0) {
+        return -EFAULT;
+    }
+    put_be32((uint8_t *)sparc32_guest_ptr(ctx, va), v);
+    return 0;
+}
 
 #define SP_CLOCK_REALTIME 0U
 #define SP_CLOCK_MONOTONIC 1U
@@ -210,4 +237,99 @@ long sparc32_l2a_getrandom(sparc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
     rc = rt_host_getrandom(sparc32_guest_ptr(ctx, buf_va), (size_t)len,
         (unsigned int)flags);
     return (long)rc;
+}
+
+long sparc32_l2a_futex(sparc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
+    uint32_t val, uint32_t timeout_va)
+{
+#if defined(__linux__) && defined(SYS_futex)
+    uint32_t *host_ptr;
+    long rc;
+    if ((op & 127U) != SP_FUTEX_WAIT && (op & 127U) != SP_FUTEX_WAKE) {
+        return -ENOSYS;
+    }
+    if (l2a_range_ok(uaddr, 4U) != 0) {
+        return -EFAULT;
+    }
+    host_ptr = (uint32_t *)sparc32_guest_ptr(ctx, uaddr);
+    if ((op & 127U) == SP_FUTEX_WAKE) {
+        rc = syscall(SYS_futex, host_ptr, (int)op, (int)val, NULL, NULL, 0);
+        return (rc < 0) ? -(long)errno : rc;
+    } {
+        uint32_t swapped = ((val & 0xFFU) << 24) | ((val & 0xFF00U) << 8) |
+            ((val & 0xFF0000U) >> 8) | ((val & 0xFF000000U) >> 24);
+        struct timespec ts;
+        struct timespec *tsp = NULL;
+        if (timeout_va != 0U) {
+            const uint8_t *tp;
+            int64_t sec;
+            int64_t nsec;
+            if (l2a_range_ok(timeout_va, 8U) != 0) {
+                return -EFAULT;
+            }
+            tp = (const uint8_t *)sparc32_guest_ptr(ctx, timeout_va);
+            sec = (int64_t)(int32_t)get_be32(tp);
+            nsec = (int64_t)(int32_t)get_be32(tp + 4);
+            if (sec < 0 || nsec < 0 || nsec >= 1000000000LL) {
+                return -EINVAL;
+            }
+            ts.tv_sec = (time_t)sec;
+            ts.tv_nsec = (long)nsec;
+            tsp = &ts;
+        }
+        rc = syscall(SYS_futex, host_ptr, (int)op, (int)swapped, tsp, NULL, 0);
+        return (rc < 0) ? -(long)errno : rc;
+    }
+#else
+    return sparc32_l2a_futex_emu32(ctx, uaddr, op, val, timeout_va);
+#endif
+}
+
+long sparc32_l2a_rt_sigprocmask(sparc32_ctx_t *ctx, uint32_t how,
+    uint32_t set_va, uint32_t oset_va, uint32_t sigsetsize)
+{
+    uint8_t old[8];
+    if (sigsetsize != 8U) {
+        return -EINVAL;
+    }
+    put_be32(old, l2a_blocked[0]);
+    put_be32(old + 4, l2a_blocked[1]);
+    if (set_va != 0U) {
+        const uint8_t *p;
+        uint32_t n0;
+        uint32_t n1;
+        if (l2a_range_ok(set_va, 8U) != 0) {
+            return -EFAULT;
+        }
+        p = (const uint8_t *)sparc32_guest_ptr(ctx, set_va);
+        n0 = get_be32(p);
+        n1 = get_be32(p + 4);
+        switch (how) {
+        case SPARC_SIG_BLOCK: l2a_blocked[0] |= n0; l2a_blocked[1] |= n1; break;
+        case SPARC_SIG_UNBLOCK:
+            l2a_blocked[0] &= ~n0; l2a_blocked[1] &= ~n1; break;
+        case SPARC_SIG_SETMASK: l2a_blocked[0] = n0; l2a_blocked[1] = n1; break;
+        default: return -EINVAL;
+        }
+    } else if (how != SPARC_SIG_BLOCK && how != SPARC_SIG_UNBLOCK &&
+        how != SPARC_SIG_SETMASK) {
+        return -EINVAL;
+    }
+    return (oset_va != 0U) ? l2a_store(ctx, oset_va, old, sizeof(old)) : 0;
+}
+
+long sparc32_l2a_ioctl(sparc32_ctx_t *ctx, uint32_t fd, uint32_t request,
+    uint32_t arg_va)
+{
+    if (request == SP_FIONREAD) {
+        int n = 0;
+        if (l2a_range_ok(arg_va, 4U) != 0) {
+            return -EFAULT;
+        }
+        if (ioctl((int)fd, FIONREAD, &n) != 0) {
+            return -(long)errno;
+        }
+        return l2a_st_be32(ctx, arg_va, (uint32_t)n);
+    }
+    return (request == SP_TCGETS) ? (isatty((int)fd) ? 0 : -ENOTTY) : -ENOTTY;
 }

@@ -25,6 +25,7 @@
 #include "interp/interp.h"
 #include "interp/interp_priv.h"
 #include "os/syscalls_min.h"
+#include "dbt/aot/aot_cache.h"
 #include "dbt/dbt.h"
 #include "dbt/difftest.h"
 
@@ -115,6 +116,9 @@ static int parse_args(sparc32_ctx_t *ctx, int argc, char **argv)
             setenv("SPARC32RT_WINDOW", argv[i + 1], 1);
         } else if (strcmp(argv[i], "--sysroot") == 0) {
             ctx->sysroot = argv[i + 1];
+        } else if (strcmp(argv[i], "--cache") == 0 ||
+                   strcmp(argv[i], "--aot-cache") == 0) {
+            ctx->cache_dir = argv[i + 1];
         } else if (strcmp(argv[i], "--engine") == 0) {
             if (parse_engine(argv[i + 1], &ctx->engine) != 0) {
                 return -1;
@@ -146,6 +150,9 @@ static void apply_env(sparc32_ctx_t *ctx)
     }
     if (ctx->sysroot == NULL && (s = getenv("SPARC32RT_SYSROOT")) != NULL) {
         ctx->sysroot = s;
+    }
+    if (ctx->cache_dir == NULL && (s = getenv("SPARC32RT_CACHE")) != NULL) {
+        ctx->cache_dir = s;
     }
     /* SPARC32RT_HOST=none opts out of the /dev/a32host handshake. */
     if ((s = getenv("SPARC32RT_HOST")) != NULL && strcmp(s, "none") == 0) {
@@ -292,18 +299,31 @@ static int run_engine(sparc32_ctx_t *ctx, engine_step_fn step, const char *tag)
     if (load_guest(ctx) != 0) {
         return 1;
     }
+    if (ctx->engine == SPARC32_ENGINE_DBT && ctx->cache_dir != NULL) {
+        (void)sparc32_aot_cache_load(ctx->cache_dir, NULL, NULL);
+    }
     for (;;) {
         long nr;
         long status;
 
         step(ctx);
-        if (ctx->exit_reason == SPARC32_EXIT_FAULT ||
-            ctx->exit_reason == SPARC32_EXIT_SINGLE_STEP) {
-            int signo;
-            if (ctx->exit_reason == SPARC32_EXIT_SINGLE_STEP) {
-                ctx->fault_addr = ctx->exit_dest;
+        if (ctx->exit_reason == SPARC32_EXIT_SINGLE_STEP) {
+            /* Page-final transfer: replay the target via interp_step
+             * (C2-3: the DBT dispatcher replays the same way in
+             * dbt_replay; treating it as a fault killed every libc
+             * guest whose startup crosses a page edge). A replay that
+             * stops again falls through to the normal stop handling
+             * below (syscall dispatch, fault delivery, loud death). */
+            ctx->pc = ctx->exit_dest;
+            ctx->npc = ctx->exit_dest + 4U;
+            ctx->exit_reason = SPARC32_EXIT_NONE;
+            interp_step(ctx);
+            if (ctx->exit_reason == SPARC32_EXIT_NONE) {
+                continue;
             }
-            signo = sparc32_classify_fault(ctx);
+        }
+        if (ctx->exit_reason == SPARC32_EXIT_FAULT) {
+            int signo = sparc32_classify_fault(ctx);
             if (interp_try_deliver_sync(ctx, signo)) {
                 continue;
             }
@@ -313,16 +333,21 @@ static int run_engine(sparc32_ctx_t *ctx, engine_step_fn step, const char *tag)
                     "sparc32rt: %s stopped: reason=%u pc=0x%08x "
                     "dest=0x%08x fault=0x%08x\n"
                     "  g1=%08x g2=%08x g3=%08x g4=%08x o0=%08x o1=%08x o2=%08x "
-                    "sp=%08x cwp=%u\n",
+                    "sp=%08x cwp=%u\n"
+                    "  l7=%08x i0=%08x i7=%08x fp=%08x\n",
                     tag, ctx->exit_reason, ctx->pc, ctx->exit_dest,
                     ctx->fault_addr, ctx->r[1], ctx->r[2], ctx->r[3],
                     ctx->r[4], ctx->r[8], ctx->r[9], ctx->r[10],
-                    ctx->r[SPARC32_SP], ctx->cwp);
+                    ctx->r[SPARC32_SP], ctx->cwp, ctx->r[23],
+                    ctx->r[24], ctx->r[31], ctx->r[30]);
             return 1;
         }
         nr = (long)(int32_t)ctx->r[SPARC32_G1];
         status = sparc32_handle_syscall(ctx);
         if (sparc32_syscall_is_exit(nr)) {
+            if (ctx->engine == SPARC32_ENGINE_DBT && ctx->cache_dir != NULL) {
+                (void)sparc32_aot_cache_save(ctx->cache_dir);
+            }
             return (int)(status & 0xFFL);
         }
     }

@@ -92,11 +92,27 @@ static inline bool sparc32_atomic_ldstub(sparc32_ctx_t *ctx, uint32_t va,
     uint8_t *cell;
     uint8_t old;
     void *hva = sparc32_atomic_hva(ctx, va, 1U, 3U);
+    uintptr_t me = (uintptr_t)ctx;
     if (hva == NULL) {
         return false;
     }
+    while (__atomic_load_n(&g_sparc32_ldstub_lock.owner, __ATOMIC_ACQUIRE) != me) {
+        uintptr_t zero = 0U;
+        if (__atomic_compare_exchange_n(&g_sparc32_ldstub_lock.owner, &zero, me,
+                false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            break;
+        }
+        sched_yield();
+    }
     cell = (uint8_t *)hva;
     old = __atomic_exchange_n(cell, (uint8_t)0xFF, __ATOMIC_SEQ_CST);
+    if (old == 0U) {
+        __atomic_store_n(&g_sparc32_ldstub_lock.va, va, __ATOMIC_RELEASE);
+    } else {
+        __atomic_store_n(&g_sparc32_ldstub_lock.va, 0U, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_sparc32_ldstub_lock.owner, 0U, __ATOMIC_RELEASE);
+        sched_yield();
+    }
     interp_wreg(ctx, rd, (uint32_t)old);
     return true;
 }

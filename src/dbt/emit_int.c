@@ -684,8 +684,25 @@ int sparc32_emit_trap(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     } else {
         p_taken = (size_t)-1;
     }
-    /* True path: TA 0x10 exits to the dispatcher syscall gate with the
-     * dynamic %g1 number; any other true trap number is EXIT_TRAP. */
+    /* True path: ta 3 flushes register windows inline (C2-3: uClibc
+     * setjmp); TA 0x10 exits to the dispatcher syscall gate with the
+     * dynamic %g1 number; any other true trap number is EXIT_TRAP.
+     * EKEEP (w22, callee-saved) survives the flush BLR, and the window
+     * file + ctx->cwp the helper reads are committed by the SAVE /
+     * RESTORE fast path before any trap executes. */
+    a64_emit_mov_imm32(b, ES0, 3u);
+    a64_emit_sub_reg_w(b, true, A64_ZR, EKEEP, ES0, A64_SHIFT_LSL, 0u);
+    b->nzcv_valid = 0;
+    {
+        size_t p_flush = a64_emit_b_cond_placeholder(b, A64_COND_EQ);
+        size_t p_noflush = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_b_cond(b, p_flush, b->count);
+        e_arg_ctx(b);
+        e_call_prologue(b, (uint64_t)(uintptr_t)&sparc32_rt_flush_windows);
+        e_call_invoke_faultable(ec);
+        a64_emit_exit_branch(b, npc);
+        a64_patch_b_cond(b, p_noflush, b->count);
+    }
     a64_emit_mov_imm32(b, ES0, (uint32_t)SPARC32_TRAP_SYSCALL_NUM);
     a64_emit_sub_reg_w(b, true, A64_ZR, EKEEP, ES0, A64_SHIFT_LSL, 0u);
     /* The trap-number compare is not a live cc result. */
@@ -778,39 +795,29 @@ int sparc32_emit_casa(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     return e_emit_memcall(ec, d, (uint64_t)(uintptr_t)&sparc32_rt_mem, 0);
 }
 
-static int e_emit_window(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
-    int is_save)
-{
-    int fast = sparc32_emit_win_fast(ec, d, is_save);
-    if (fast != 0) {
-        return fast > 0 ? (ec->buf->overflow ? -1 : 0) : -1;
-    }
-    return e_emit_memcall(ec, d, (uint64_t)(uintptr_t)&sparc32_rt_window, 1);
-}
-
 int sparc32_emit_save(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
-    return e_emit_window(ec, d, 1);
+    int fast = sparc32_emit_win_fast(ec, d, 1);
+    return fast != 0 ? (fast > 0 ? (ec->buf->overflow ? -1 : 0) : -1)
+        : e_emit_memcall(ec, d, (uint64_t)(uintptr_t)&sparc32_rt_window, 1);
 }
 
 int sparc32_emit_restore(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
-    return e_emit_window(ec, d, 0);
+    int fast = sparc32_emit_win_fast(ec, d, 0);
+    return fast != 0 ? (fast > 0 ? (ec->buf->overflow ? -1 : 0) : -1)
+        : e_emit_memcall(ec, d, (uint64_t)(uintptr_t)&sparc32_rt_window, 1);
 }
 
 int sparc32_emit_flush(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
-    (void)ec;
-    (void)d;
-    /* Host memory model needs no barrier (interp returns true). */
+    (void)ec; (void)d;
     return 0;
 }
 
 int sparc32_emit_stbar(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
-    (void)ec;
-    (void)d;
-    /* Store barrier is a host-model nop (TSO). */
+    (void)ec; (void)d;
     return 0;
 }
 
@@ -824,7 +831,6 @@ int sparc32_emit_priv(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 int sparc32_emit_fallback(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
     (void)d;
-    /* FPU/FBfcc/odd encodings: dispatcher single-steps via interp_step. */
     a64_emit_exit_undef(ec->buf, ec->pc);
     return ec->buf->overflow ? -1 : 0;
 }
@@ -832,51 +838,29 @@ int sparc32_emit_fallback(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 static int e_emit_one(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
 {
     switch (d->cls) {
-    case SPARC32_OP_SETHI:
-        return sparc32_emit_sethi(ec, d);
-    case SPARC32_OP_ALU:
-        return sparc32_emit_alu(ec, d);
-    case SPARC32_OP_SHIFT:
-        return sparc32_emit_shift(ec, d);
-    case SPARC32_OP_RDASR:
-        return sparc32_emit_rdasr(ec, d);
-    case SPARC32_OP_WRASR:
-        return sparc32_emit_wrasr(ec, d);
-    case SPARC32_OP_PRIV:
-        return sparc32_emit_priv(ec, d);
-    case SPARC32_OP_CALL:
-        return sparc32_emit_call(ec, d);
-    case SPARC32_OP_BRANCH:
-        return sparc32_emit_branch(ec, d);
-    case SPARC32_OP_JMPL:
-        return sparc32_emit_jmpl(ec, d);
-    case SPARC32_OP_SAVE:
-        return sparc32_emit_save(ec, d);
-    case SPARC32_OP_RESTORE:
-        return sparc32_emit_restore(ec, d);
-    case SPARC32_OP_TRAP:
-        return sparc32_emit_trap(ec, d);
-    case SPARC32_OP_FLUSH:
-        return sparc32_emit_flush(ec, d);
-    case SPARC32_OP_STBAR:
-        return sparc32_emit_stbar(ec, d);
-    case SPARC32_OP_LOAD:
-        return sparc32_emit_load(ec, d);
-    case SPARC32_OP_STORE:
-        return sparc32_emit_store(ec, d);
-    case SPARC32_OP_SWAP:
-        return sparc32_emit_swap(ec, d);
-    case SPARC32_OP_CASA:
-        return sparc32_emit_casa(ec, d);
-    case SPARC32_OP_FPU:
-        return sparc32_emit_fpu(ec, d);
-    case SPARC32_OP_FBRANCH:
-        return sparc32_emit_fbranch(ec, d);
-    case SPARC32_OP_FPMEM:
-        return sparc32_emit_fpmem(ec, d);
+    case SPARC32_OP_SETHI:   return sparc32_emit_sethi(ec, d);
+    case SPARC32_OP_ALU:     return sparc32_emit_alu(ec, d);
+    case SPARC32_OP_SHIFT:   return sparc32_emit_shift(ec, d);
+    case SPARC32_OP_RDASR:   return sparc32_emit_rdasr(ec, d);
+    case SPARC32_OP_WRASR:   return sparc32_emit_wrasr(ec, d);
+    case SPARC32_OP_PRIV:    return sparc32_emit_priv(ec, d);
+    case SPARC32_OP_CALL:    return sparc32_emit_call(ec, d);
+    case SPARC32_OP_BRANCH:  return sparc32_emit_branch(ec, d);
+    case SPARC32_OP_JMPL:    return sparc32_emit_jmpl(ec, d);
+    case SPARC32_OP_SAVE:    return sparc32_emit_save(ec, d);
+    case SPARC32_OP_RESTORE: return sparc32_emit_restore(ec, d);
+    case SPARC32_OP_TRAP:    return sparc32_emit_trap(ec, d);
+    case SPARC32_OP_FLUSH:   return sparc32_emit_flush(ec, d);
+    case SPARC32_OP_STBAR:   return sparc32_emit_stbar(ec, d);
+    case SPARC32_OP_LOAD:    return sparc32_emit_load(ec, d);
+    case SPARC32_OP_STORE:   return sparc32_emit_store(ec, d);
+    case SPARC32_OP_SWAP:    return sparc32_emit_swap(ec, d);
+    case SPARC32_OP_CASA:    return sparc32_emit_casa(ec, d);
+    case SPARC32_OP_FPU:     return sparc32_emit_fpu(ec, d);
+    case SPARC32_OP_FBRANCH: return sparc32_emit_fbranch(ec, d);
+    case SPARC32_OP_FPMEM:   return sparc32_emit_fpmem(ec, d);
     case SPARC32_OP_ILLEGAL:
-    default:
-        break;
+    default: break;
     }
     return sparc32_emit_fallback(ec, d);
 }

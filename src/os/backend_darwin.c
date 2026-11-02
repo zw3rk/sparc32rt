@@ -232,6 +232,25 @@ int rt_host_map_anon(void *hint_addr, size_t len, int linux_prot,
         uintptr_t hp_start = start & ~(uintptr_t)(hp - 1u);
         uintptr_t hp_end = (end + (uintptr_t)(hp - 1u)) & ~(uintptr_t)(hp - 1u);
         int hprot = (prot == 0) ? PROT_NONE : (PROT_READ | PROT_WRITE);
+        /* C2-3: a PROT_NONE reservation must round INWARD (only fully
+         * covered host pages go NONE); rounding outward would strip
+         * readable neighbours sharing the 16 KiB page (loader PROT_NONE
+         * slip covering live library probes). Upgrades stay outward:
+         * the region table (not the host page) is authoritative, so an
+         * over-permissive host page is safe while an over-strict one
+         * SIGBUSes the translator. Skipped edges keep prior host prot;
+         * fully covered pages always apply. */
+        if (hprot == PROT_NONE) {
+            uintptr_t in_start = (start + (uintptr_t)(hp - 1u)) &
+                ~(uintptr_t)(hp - 1u);
+            uintptr_t in_end = (uintptr_t)(start + len) & ~(uintptr_t)(hp - 1u);
+            if (in_end <= in_start) {
+                *out_host_addr = hint_addr;
+                return 0;
+            }
+            hp_start = in_start;
+            hp_end = in_end;
+        }
         if (mprotect((void *)hp_start, hp_end - hp_start, hprot) != 0) {
             return -errno;
         }
@@ -382,6 +401,18 @@ int rt_host_protect(void *host_addr, size_t len, int linux_prot)
         uintptr_t hp_start = start & ~(uintptr_t)(hp - 1u);
         uintptr_t hp_end = (end + (uintptr_t)(hp - 1u)) & ~(uintptr_t)(hp - 1u);
         int hprot = (prot == 0) ? PROT_NONE : (PROT_READ | PROT_WRITE);
+        /* C2-3: see rt_host_map_anon — downgrades to NONE round inward
+         * so partially covered neighbours keep their host mapping. */
+        if (hprot == PROT_NONE) {
+            uintptr_t in_start = (start + (uintptr_t)(hp - 1u)) &
+                ~(uintptr_t)(hp - 1u);
+            uintptr_t in_end = end & ~(uintptr_t)(hp - 1u);
+            if (in_end <= in_start) {
+                return 0;
+            }
+            hp_start = in_start;
+            hp_end = in_end;
+        }
         if (mprotect((void *)hp_start, hp_end - hp_start, hprot) != 0) {
             return -errno;
         }

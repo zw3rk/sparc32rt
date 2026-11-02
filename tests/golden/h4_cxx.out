@@ -1,0 +1,7 @@
+H4-CXX17 start
+unwind frames=3 dtors=2 order=2,1 msg=boom-17
+rethrow val=42 dtor=7
+unwind signal=USR1 seen=1 dtors=12,11 msg=sig-17
+rtti down=x cross=null bad_cast=1 typeid=ok
+threads n=4 reps=1000 sum=4000 tld_dtors=4
+H4-CXX17-PASS

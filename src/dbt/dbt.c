@@ -31,6 +31,7 @@
 #endif
 
 #include "sparc32rt.h"
+#include "dbt/aot/aot_cache.h"
 #include "dbt/aot/mem_site.h"
 #include "dbt/dbt.h"
 #include "dbt/emit_int.h"
@@ -374,6 +375,11 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
             overflow = true;
         }
     }
+    if (have_insn && !overflow && buf.count < (size_t)cap) {
+        g_arena_used -= ((size_t)cap - buf.count) * sizeof(uint32_t);
+    } else if (!have_insn || overflow) {
+        g_arena_used -= (size_t)cap * sizeof(uint32_t);
+    }
     buf.guest_end_pc = end;
     /* Direct-map collision: this bucket already holds another block.
      * In-fragment chain probes validate the target epoch only, so a
@@ -392,26 +398,10 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
             }
         }
     }
-    if (!have_insn) {
-        /* Overflow on the very first insn: keep a needs_interp stub so
-         * execution falls back to interp_step with identical protocol. */
+    if (!have_insn || overflow) {
         b->start_pc = pc;
-        b->end_pc = pc + 4U;
-        b->n_insns = 0U;
-        b->epoch = g_cache_epoch;
-        b->valid = true;
-        b->needs_interp = true;
-        b->host_code = NULL;
-        b->ends_cti = false;
-        b->ends_trap = false;
-        b->is_link = false;
-        b->indirect = false;
-        b->slot_count = 0U;
-    } else if (overflow) {
-        /* Truncated fragments never execute: identical interp fallback. */
-        b->start_pc = pc;
-        b->end_pc = end;
-        b->n_insns = n;
+        b->end_pc = have_insn ? end : (pc + 4U);
+        b->n_insns = have_insn ? n : 0U;
         b->epoch = g_cache_epoch;
         b->valid = true;
         b->needs_interp = true;
@@ -462,6 +452,7 @@ static const dbt_block_t *dbt_translate(sparc32_ctx_t *ctx, uint32_t pc,
     ch->host_code = b->host_code;
     if (b->host_code != NULL && end > pc) {
         vm32_note_code_page(pc, end - pc);
+        (void)sparc32_aot_cache_record(pc, end - pc, 1u);
     }
     ctx->blocks_compiled += 1U;
     if (ctx->trace_enabled && have_insn && !overflow && b->host_code != NULL) {
@@ -484,7 +475,14 @@ const dbt_block_t *dbt_lookup(sparc32_ctx_t *ctx, uint32_t pc)
     }
     idx = dbt_cache_index(pc);
     b = &g_blocks[idx];
-    if (b->valid && b->epoch == g_cache_epoch && b->start_pc == pc) {
+    if (b->valid && b->start_pc == pc) {
+        if (b->epoch != g_cache_epoch) {
+            b->epoch = g_cache_epoch;
+            memset(&g_chain[idx], 0, sizeof(g_chain[idx]));
+            g_chain[idx].key_epoch =
+                (uint64_t)b->start_pc | ((uint64_t)b->epoch << 32);
+            g_chain[idx].host_code = b->host_code;
+        }
         return b;
     }
     return dbt_translate(ctx, pc, false);

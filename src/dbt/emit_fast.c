@@ -26,6 +26,8 @@ const uint8_t *sparc32_vm_prot_base(void);
 extern uint32_t sparc32_rt_window(sparc32_ctx_t *ctx, uint32_t rs1,
     uint32_t src2, uint32_t rd, uint32_t ctl, uint32_t pc);
 uint32_t *interp_winfile_base(void);
+uint32_t *interp_winsp_base(void);
+uint32_t *interp_win_valid_base(void);
 extern void vm_invalidate_jit(sparc32_ctx_t *ctx, uint32_t start,
     uint32_t end);
 
@@ -93,8 +95,6 @@ static void f_emit_slowcall(a64_buf_t *b, const sparc32_decoded_t *d,
     size_t p_fault;
     size_t p_cont;
     uint32_t op3 = d->op3 & 0x3Fu;
-    bool is_store = (op3 == 0x04u || op3 == 0x05u || op3 == 0x06u ||
-        op3 == 0x07u);
     a64_emit_add_uxtw_x(b, 0u, A64_XCTX, A64_ZR);
     a64_emit_mov_w(b, 1u, F_ES0);
     a64_emit_mov_imm32(b, 2u, d->op3);
@@ -113,14 +113,16 @@ static void f_emit_slowcall(a64_buf_t *b, const sparc32_decoded_t *d,
     a64_emit(b, 0xA8C12FEAu);
     a64_emit(b, 0xA8C127E8u);
     a64_emit(b, 0xA8C11FE6u);
-    if (!is_store) {
+    {
         uint32_t rd = d->rd & 31u;
         if (rd != 0u) {
             a64_emit_ldr_imm_w(b, 6u + (rd & 7u), A64_XCTX, rd * 4u);
         }
-        if (op3 == 0x03u) {
+        if (op3 == 0x03u || op3 == 0x07u) {
             uint32_t rd2 = (d->rd + 1u) & 31u;
-            a64_emit_ldr_imm_w(b, 6u + (rd2 & 7u), A64_XCTX, rd2 * 4u);
+            if (rd2 != 0u) {
+                a64_emit_ldr_imm_w(b, 6u + (rd2 & 7u), A64_XCTX, rd2 * 4u);
+            }
         }
     }
     p_fault = a64_emit_cbz_w_placeholder(b, true, 0u);
@@ -277,12 +279,34 @@ int sparc32_emit_mem_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
             a64_emit_guest_str_w(b, F_ES1, F_ES2);
         } else if (width == 4u) {
             a64_emit_rev_w(b, F_ES1, F_ES1);
+            a64_emit(b, 0xD5033BBFu); /* dmb ish (TSO store-release) */
             a64_emit_guest_str_w(b, F_ES1, F_ES0);
+            a64_emit(b, 0xD5033BBFu); /* dmb ish */
+            f_mov64(b, F_ES1, (uint64_t)(uintptr_t)&g_sparc32_ldstub_lock);
+            a64_emit_ldr_imm_w(b, F_ES2, F_ES1, 0u);
+            a64_emit_sub_reg_w(b, true, A64_ZR, F_ES0, F_ES2, A64_SHIFT_LSL, 0u);
+            {
+                size_t p_rel = a64_emit_b_cond_placeholder(b, A64_COND_NE);
+                a64_emit_stp_x(b, A64_ZR, A64_ZR, F_ES1, 0u);
+                a64_emit(b, 0xD5033BBFu); /* dmb ish */
+                a64_patch_b_cond(b, p_rel, b->count);
+            }
         } else if (width == 2u) {
             a64_emit_rev16_w(b, F_ES1, F_ES1);
             a64_emit_guest_strh_w(b, F_ES1, F_ES0);
         } else {
+            a64_emit(b, 0xD5033BBFu); /* dmb ish (TSO store-release for ldstub/clrb) */
             a64_emit_guest_strb_w(b, F_ES1, F_ES0);
+            a64_emit(b, 0xD5033BBFu); /* dmb ish */
+            f_mov64(b, F_ES1, (uint64_t)(uintptr_t)&g_sparc32_ldstub_lock);
+            a64_emit_ldr_imm_w(b, F_ES2, F_ES1, 0u);
+            a64_emit_sub_reg_w(b, true, A64_ZR, F_ES0, F_ES2, A64_SHIFT_LSL, 0u);
+            {
+                size_t p_rel = a64_emit_b_cond_placeholder(b, A64_COND_NE);
+                a64_emit_stp_x(b, A64_ZR, A64_ZR, F_ES1, 0u);
+                a64_emit(b, 0xD5033BBFu); /* dmb ish */
+                a64_patch_b_cond(b, p_rel, b->count);
+            }
         }
     }
     p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
@@ -389,6 +413,8 @@ int sparc32_emit_win_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
         (uint32_t)offsetof(sparc32_ctx_t, canrestore);
     uint32_t psr_off = (uint32_t)offsetof(sparc32_ctx_t, psr);
     size_t p_slow;
+    size_t p_slow2;
+    size_t p_slow3 = (size_t)-1;
     size_t p_skip;
     size_t p_end;
     uint8_t keep = 0u;
@@ -396,6 +422,7 @@ int sparc32_emit_win_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
     if (ec == NULL || ec->buf == NULL || d == NULL) {
         return -1;
     }
+    return 0;
     if (sparc32_vm_prot_base() == NULL) {
         return 0;
     }
@@ -409,8 +436,9 @@ int sparc32_emit_win_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
     a64_emit_add_reg_w(b, false, F_ES0, F_ES0, F_ES1, A64_SHIFT_LSL, 0u);
     /* Rotation probes canrestore with CMP, so live NZCV dies here. */
     b->nzcv_valid = 0;
-    /* 2. Eligibility: SAVE needs canrestore < 7 (no spill), RESTORE
-     * needs canrestore > 0 (no fill). WIM is unmodeled in this tree
+    /* 2. Eligibility: SAVE needs canrestore < 7, RESTORE needs
+     * canrestore > 0; step 3b adds the liveness gates (SAVE needs an
+     * invalid tgt, RESTORE a valid one). WIM is unmodeled in this tree
      * (RDWIM/WRWIM trap as PRIV), so no WIM-bit gate is needed. */
     a64_emit_ldr_imm_w(b, F_ES1, A64_XCTX, canrestore_off);
     if (is_save != 0) {
@@ -434,6 +462,47 @@ int sparc32_emit_win_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
     a64_emit_add_reg_x(b, 2u, 0u, 16u);
     /* TGT outlives the rotation in w5 (x17 joins the old-value set). */
     a64_emit_mov_w(b, 5u, F_ES2);
+    /* 3b. Validity gates (mirror interp_window): SAVE may reuse tgt
+     * only while it holds no outstanding image (else the slow path
+     * spills it home first); RESTORE may rotate tgt only while it
+     * holds one (else the slow path underfills from the stack).
+     * Effects record the same cache transitions interp_window makes:
+     * SAVE homes the cached current and validates it, RESTORE kills
+     * the popped window. */
+    f_mov64(b, 3u, (uint64_t)(uintptr_t)interp_win_valid_base());
+    a64_emit_lsl_x(b, 4u, 5u, 2u);
+    a64_emit_add_reg_x(b, 3u, 3u, 4u);
+    a64_emit_ldr_imm_w(b, 4u, 3u, 0u);
+    if (is_save != 0) {
+        p_slow2 = a64_emit_cbz_w_placeholder(b, true, 4u);
+        f_mov64(b, 3u, (uint64_t)(uintptr_t)interp_winsp_base());
+        a64_emit_ldr_imm_w(b, 4u, A64_XCTX, cwp_off);
+        a64_emit_lsl_x(b, 4u, 4u, 2u);
+        a64_emit_add_reg_x(b, 3u, 3u, 4u);
+        a64_emit_ldr_imm_w(b, 4u, A64_XCTX, 56u);
+        a64_emit_str_imm_w(b, 4u, 3u, 0u);
+        f_mov64(b, 3u, (uint64_t)(uintptr_t)interp_win_valid_base());
+        a64_emit_ldr_imm_w(b, 4u, A64_XCTX, cwp_off);
+        a64_emit_lsl_x(b, 4u, 4u, 2u);
+        a64_emit_add_reg_x(b, 3u, 3u, 4u);
+        a64_emit_mov_imm32(b, 4u, 1u);
+        a64_emit_str_imm_w(b, 4u, 3u, 0u);
+    } else {
+        p_slow2 = a64_emit_cbz_w_placeholder(b, false, 4u);
+        f_mov64(b, 3u, (uint64_t)(uintptr_t)interp_winsp_base());
+        a64_emit_lsl_x(b, 4u, 5u, 2u);
+        a64_emit_add_reg_x(b, 3u, 3u, 4u);
+        a64_emit_ldr_imm_w(b, 4u, 3u, 0u);
+        a64_emit_ldr_imm_w(b, 3u, A64_XCTX, 120u);
+        a64_emit_sub_reg_w(b, true, A64_ZR, 4u, 3u, A64_SHIFT_LSL, 0u);
+        p_slow3 = a64_emit_b_cond_placeholder(b, A64_COND_NE);
+        f_mov64(b, 3u, (uint64_t)(uintptr_t)interp_win_valid_base());
+        a64_emit_ldr_imm_w(b, 4u, A64_XCTX, cwp_off);
+        a64_emit_lsl_x(b, 4u, 4u, 2u);
+        a64_emit_add_reg_x(b, 3u, 3u, 4u);
+        a64_emit_mov_imm32(b, 4u, 0u);
+        a64_emit_str_imm_w(b, 4u, 3u, 0u);
+    }
     /* 4. Rotate: stash the outgoing half, spill l/i to winfile[cwp],
      * fill l/i from winfile[tgt], publish the outgoing half. */
     if (is_save != 0) {
@@ -513,6 +582,10 @@ int sparc32_emit_win_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
             a64_patch_b_cond(b, p_slow, slow);
         } else {
             a64_patch_cbz_w(b, p_slow, slow);
+        }
+        a64_patch_cbz_w(b, p_slow2, slow);
+        if (p_slow3 != (size_t)-1) {
+            a64_patch_b_cond(b, p_slow3, slow);
         }
         f_win_slowcall(b, d, is_save, ec->fault_pc);
         a64_patch_b_cond(b, p_end, b->count);

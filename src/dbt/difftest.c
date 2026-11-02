@@ -348,6 +348,19 @@ int difftest_run(sparc32_ctx_t *ctx)
         interp_step(&a);
         difftest_rmw_restore(&a, &rmw);
         dbt_step(&b);
+        /* C2-3: interp reports page-final transfers as SINGLE_STEP
+         * while dbt_step replays them internally (NONE). Replay side A
+         * the same way so both sides agree past the transfer; the
+         * replay is interp-vs-interp (no RMW wrap needed). A replay
+         * that stops again keeps its reason and falls into the normal
+         * reason-compare below (genuine divergence or a shared stop). */
+        if (a.exit_reason == SPARC32_EXIT_SINGLE_STEP &&
+            b.exit_reason == SPARC32_EXIT_NONE) {
+            a.pc = a.exit_dest;
+            a.npc = a.exit_dest + 4U;
+            a.exit_reason = SPARC32_EXIT_NONE;
+            interp_step(&a);
+        }
         if (a.exit_reason != b.exit_reason) {
             return difftest_reason_div(&a, &b, step_pc);
         }

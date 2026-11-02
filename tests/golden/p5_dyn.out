@@ -1,0 +1,8 @@
+dlopen ok
+add ok 42
+name ok p5-dynlib
+pair ok 42
+exe-tls ok 8
+lib-tls ok 1 2
+missing ok
+P5-DYN-PASS

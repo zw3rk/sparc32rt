@@ -33,12 +33,16 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include "sparc32rt.h"
+#include "interp/interp.h"
+#include "interp/interp_priv.h"
 #include "os/syscall_nr.h"
 #include "os/threads.h"
 #include "rt32/rt32.h"
@@ -90,6 +94,8 @@ long sparc32_l2a_getrandom(sparc32_ctx_t *ctx, uint32_t buf_va, uint32_t len,
     uint32_t flags);
 long sparc32_l2a_futex(sparc32_ctx_t *ctx, uint32_t uaddr, uint32_t op,
     uint32_t val, uint32_t timeout_va);
+long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
+    uint32_t op, uint32_t val, uint32_t timeout_va);
 long sparc32_l2a_rt_sigprocmask(sparc32_ctx_t *ctx, uint32_t how,
     uint32_t set_va, uint32_t oset_va, uint32_t sigsetsize);
 long sparc32_l2a_ioctl(sparc32_ctx_t *ctx, uint32_t fd, uint32_t request,
@@ -178,6 +184,8 @@ static int guest_range_ok(uint32_t va, uint32_t len)
 }
 
 /* Big-endian guest word access (guest is BE, host may be LE). */
+static int sys_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v);
+#if defined(__linux__)
 static int sys_ld_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t *out)
 {
     const uint8_t *p;
@@ -189,152 +197,21 @@ static int sys_ld_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t *out)
         ((uint32_t)p[2] << 8) | (uint32_t)p[3];
     return 0;
 }
+#endif
 
-/* Old-style (non-SA_SIGINFO) signal dispositions for sync delivery.
- * Phase-1 scope: installed by rt_sigaction, consulted by
- * interp_try_deliver_sync. Async delivery/threads arrive in Phase 4. */
-static struct {
-    uint32_t handler;
-    uint32_t restorer;
-    int installed;
-} sigact[32];
+#ifndef SPARC32__NR_sigaltstack
+#define SPARC32__NR_sigaltstack 28L
+#endif
+#ifndef SPARC32__NR_rt_sigreturn
+#define SPARC32__NR_rt_sigreturn 101L
+#endif
 
-int sparc32_signal_get(int sig, uint32_t *handler_va, uint32_t *restorer_va)
-{
-    if (sig < 1 || sig > 31 || !sigact[sig].installed) {
-        return -1;
-    }
-    *handler_va = sigact[sig].handler;
-    *restorer_va = sigact[sig].restorer;
-    return 0;
-}
-
-/* execve reset (RC4): a new image starts with no handlers installed
- * (Linux resets caught signals to SIG_DFL across exec). */
-void sparc32_signal_reset_all(void)
-{
-    int sig;
-    for (sig = 1; sig <= 31; sig++) {
-        sigact[sig].installed = 0;
-        sigact[sig].handler = 0U;
-        sigact[sig].restorer = 0U;
-    }
-}
-
-/* Close moved to src/os/syscalls.c (lane L2a, sparc32_l2a_close);
- * behaviour identical (0 on success, negative host errno on failure). */
-
-/* rt_sigaction(102): SPARC 5-arg form (E05: sig, act, oact, restorer,
- * sigsetsize). Phase-1 accepts old-style handlers only (flags == 0);
- * SA_SIGINFO and realtime extensions are Phase 4. */
-static long sys_rt_sigaction(sparc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
-    uint32_t oact_va, uint32_t restorer, uint32_t sigsetsize)
-{
-    uint32_t handler;
-    uint32_t flags;
-    (void)ctx;
-    (void)oact_va;
-    if (sig < 1U || sig > 31U) {
-        return -EINVAL;
-    }
-    if (sigsetsize != 8U) {
-        return -EINVAL;
-    }
-    if (guest_range_ok(act_va, 20U) != 0) {
-        return -EFAULT;
-    }
-    if (sys_ld_be32(ctx, act_va, &handler) != 0) {
-        return -EFAULT;
-    }
-    if (sys_ld_be32(ctx, act_va + 4U, &flags) != 0) {
-        return -EFAULT;
-    }
-    if (flags != 0U) {
-        return -EINVAL;
-    }
-    sigact[sig].handler = handler;
-    sigact[sig].restorer = restorer;
-    sigact[sig].installed = 1;
-    return 0;
-}
-
-/* sigreturn(216): legacy non-RT restore with qemu-sparc compatible frame
- * addressing. The guest handler (L1d test) patches pc/npc at frame+100 /
- * frame+104 — the non-RT struct signal_frame regs slots, which alias the
- * RT frame's si_errno/si_code words on this kernel/qemu layout — and
- * resumes from there. u_regs (g0..g7, i0..i7), y and psr come from the
- * kernel-layout slots (+0xE0 regs); %o regs stay live (handler contract).
- * fpu_save/rwin_save must be 0 (we never set them); anything else faults
- * instead of silently mis-restoring. */
-static long sys_sigreturn(sparc32_ctx_t *ctx)
-{
-    uint32_t base = ctx->r[SPARC32_SP];
-    uint32_t u[16];
-    uint32_t pc;
-    uint32_t npc;
-    uint32_t y;
-    uint32_t psr;
-    uint32_t fp;
-    uint32_t rp;
-    uint32_t fs;
-    int i;
-    if ((base & 15U) != 0U) {
-        return -EFAULT;
-    }
-    if (guest_range_ok(base, 344U) != 0) {
-        return -EFAULT;
-    }
-    if (sys_ld_be32(ctx, base + 0xF0U + 14U * 4U, &fp) != 0) {
-        return -EFAULT;
-    }
-    if ((fp & 7U) != 0U) {
-        return -EFAULT;
-    }
-    if (sys_ld_be32(ctx, base + 100U, &pc) != 0) {
-        return -EFAULT;
-    }
-    if (sys_ld_be32(ctx, base + 104U, &npc) != 0) {
-        return -EFAULT;
-    }
-    if ((pc & 3U) != 0U || (npc & 3U) != 0U) {
-        return -EFAULT;
-    }
-    if (sys_ld_be32(ctx, base + 0x138U, &fs) != 0) {
-        return -EFAULT;
-    }
-    if (fs != 0U) {
-        return -EFAULT;
-    }
-    if (sys_ld_be32(ctx, base + 0x154U, &rp) != 0) {
-        return -EFAULT;
-    }
-    if (rp != 0U) {
-        return -EFAULT;
-    }
-    if (sys_ld_be32(ctx, base + 0xE0U, &psr) != 0) {
-        return -EFAULT;
-    }
-    if (sys_ld_be32(ctx, base + 0xECU, &y) != 0) {
-        return -EFAULT;
-    }
-    for (i = 0; i < 16; i++) {
-        if (sys_ld_be32(ctx, base + 0xF0U + (uint32_t)i * 4U, &u[i]) != 0) {
-            return -EFAULT;
-        }
-    }
-    ctx->psr = psr;
-    ctx->y = y;
-    for (i = 1; i < 8; i++) {
-        ctx->r[(uint32_t)i] = u[i];
-    }
-    for (i = 8; i < 16; i++) {
-        ctx->r[SPARC32_I0 + (uint32_t)(i - 8)] = u[i];
-    }
-    ctx->r[0] = 0U;
-    ctx->pc = pc;
-    ctx->npc = npc;
-    return 0;
-}
+long sparc32_sys_rt_sigaction(sparc32_ctx_t *ctx, uint32_t sig, uint32_t act_va,
+    uint32_t oact_va, uint32_t restorer, uint32_t sigsetsize);
+long sparc32_sys_sigaltstack(sparc32_ctx_t *ctx, uint32_t uss_va,
+    uint32_t uoss_va);
+long sparc32_sys_sigreturn(sparc32_ctx_t *ctx);
+long sparc32_sys_rt_sigreturn(sparc32_ctx_t *ctx);
 
 static long sys_read(sparc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t count)
 {
@@ -574,6 +451,41 @@ static long sys_prlimit64(sparc32_ctx_t *ctx, uint32_t pid, uint32_t res,
 #endif
 }
 
+/* set_robust_list(300)/get_robust_list(301): record the NPTL robust
+ * mutex list head/len per thread and report it back. The translator
+ * never needs to walk the list (no fatal thread exits mid-critical
+ * section in the test matrix), so recording suffices; qemu accepts
+ * the call, hence 0 rather than -ENOSYS. */
+static long sys_set_robust_list(sparc32_ctx_t *ctx, uint32_t head_va,
+    uint32_t len)
+{
+    if (len != 12U && len != 24U) {
+        return -EINVAL;
+    }
+    ctx->robust_list_head = head_va;
+    ctx->robust_list_len = len;
+    return 0;
+}
+
+static long sys_get_robust_list(sparc32_ctx_t *ctx, uint32_t pid,
+    uint32_t head_ptr_va, uint32_t len_ptr_va)
+{
+    if (pid != 0U) {
+        return -ESRCH;
+    }
+    if (guest_range_ok(head_ptr_va, 4U) != 0 ||
+        guest_range_ok(len_ptr_va, 4U) != 0) {
+        return -EFAULT;
+    }
+    if (sys_st_be32(ctx, head_ptr_va, ctx->robust_list_head) != 0) {
+        return -EFAULT;
+    }
+    if (sys_st_be32(ctx, len_ptr_va, ctx->robust_list_len) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
 int sparc32_syscall_is_exit(long nr)
 {
     return (nr == (long)SPARC32__NR_exit || nr == (long)SPARC32__NR_exit_group) ? 1 : 0;
@@ -623,6 +535,11 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
     o3 = ctx->r[SPARC32_O3];
     o4 = ctx->r[SPARC32_O4];
     o5 = ctx->r[SPARC32_O5];
+    if (__atomic_load_n(&g_sparc32_ldstub_lock.owner, __ATOMIC_RELAXED) ==
+        (uintptr_t)ctx) {
+        __atomic_store_n(&g_sparc32_ldstub_lock.va, 0U, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_sparc32_ldstub_lock.owner, 0U, __ATOMIC_RELEASE);
+    }
 
     switch (nr) {
     case (long)SPARC32__NR_exit:
@@ -687,6 +604,9 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         break;
     case (long)SPARC32__NR_getpid:
         ret = sparc32_l2a_getpid();
+        break;
+    case (long)SPARC32__NR_gettid:
+        ret = sparc32_thr_gettid(ctx);
         break;
     case (long)SPARC32__NR_getuid:
     case (long)SPARC32__NR_getuid32:
@@ -772,6 +692,15 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
     case (long)SPARC32__NR_futex:
         ret = sparc32_l2a_futex(ctx, o0, o1, o2, o3);
         break;
+    case (long)SPARC32__NR_futex_time64:
+        ret = sparc32_l2a_futex_time64(ctx, o0, o1, o2, o3);
+        break;
+    case (long)SPARC32__NR_set_robust_list:
+        ret = sys_set_robust_list(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_get_robust_list:
+        ret = sys_get_robust_list(ctx, o0, o1, o2);
+        break;
     /* Lane L4c rlimit hook (oracle: values above, was default -ENOSYS). */
     case (long)SPARC32__NR_getrlimit:
         ret = sys_getrlimit(ctx, o0, o1);
@@ -780,13 +709,24 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         ret = sys_prlimit64(ctx, o0, o1, o2, o3);
         break;
     case (long)SPARC32__NR_rt_sigaction:
-        ret = sys_rt_sigaction(ctx, o0, o1, o2, o3, o4);
+        ret = sparc32_sys_rt_sigaction(ctx, o0, o1, o2, o3, o4);
+        break;
+    case (long)SPARC32__NR_sigaltstack:
+        ret = sparc32_sys_sigaltstack(ctx, o0, o1);
+        break;
+    case (long)SPARC32__NR_rt_sigreturn:
+        /* rt_sigreturn sets an absolute resume pc/npc like sigreturn. */
+        ret = sparc32_sys_rt_sigreturn(ctx);
+        if (ret == 0) {
+            ctx->syscalls_executed++;
+            return 0;
+        }
         break;
     case (long)SPARC32__NR_sigreturn:
         /* sigreturn sets an absolute resume pc/npc; the common tail
          * advance below must not run a second time (same double-advance
          * class as the old trap_taken bug: resume would skip +4). */
-        ret = sys_sigreturn(ctx);
+        ret = sparc32_sys_sigreturn(ctx);
         if (ret == 0) {
             ctx->syscalls_executed++;
             return 0;

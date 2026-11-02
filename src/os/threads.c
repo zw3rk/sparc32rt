@@ -121,7 +121,7 @@ static void thr_host_handler(int sig)
 {
     uint32_t handler;
     uint32_t restorer;
-    if (sig < 1 || sig > 31) {
+    if (sig < 1 || sig > 64) {
         return;
     }
     if (sparc32_signal_get(sig, &handler, &restorer) == 0) {
@@ -377,6 +377,12 @@ static void thr_thread_finish(struct thr_start *st, long status)
         p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 0;
 #if defined(__linux__) && defined(SYS_futex)
         (void)syscall(SYS_futex, (uint32_t *)p, 1, 1, NULL, NULL, 0);
+#else
+        {
+            extern long sparc32_futex_wake_emu(sparc32_ctx_t *c,
+                uint32_t uaddr, uint32_t n);
+            (void)sparc32_futex_wake_emu(ctx, st->clear_tid_va, 1U);
+        }
 #endif
     }
     thr_deregister(ctx);
@@ -391,11 +397,7 @@ static void *thr_thread_entry(void *arg)
 {
     struct thr_start *st = (struct thr_start *)arg;
     sparc32_ctx_t *ctx = st->ctx;
-    /* Publish the real kernel TID first (parent blocks on it). No
-     * window reset: the global winfile/WIM is shared until RC4
-     * per-thread state lands; the child continues the quiescent
-     * parent's window images, so the parent must not execute guest
-     * code concurrently (futex rendezvous before it resumes). */
+    interp_window_clone_restore(st->winfile, st->winsp, st->win_valid);
     ctx->host_tid = thr_gettid();
     pthread_mutex_lock(&st->lock);
     st->child_tid = (long)ctx->host_tid;
@@ -499,11 +501,11 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
     child->is_thread_clone = true;
     child->clear_child_tid = 0U;
     child->stack_base = stack;
-    /* Child resumes past the clone trap with (o0 = 0, o1 = 0). */
+    /* Child resumes past the clone trap with (o0 = 0, o1 = 1). */
     child->pc = ctx->npc;
     child->npc = ctx->npc + 4U;
     child->r[SPARC32_O0] = 0U;
-    child->r[SPARC32_O1] = 0U;
+    child->r[SPARC32_O1] = 1U;
     if (stack != 0U) {
         child->r[SPARC32_SP] = stack & ~15U;
     }
@@ -519,6 +521,7 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
     st->flags_cleartid = (flags & THR_CLONE_CHILD_CLEARTID) != 0U;
     st->tid_ready = false;
     st->child_tid = -1L;
+    interp_window_clone_save(st->winfile, st->winsp, st->win_valid);
     thr_register(child);
     if (pthread_mutex_init(&st->lock, NULL) != 0 ||
         pthread_cond_init(&st->ready, NULL) != 0 ||
@@ -593,7 +596,7 @@ long sparc32_thr_kill(sparc32_ctx_t *ctx, uint32_t pid, uint32_t sig)
     if (ctx == NULL) {
         return -EFAULT;
     }
-    if (sig > 31U) {
+    if (sig > 64U) {
         return -EINVAL;
     }
     if (sig != 0U && kill((pid_t)(int32_t)pid, (int)sig) != 0) {
@@ -609,7 +612,7 @@ static long thr_kill_tid(sparc32_ctx_t *ctx, uint32_t tgid,
     uint32_t tid, uint32_t sig)
 {
     long rc;
-    if (sig > 31U) {
+    if (sig > 64U) {
         return -EINVAL;
     }
 #if defined(__linux__) && defined(SYS_tgkill)
@@ -620,13 +623,43 @@ static long thr_kill_tid(sparc32_ctx_t *ctx, uint32_t tgid,
     rc = syscall(SYS_tkill, (pid_t)(int32_t)tid, (int)sig);
 #else
     (void)tgid;
-    rc = ((int32_t)tid == thr_gettid() || (pid_t)(int32_t)tid == getpid())
-        ? 0 : (long)kill((pid_t)(int32_t)tid, (int)sig);
+    {
+        size_t i;
+        bool found = ((int32_t)tid == thr_gettid() ||
+            (pid_t)(int32_t)tid == getpid());
+        for (i = 0U; i < THR_MAX_LIVE; i++) {
+            sparc32_ctx_t *c = thr_live[i];
+            if (c != NULL && c->host_tid == (int32_t)tid) {
+                found = true;
+                if (sig >= 1U && sig <= 64U) {
+                    uint64_t bit = 1ULL << (uint64_t)((sig - 1U) % 32U);
+                    if (sig <= 32U) {
+                        c->pending_signals |= bit << 32U;
+                    } else {
+                        c->pending_signals |= bit;
+                    }
+                }
+            }
+        }
+        rc = found ? 0 : (long)kill((pid_t)(int32_t)tid, (int)sig);
+    }
 #endif
     if (sig != 0U && rc == 0 && (int32_t)tid == thr_gettid()) {
         return thr_kill_self(ctx, (int)sig);
     }
     return (rc == 0) ? 0 : -(long)errno;
+}
+
+long sparc32_thr_gettid(sparc32_ctx_t *ctx)
+{
+    sparc32_threads_ensure_init(ctx);
+    if (ctx == NULL) {
+        return -EFAULT;
+    }
+    if (ctx->host_tid <= 0) {
+        ctx->host_tid = thr_gettid();
+    }
+    return (long)ctx->host_tid;
 }
 
 long sparc32_thr_tkill(sparc32_ctx_t *ctx, uint32_t tid, uint32_t sig)
@@ -734,7 +767,7 @@ long sparc32_thr_rt_sigsuspend(sparc32_ctx_t *ctx, uint32_t set_va,
     sigemptyset(&host_set);
     for (;;) {
         bool woke = false;
-        for (s = 1; s <= 31; s++) {
+        for (s = 1; s <= 64; s++) {
             uint64_t bit = 1ULL << (uint64_t)((uint32_t)(s - 1) % 32U);
             uint32_t handler;
             uint32_t restorer;

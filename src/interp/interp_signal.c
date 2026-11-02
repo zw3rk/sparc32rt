@@ -31,10 +31,81 @@ RC1 subset of Phase-4 signals: rt_signal_frame32 construction for
  * that path, matching qemu-sparc do_sigreturn. Returns false when no
  * handler is installed or the frame does not fit (caller keeps EXIT_FAULT).
  * Misaligned DATA accesses never reach here (emulated byte-wise, E06). */
+/* C2-3 delivery stack: an SA_ONSTACK handler runs on the installed
+ * alternate stack (top, frame built under it 16-aligned) unless a
+ * handler already runs there; records the transition and pushes the
+ * live FPU for the matching sigreturn. Returns the sp to build under. */
+static uint32_t interp_delivery_sp(sparc32_ctx_t *ctx, uint32_t flags)
+{
+    uint32_t sp = ctx->r[SPARC32_SP];
+    /* Flush all cached caller windows and the interrupted live window to
+     * the interrupted stack before overwriting %sp with the signal frame,
+     * so setjmp/longjmp or stack unwinding out of a signal handler finds
+     * the interrupted window's L0..I7 at its true home sp. */
+    (void)interp_flush_windows(ctx);
+    if (interp_range_ok(ctx, sp, SPARC32_RWINDOW_SIZE, 2U)) {
+        int i;
+        for (i = 0; i < 8; i++) {
+            uint32_t base = sp + (uint32_t)i * 4U;
+            (void)interp_st_be(ctx, base, 4U,
+                ctx->r[SPARC32_L0 + (uint32_t)i]);
+            (void)interp_st_be(ctx, base + 32U, 4U,
+                ctx->r[SPARC32_I0 + (uint32_t)i]);
+        }
+    }
+    if ((flags & SPARC32_SA_ONSTACK) != 0U) {
+        uint32_t asp;
+        uint32_t asize;
+        int onstack;
+        if (sparc32_sigaltstack_state(&asp, &asize, &onstack) == 0 &&
+            !onstack) {
+            sparc32_sigaltstack_set_onstack(1);
+            sp = asp + asize;
+        }
+    }
+    sparc32_fpu_save_push(ctx);
+    return sp;
+}
+
+/* C2-3 frame stack field (0x144, 12 B stack_t): the installed alternate
+ * stack, SS_ONSTACK while a handler runs on it, SS_DISABLE when none is
+ * installed; extra_size words stay zero. */
+static bool interp_frame_stack(sparc32_ctx_t *ctx, uint32_t frame)
+{
+    uint32_t asp = 0U;
+    uint32_t asize = 0U;
+    uint32_t aflags = SPARC32_SS_DISABLE;
+    uint32_t qsp;
+    uint32_t qsize;
+    int onstack;
+    if (sparc32_sigaltstack_state(&qsp, &qsize, &onstack) == 0) {
+        asp = qsp;
+        asize = qsize;
+        aflags = (onstack != 0) ? SPARC32_SS_ONSTACK : 0U;
+    }
+    if (!interp_st_be(ctx, frame + 0x144U, 4U, asp)) {
+        return false;
+    }
+    if (!interp_st_be(ctx, frame + 0x148U, 4U, aflags)) {
+        return false;
+    }
+    if (!interp_st_be(ctx, frame + 0x14cU, 4U, asize)) {
+        return false;
+    }
+    if (!interp_st_be(ctx, frame + 0x150U, 4U, 0U)) {
+        return false;
+    }
+    if (!interp_st_be(ctx, frame + 0x154U, 4U, 0U)) {
+        return false;
+    }
+    return true;
+}
+
 bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
 {
     uint32_t handler;
     uint32_t restorer;
+    uint32_t flags = 0U;
     uint32_t addr;
     uint32_t frame;
     uint32_t code = 1U;
@@ -43,7 +114,7 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
     if (ctx == NULL || (signo != 10 && signo != 11)) {
         return false;
     }
-    if (sparc32_signal_get(signo, &handler, &restorer) != 0) {
+    if (sparc32_signal_get_full(signo, &handler, &restorer, &flags) != 0) {
         return false;
     }
     addr = ctx->fault_addr;
@@ -59,7 +130,8 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
             }
         }
     }
-    frame = (ctx->r[SPARC32_SP] - SPARC32_RT_SIGFRAME_SIZE) & ~15U;
+    frame = (interp_delivery_sp(ctx, flags) - SPARC32_RT_SIGFRAME_SIZE) &
+        ~15U;
     if (!interp_range_ok(ctx, frame, SPARC32_RT_SIGFRAME_SIZE, 2U)) {
         return false;
     }
@@ -98,7 +170,9 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
     if (!interp_st_be(ctx, frame + 0x40U, 4U, 0U)) {
         return false;
     }
-    if (!interp_st_be(ctx, frame + 0x78U, 4U, addr)) {
+    /* si_addr is _sifields+0 (siginfo+12): the handler reads info+8
+     * (si_code) and info+12 (si_addr) per the uClibc/Linux sparc layout. */
+    if (!interp_st_be(ctx, frame + 0x6cU, 4U, addr)) {
         return false;
     }
     for (i = 7; i < 32; i++) {
@@ -120,7 +194,7 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
     }
     for (i = 0; i < 16; i++) {
         uint32_t v = (i < 8) ? ctx->r[(uint32_t)i]
-                             : ctx->r[SPARC32_I0 + (uint32_t)(i - 8)];
+                             : ctx->r[SPARC32_O0 + (uint32_t)(i - 8)];
         if (!interp_st_be(ctx, frame + 0xf0U + (uint32_t)i * 4U, 4U, v)) {
             return false;
         }
@@ -140,10 +214,8 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
     if (!interp_st_be(ctx, frame + 0x140U, 4U, SPARC32_RESTORER_TA_10)) {
         return false;
     }
-    for (i = 0; i < 5; i++) {
-        if (!interp_st_be(ctx, frame + 0x144U + (uint32_t)i * 4U, 4U, 0U)) {
-            return false;
-        }
+    if (!interp_frame_stack(ctx, frame)) {
+        return false;
     }
     ctx->r[SPARC32_SP] = frame;
     ctx->r[SPARC32_O0] = (uint32_t)signo;
@@ -174,15 +246,16 @@ static bool interp_async_build(sparc32_ctx_t *ctx, int signo, uint32_t *frame)
 {
     uint32_t handler;
     uint32_t restorer;
+    uint32_t flags = 0U;
     uint32_t fr;
     int i;
-    if (ctx == NULL || signo < 1 || signo > 31) {
+    if (ctx == NULL || signo < 1 || signo > 64) {
         return false;
     }
-    if (sparc32_signal_get(signo, &handler, &restorer) != 0) {
+    if (sparc32_signal_get_full(signo, &handler, &restorer, &flags) != 0) {
         return false;
     }
-    fr = (ctx->r[SPARC32_SP] - SPARC32_RT_SIGFRAME_SIZE) & ~15U;
+    fr = (interp_delivery_sp(ctx, flags) - SPARC32_RT_SIGFRAME_SIZE) & ~15U;
     if (!interp_range_ok(ctx, fr, SPARC32_RT_SIGFRAME_SIZE, 2U)) {
         return false;
     }
@@ -243,18 +316,20 @@ static bool interp_async_build(sparc32_ctx_t *ctx, int signo, uint32_t *frame)
      * (qemu style), so the mirror must carry pc/npc at delivery; the
      * sync path keeps oracle-visible si_errno/si_code and relies on
      * the L1d/E05 patch-before-sigreturn pattern instead. */
-    if (!interp_st_be(ctx, fr + 100U, 4U, ctx->pc)) {
-        return false;
-    }
-    if (!interp_st_be(ctx, fr + 104U, 4U, ctx->npc)) {
-        return false;
+    if ((flags & SPARC32_SA_SIGINFO) == 0U) {
+        if (!interp_st_be(ctx, fr + 100U, 4U, ctx->pc)) {
+            return false;
+        }
+        if (!interp_st_be(ctx, fr + 104U, 4U, ctx->npc)) {
+            return false;
+        }
     }
     if (!interp_st_be(ctx, fr + 0xecU, 4U, ctx->y)) {
         return false;
     }
     for (i = 0; i < 16; i++) {
         uint32_t v = (i < 8) ? ctx->r[(uint32_t)i]
-                             : ctx->r[SPARC32_I0 + (uint32_t)(i - 8)];
+                             : ctx->r[SPARC32_O0 + (uint32_t)(i - 8)];
         if (!interp_st_be(ctx, fr + 0xf0U + (uint32_t)i * 4U, 4U, v)) {
             return false;
         }
@@ -274,10 +349,8 @@ static bool interp_async_build(sparc32_ctx_t *ctx, int signo, uint32_t *frame)
     if (!interp_st_be(ctx, fr + 0x140U, 4U, SPARC32_RESTORER_TA_10)) {
         return false;
     }
-    for (i = 0; i < 5; i++) {
-        if (!interp_st_be(ctx, fr + 0x144U + (uint32_t)i * 4U, 4U, 0U)) {
-            return false;
-        }
+    if (!interp_frame_stack(ctx, fr)) {
+        return false;
     }
     *frame = fr;
     return true;
@@ -356,6 +429,9 @@ bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
         uint32_t psr = ctx->psr & ~SPARC32_PSR_C;
         if (carry) {
             psr |= SPARC32_PSR_C;
+            if (!interp_st_be(ctx, frame + 0xf0U + 8U * 4U, 4U, 4U)) {
+                return false;
+            }
         }
         if (!interp_st_be(ctx, frame + 0xe0U, 4U, psr)) {
             return false;
@@ -388,7 +464,7 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
     }
     blocked = ctx->sig_mask | sparc32_l2a_blocked_mask();
     p = ctx->pending_signals;
-    for (s = 1; s <= 31; s++) {
+    for (s = 1; s <= 64; s++) {
         uint64_t bit = 1ULL << (uint64_t)((uint32_t)(s - 1) % 32U);
         uint32_t w;
         if ((uint32_t)s <= 32U) {

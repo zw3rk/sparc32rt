@@ -36,5 +36,31 @@ bool interp_poll_async(sparc32_ctx_t *ctx);
 bool interp_fill_from(sparc32_ctx_t *ctx, uint32_t w, uint32_t va);
 bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
     bool is_save);
+/* Real SPARC signal constants (C2-3: verified against the uClibc
+ * sysroot headers; shared by the syscall layer and delivery). */
+#define SPARC32_SA_ONSTACK 1U
+#define SPARC32_SA_RESTART 2U
+#define SPARC32_SA_SIGINFO 0x200U
+#define SPARC32_SS_ONSTACK 1U
+#define SPARC32_SS_DISABLE 2U
+#define SPARC32_MINSIGSTKSZ 4096U
+/* C2-3 signal extensions (implemented in os/syscalls_min.c, consulted
+ * by interp_signal.c delivery): full disposition (handler/restorer/
+ * accepted SA_* flags), alternate-stack state, onstack mark, and the
+ * host-side FPU save stack (push at delivery, pop newest match at
+ * sigreturn; -1 when no push pairs, e.g. longjmp bypassed sigreturn). */
+int sparc32_signal_get_full(int sig, uint32_t *handler_va,
+    uint32_t *restorer_va, uint32_t *flags);
+int sparc32_sigaltstack_state(uint32_t *sp, uint32_t *size, int *onstack);
+void sparc32_sigaltstack_set_onstack(int onstack);
+void sparc32_fpu_save_push(const sparc32_ctx_t *ctx);
+int sparc32_fpu_save_pop(sparc32_ctx_t *ctx);
+/* Flush-windows trap (ta 3, C2-3): spill every cached caller window to
+ * its recorded stack slot so setjmp/longjmp and signal frames observe
+ * fully spilled stacks. The cache values are published unchanged, so no
+ * counter changes (a later RESTORE still fills the identical image);
+ * false propagates the spill fault (exit_reason/fault_addr already
+ * set by the memory layer). */
+bool interp_flush_windows(sparc32_ctx_t *ctx);
 
 #endif /* SPARC32RT_INTERP_PRIV_H */

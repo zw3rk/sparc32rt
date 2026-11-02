@@ -337,4 +337,12 @@ static inline int sparc32_host_prot(const sparc32_ctx_t *ctx, uint32_t guest_pro
     return (int)p;
 }
 
+typedef struct {
+    uint32_t va;
+    uint32_t pad;
+    uintptr_t owner;
+} sparc32_ldstub_lock_t;
+
+extern sparc32_ldstub_lock_t g_sparc32_ldstub_lock;
+
 #endif /* SPARC32RT_H */

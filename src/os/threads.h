@@ -52,7 +52,17 @@ struct thr_start {
     pthread_cond_t ready;
     bool tid_ready;
     long child_tid;
+    uint32_t winfile[SPARC32_NWINDOWS][16];
+    uint32_t winsp[SPARC32_NWINDOWS];
+    uint32_t win_valid[SPARC32_NWINDOWS];
 };
+
+void interp_window_clone_save(uint32_t wf[SPARC32_NWINDOWS][16],
+    uint32_t wsp[SPARC32_NWINDOWS], uint32_t wv[SPARC32_NWINDOWS]);
+void interp_window_clone_restore(const uint32_t wf[SPARC32_NWINDOWS][16],
+    const uint32_t wsp[SPARC32_NWINDOWS],
+    const uint32_t wv[SPARC32_NWINDOWS]);
+long sparc32_thr_gettid(sparc32_ctx_t *ctx);
 
 /* Live-context registry + host async-handler install. Idempotent; called
  * from every helper (notably the completed set_tid_address arm, which

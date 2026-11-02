@@ -1,0 +1,6 @@
+hello libc
+int=-42 hex=deadbeef str=sparc
+alloc ok
+qsort ok n=10000 first=1 last=32763
+file ok bytes=65536
+P2-LIBC-PASS
