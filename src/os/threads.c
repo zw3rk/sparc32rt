@@ -94,6 +94,31 @@ static void thr_deregister(sparc32_ctx_t *ctx)
     pthread_mutex_unlock(&thr_live_lock);
 }
 
+/* Drop a live context without racing an async host-signal note (Section
+ * 3 #3): sparc32_thr_note_signal runs in signal context on any thread and
+ * dereferences every thr_live[] entry, so the deregister+free sequence
+ * must be uninterruptible on this thread. sigfillset covers every handled
+ * signal; the mask is restored before return, at which point the slot is
+ * already NULL and a handler can no longer observe the freed pointer. */
+static void thr_drop_context(sparc32_ctx_t *ctx)
+{
+    sigset_t block;
+    sigset_t old;
+    bool have_old = false;
+    if (ctx == NULL) {
+        return;
+    }
+    sigfillset(&block);
+    if (sigprocmask(SIG_SETMASK, &block, &old) == 0) {
+        have_old = true;
+    }
+    thr_deregister(ctx);
+    free(ctx);
+    if (have_old) {
+        (void)sigprocmask(SIG_SETMASK, &old, NULL);
+    }
+}
+
 /* Host async note: set the kernel-layout pending bit on every live ctx.
  * Atomic loads/stores only; signals without a guest handler are left for
  * the default path in thr_host_handler. */
@@ -290,6 +315,7 @@ long sparc32_thr_fork(sparc32_ctx_t *ctx)
         return -(long)errno;
     }
     if (pid == 0) {
+        sparc32_vm_fork_child_reset();
         __atomic_store_n(&ctx->pending_signals, 0ULL, __ATOMIC_RELAXED);
         ctx->sig_last_frame_va = 0U;
         ctx->r[SPARC32_O1] = 1U;
@@ -378,8 +404,7 @@ static void thr_thread_finish(struct thr_start *st, long status)
         }
 #endif
     }
-    thr_deregister(ctx);
-    free(ctx);
+    thr_drop_context(ctx);
     free(st);
     pthread_exit((void *)(uintptr_t)(status & 0xFFL));
 }
@@ -519,8 +544,7 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
     if (pthread_mutex_init(&st->lock, NULL) != 0 ||
         pthread_cond_init(&st->ready, NULL) != 0 ||
         pthread_attr_init(&attr) != 0) {
-        thr_deregister(child);
-        free(child);
+        thr_drop_context(child);
         free(st);
         return -ENOMEM;
     }
@@ -530,8 +554,7 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
         pthread_attr_destroy(&attr);
         pthread_mutex_destroy(&st->lock);
         pthread_cond_destroy(&st->ready);
-        thr_deregister(child);
-        free(child);
+        thr_drop_context(child);
         free(st);
         return -(long)e;
     }

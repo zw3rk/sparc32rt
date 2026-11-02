@@ -70,15 +70,33 @@ uint8_t *g_vm32_prot_jit = NULL;
 #define VM32_PROT_FAST_WRITE 0x08u
 
 /* Centralize every g_vm32_prot/g_vm32_state mutation through this
- * helper so bit 3 never goes stale (P13-4 invariant 8). */
+ * helper so bit 3 never goes stale (P13-4 invariant 8). The prot byte is
+ * shared across lock domains (VM write lock via vm32_publish_page, DBT
+ * lock via vm32_note_code_page/vm32_clear_code_range), so the update is
+ * an atomic CAS loop: a plain store here could clobber a concurrent
+ * mprotect publish's low permission bits (or vice versa), leaving the
+ * table RW while the host mapping is PROT_NONE. Every state mutation is
+ * program-order followed by a sync on the same thread, so a CAS retry
+ * always re-reads fresh state and the last synchronizer wins correctly. */
 static inline void vm32_sync_fast_write(uint32_t vpn)
 {
-    uint8_t p = __atomic_load_n(&g_vm32_prot[vpn], __ATOMIC_ACQUIRE) & 0x7u;
-    uint8_t s = __atomic_load_n(&g_vm32_state[vpn], __ATOMIC_ACQUIRE);
-    if (rt_write_tag_allowed((uint32_t)s, (uint32_t)p)) {
-        p = (uint8_t)(p | VM32_PROT_FAST_WRITE);
+    uint8_t cur = __atomic_load_n(&g_vm32_prot[vpn], __ATOMIC_ACQUIRE);
+    for (;;) {
+        uint8_t s = __atomic_load_n(&g_vm32_state[vpn], __ATOMIC_ACQUIRE);
+        uint8_t want;
+        if (rt_write_tag_allowed((uint32_t)s, (uint32_t)(cur & 0x7u))) {
+            want = (uint8_t)(cur | VM32_PROT_FAST_WRITE);
+        } else {
+            want = (uint8_t)(cur & (uint8_t)~VM32_PROT_FAST_WRITE);
+        }
+        if (want == cur) {
+            return;
+        }
+        if (__atomic_compare_exchange_n(&g_vm32_prot[vpn], &cur, want,
+                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            return;
+        }
     }
-    __atomic_store_n(&g_vm32_prot[vpn], p, __ATOMIC_RELEASE);
 }
 
 static uint64_t vm32_line_mask_in_page(uint32_t vpn, uint32_t gva, size_t len)

@@ -12,7 +12,7 @@
 # Rows:
 #   struct      make check-line-limits, make check-abi-invariants,
 #               make build-darwin, host thread-entry check, host AOT
-#               cache unit check.
+#               cache unit check, host ELF overlap unit check.
 #   sparcv8     10-category uniform guest matrix (--interp and --dbt)
 #               against committed goldens in tests/golden/:
 #                 1. p1_isa      integer/branch/window/unaligned/trap torture
@@ -112,6 +112,20 @@ if cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
 else
     parity_row "struct" "$HOST" "host-aot-cache" "host" "FAIL" "0" \
         "see $OUT/host-aot.log"
+fi
+
+_t0="$(parity_now_ms)"
+if cc -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+        -Iinclude -Isrc tests/test_elf_overlap.c \
+        src/rt32/elf32.c -o "$OUT/host_elf_overlap" \
+        2>"$OUT/host-elf-overlap.log" \
+    && timeout --kill-after=5s 15s "$OUT/host_elf_overlap" >"$OUT/host-elf-overlap.out" 2>&1 \
+    && grep -q "ELF-OVERLAP: PASS" "$OUT/host-elf-overlap.out"; then
+    parity_row "struct" "$HOST" "host-elf-overlap" "host" "PASS" \
+        "$(( $(parity_now_ms) - _t0 ))" "interp/exec segment overlap PASS"
+else
+    parity_row "struct" "$HOST" "host-elf-overlap" "host" "FAIL" "0" \
+        "see $OUT/host-elf-overlap.log"
 fi
 
 # ---- runner resolution ------------------------------------------------

@@ -127,6 +127,22 @@ void vm_lock_release(void)
     sparc32_spin_unlock(&g_vm_lock);
 }
 
+/* Fork-child reset (Section 3 #1): fork() retains only the calling thread,
+ * so reader/writer-wait/spin state inherited from dead sibling threads
+ * would deadlock the child's first VM mutation (vm_lock_acquire spins for
+ * g_vm_readers == 0). The forking thread's own thread-local depth is
+ * cleared with it: its read holds (if any) counted toward the discarded
+ * pre-fork reader total, so keeping them would underflow the fresh count
+ * on the matching leave. Async-signal-safe: plain relaxed stores only. */
+void sparc32_vm_fork_child_reset(void)
+{
+    atomic_store_explicit(&g_vm_readers, 0U, memory_order_relaxed);
+    atomic_store_explicit(&g_vm_writer_waiting, 0U, memory_order_relaxed);
+    atomic_store_explicit(&g_vm_lock, 0U, memory_order_relaxed);
+    t_vm_lock_held = 0U;
+    t_vm_read_depth = 0U;
+}
+
 uint64_t vm_page_align_up(uint64_t v)
 {
     return (v + 0xFFFULL) & ~0xFFFULL;

@@ -323,6 +323,7 @@ const uint8_t *sparc32_vm_prot_base(void);
 const uint8_t *sparc32_vm_state_base(void);
 void sparc32_vm_access_enter(void);
 void sparc32_vm_access_leave(void);
+void sparc32_vm_fork_child_reset(void);
 void vm_file_note_mutation(uint64_t dev, uint64_t ino, int host_fd,
     uint64_t new_size);
 void vm_file_note_mapping(uint64_t dev, uint64_t ino, int host_fd,
