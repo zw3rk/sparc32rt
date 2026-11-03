@@ -64,14 +64,14 @@ static bool thr_fd_ensure_locked(int fd)
     if (nu == NULL) {
         return false;
     }
+    /* Commit the moved buffer at once; the cap stays until both grow. */
+    thr_fd_used = nu;
     nc = (uint8_t *)realloc(thr_fd_cloexec, need);
     if (nc == NULL) {
-        free(nu);
         return false;
     }
     memset(nu + thr_fd_cap, 0, need - thr_fd_cap);
     memset(nc + thr_fd_cap, 0, need - thr_fd_cap);
-    thr_fd_used = nu;
     thr_fd_cloexec = nc;
     thr_fd_cap = need;
     return true;

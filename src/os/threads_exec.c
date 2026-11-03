@@ -29,17 +29,6 @@ extern void sparc32_thr_exec_retire_done(void);
 #define THR_EXEC_ARGS_MAX 256U
 #define THR_EXEC_STR_MAX 4096U
 
-/* Checked guest word load (moved with the exec block; sole user). */
-static int thr_ld(sparc32_ctx_t *ctx, uint32_t va, uint32_t *out)
-{
-    uint8_t p[4];
-    if (l2a_load(ctx, va, p, 4U) != 0) {
-        return -EFAULT;
-    }
-    *out = get_be32(p);
-    return 0;
-}
-
 /* execve(59): reload an ELF into the same G window. Sibling guest
  * threads retire before the old image is destroyed (S32-R3-4); caught
  * dispositions return to default while ignored ones survive
@@ -67,7 +56,7 @@ static int thr_read_vec(sparc32_ctx_t *ctx, uint32_t vec_va, char **out,
     for (;;) {
         uint32_t eva;
         char *s;
-        if (thr_ld(ctx, va, &eva) != 0) {
+        if (l2a_ld_be32(ctx, va, &eva) != 0) {
             thr_free_vec(out, n);
             return -EFAULT;
         }
@@ -172,6 +161,9 @@ long sparc32_thr_execve(sparc32_ctx_t *ctx, uint32_t path_va,
             _exit(127);
         }
     }
+    /* New image identity: stack_setup retains a heap copy, so this
+     * borrow of the staging buffer is never kept past the call. */
+    ctx->exec_path = path;
     rc = rt32_stack_setup(ctx, &info, (int)argc, argv, envp, &sp);
     thr_free_vec(argv, argc);
     thr_free_vec(envp, envc);
@@ -210,7 +202,6 @@ long sparc32_thr_execve(sparc32_ctx_t *ctx, uint32_t path_va,
     ctx->robust_list_head = 0U;
     ctx->robust_list_len = 0U;
     ctx->is_thread_clone = false;
-    ctx->exec_path = NULL;
     /* Pre-compensate for the dispatch tail (pc = npc; npc += 4). */
     ctx->pc = info.entry - 4U;
     ctx->npc = info.entry;

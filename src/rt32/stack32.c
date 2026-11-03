@@ -17,7 +17,9 @@
 #include "rt32.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -49,6 +51,7 @@
 #define SPARC_AT_EUID    12U
 #define SPARC_AT_GID     13U
 #define SPARC_AT_EGID    14U
+#define SPARC_AT_PLATFORM 15U
 /* SPARC Linux AT_HWCAP bits (glibc bits/hwcap.h, mirroring the kernel
  * arch/sparc uapi header): FLUSH/STBAR/SWAP/MULDIV are exactly what
  * qemu-sparc -cpu LEON3 advertises (auxv-dump probe: 0x0F); V9 stays
@@ -114,6 +117,152 @@ static int push_string_table(sparc32_ctx_t *ctx, uint32_t *sp, char **strs,
     return 0;
 }
 
+/* AT_RANDOM bytes: getrandom first on Linux, else /dev/urandom with
+ * EINTR/short-read retry; -1 unless 16 CSPRNG bytes are obtained. */
+static int rt32_get_rand(uint8_t out[16])
+{
+    size_t done = 0U;
+#ifdef __linux__
+    while (done < 16U) {
+        ssize_t r = getrandom(out + done, 16U - done, 0);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (r == 0) {
+            break;
+        }
+        done += (size_t)r;
+    }
+    if (done == 16U) {
+        return 0;
+    }
+    done = 0U;
+#endif
+    {
+        int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return -1;
+        }
+        while (done < 16U) {
+            ssize_t r = read(fd, out + done, 16U - done);
+            if (r < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                close(fd);
+                return -1;
+            }
+            if (r == 0) {
+                close(fd);
+                return -1;
+            }
+            done += (size_t)r;
+        }
+        close(fd);
+    }
+    return 0;
+}
+
+/* Heap-owned argv/envp/exec copies kept in ctx across execve, so
+ * /proc/self/cmdline and /proc/self/exe stay valid after the staging
+ * vectors are freed. Only pointers placed here are ever released, so a
+ * caller-owned string already in ctx is never freed by mistake. */
+static char **rt32_owned_argv;
+static char **rt32_owned_envp;
+static char *rt32_owned_exec;
+
+static void rt32_free_owned_vec(char **v)
+{
+    int i;
+    if (v == NULL) {
+        return;
+    }
+    for (i = 0; v[i] != NULL; i++) {
+        free(v[i]);
+    }
+    free(v);
+}
+
+static int rt32_dup_strvec(char **src, int n, char ***out)
+{
+    char **d;
+    int i;
+    *out = NULL;
+    if (n <= 0 || src == NULL) {
+        return 0;
+    }
+    d = (char **)malloc(((size_t)n + 1U) * sizeof(*d));
+    if (d == NULL) {
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        size_t len;
+        if (src[i] == NULL) {
+            break;
+        }
+        len = strlen(src[i]) + 1U;
+        d[i] = (char *)malloc(len);
+        if (d[i] == NULL) {
+            break;
+        }
+        memcpy(d[i], src[i], len);
+    }
+    if (i != n) {
+        while (--i >= 0) {
+            free(d[i]);
+        }
+        free(d);
+        return -1;
+    }
+    d[n] = NULL;
+    *out = d;
+    return 0;
+}
+
+static int rt32_retain_args(sparc32_ctx_t *ctx, int argc, char **argv,
+    char **envp, const char *execfn)
+{
+    char **nargv = NULL;
+    char **nenvp = NULL;
+    char *nexec = NULL;
+    int nenv = 0;
+    if (envp != NULL) {
+        while (envp[nenv] != NULL) {
+            nenv++;
+        }
+    }
+    if (rt32_dup_strvec(argv, argc, &nargv) != 0 ||
+        rt32_dup_strvec(envp, nenv, &nenvp) != 0) {
+        rt32_free_owned_vec(nargv);
+        rt32_free_owned_vec(nenvp);
+        return -1;
+    }
+    if (execfn != NULL && execfn[0] != '\0') {
+        size_t len = strlen(execfn) + 1U;
+        nexec = (char *)malloc(len);
+        if (nexec == NULL) {
+            rt32_free_owned_vec(nargv);
+            rt32_free_owned_vec(nenvp);
+            return -1;
+        }
+        memcpy(nexec, execfn, len);
+    }
+    rt32_free_owned_vec(rt32_owned_argv);
+    rt32_free_owned_vec(rt32_owned_envp);
+    free(rt32_owned_exec);
+    rt32_owned_argv = nargv;
+    rt32_owned_envp = nenvp;
+    rt32_owned_exec = nexec;
+    ctx->guest_argc = argc;
+    ctx->guest_argv = nargv;
+    ctx->host_envp = nenvp;
+    ctx->exec_path = nexec;
+    return 0;
+}
+
 int rt32_stack_setup(sparc32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
                     int guest_argc, char **guest_argv, char **host_envp,
                     uint32_t *out_sp)
@@ -157,15 +306,8 @@ int rt32_stack_setup(sparc32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
 
     sp = SPARC32_STACK_TOP;
 
-#ifdef __linux__
-    if (getrandom(rand_bytes, sizeof(rand_bytes), 0) != (ssize_t)sizeof(rand_bytes))
-#else
-    if (0)
-#endif
-    {
-        for (size_t i = 0; i < sizeof(rand_bytes); i++) {
-            rand_bytes[i] = (uint8_t)(0xA5U ^ (uint8_t)(i * 17U));
-        }
+    if (rt32_get_rand(rand_bytes) != 0) {
+        return -EIO;
     }
     at_random_va   = push_bytes(ctx, &sp, rand_bytes, sizeof(rand_bytes));
     at_platform_va = push_cstring(ctx, &sp, "sparc");
@@ -201,6 +343,7 @@ int rt32_stack_setup(sparc32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
         SPARC_HWCAP_FLUSH | SPARC_HWCAP_STBAR | SPARC_HWCAP_SWAP |
         SPARC_HWCAP_MULDIV);
     AUXV_PUT(SPARC_AT_HWCAP2, 0U);
+    AUXV_PUT(SPARC_AT_PLATFORM, at_platform_va);
     AUXV_PUT(SPARC_AT_CLKTCK, 100U);
     AUXV_PUT(SPARC_AT_SECURE, 0U);
     AUXV_PUT(SPARC_AT_RANDOM, at_random_va);
@@ -242,9 +385,11 @@ int rt32_stack_setup(sparc32_ctx_t *ctx, const rt32_elf_info_t *elf_info,
         pos++;
     }
 
-    ctx->guest_argc = argc;
-    ctx->guest_argv = guest_argv;
-    ctx->host_envp  = host_envp;
+    /* Retain heap-owned copies: the caller's vectors may be freed or
+     * replaced (execve staging) while /proc still reads them via ctx. */
+    if (rt32_retain_args(ctx, argc, guest_argv, host_envp, execfn_str) != 0) {
+        return -ENOMEM;
+    }
 
     copy_words = aux_idx;
     if (copy_words > (sizeof(ctx->auxv_data) / sizeof(ctx->auxv_data[0]))) {

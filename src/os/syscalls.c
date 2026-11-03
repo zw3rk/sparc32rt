@@ -1,9 +1,7 @@
 /*
  * src/os/syscalls.c — Phase-2 static-libc syscalls (lane L2a).
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
- * SPDX-License-Identifier: Apache-2.0
- * Frozen numbers, L1c carry convention; guest structs via the G window
- * (BE stores); host-style returns. Mask is file-static (single-thread).
+ * SPDX-License-Identifier: Apache-2.0 (BE stores via G window; L1c carry).
  * Needs _GNU_SOURCE: musl hides syscall(2)/clock_gettime under -std=c11.
  */
 #define _GNU_SOURCE
@@ -49,6 +47,7 @@
 #define SP_O_DSYNC 0x2000U
 #define SP_O_SYNC 0x802000U
 #define SP_O_NONBLOCK 0x4000U
+#define SP_O_ASYNC 0x2000U /* FASYNC shares the O_DSYNC bit; F_SETFL takes ASYNC. */
 #define SP_O_NDELAY 0x4004U
 #define SP_O_NOCTTY 0x8000U
 #define SP_O_LARGEFILE 0x40000U
@@ -78,12 +77,8 @@
 
 /* BE words, range model, guest stores, and l2a_copy_cstring live in os/l2a_access.h. */
 
-/* Sysroot fallback (C2-3): absolute guest paths that miss on the host
- * retry under ctx->sysroot (dynamic loader DT_NEEDED + PT_INTERP
- * dependencies live there; guest /tmp and relative paths stay on the
- * host). Mirrors the ppc64rt "fallback on miss" contract. Returns 0 and
- * fills out on success, -1 when no sysroot applies. /proc stays with
- * the procfs layer (never remapped). */
+/* Sysroot fallback (C2-3): absolute guest misses retry under
+ * ctx->sysroot; /proc never remapped. 0 + out on success, -1 otherwise. */
 static int sys_path_sysroot(const sparc32_ctx_t *ctx, const char *path,
     char *out, size_t cap)
 {
@@ -128,13 +123,8 @@ static long narrow_s32(int64_t v)
                                                     : -EOVERFLOW;
 }
 
-/* Identity fold (C2-3): host dev_t/ino_t routinely exceed the SPARC
- * old-ABI 16/32-bit identity fields (Darwin reports dev 0x100000e),
- * which strict narrowing turns into EOVERFLOW on every library stat.
- * Folding keeps a stable per-file identity instead of failing the
- * lookup; semantic fields (uid/gid/mode/size/times) keep strict
- * narrowing above. The 104 B stat64 layout carries full-width
- * identities and is unaffected. */
+/* Identity fold (C2-3): host dev/ino exceed old-ABI fields, so fold
+ * keeps a stable identity while semantic fields narrow strictly above. */
 static uint16_t fold_dev16(uint64_t v)
 {
     return (uint16_t)((v ^ (v >> 16U) ^ (v >> 32U)) & 0xFFFFULL);
@@ -664,7 +654,7 @@ struct l2a_host_statx {
 
 static void put_statx_ts(uint8_t *b, uint32_t off, int64_t sec, uint64_t nsec)
 {
-    put_be64(b + off, (sec < 0) ? 0U : (uint64_t)sec);
+    put_be64(b + off, (uint64_t)sec);
     put_be32(b + off + 8, (uint32_t)nsec);
     put_be32(b + off + 12, 0U);
 }
@@ -806,13 +796,13 @@ long sparc32_l2a_statx(sparc32_ctx_t *ctx, uint32_t dirfd, uint32_t path_va,
         put_be64(b + STX_OFF_BLOCKS, (uint64_t)h.st_blocks);
         put_be64(b + STX_OFF_ATTRMASK, 0U);
         l2a_host_times(&h, 0, &sec, &nsec);
-        put_be64(b + STX_OFF_ATIME, (sec < 0) ? 0U : (uint64_t)sec);
+        put_be64(b + STX_OFF_ATIME, (uint64_t)sec);
         put_be32(b + STX_OFF_ATIME + 8, (uint32_t)nsec);
         l2a_host_times(&h, 1, &sec, &nsec);
-        put_be64(b + STX_OFF_MTIME, (sec < 0) ? 0U : (uint64_t)sec);
+        put_be64(b + STX_OFF_MTIME, (uint64_t)sec);
         put_be32(b + STX_OFF_MTIME + 8, (uint32_t)nsec);
         l2a_host_times(&h, 2, &sec, &nsec);
-        put_be64(b + STX_OFF_CTIME, (sec < 0) ? 0U : (uint64_t)sec);
+        put_be64(b + STX_OFF_CTIME, (uint64_t)sec);
         put_be32(b + STX_OFF_CTIME + 8, (uint32_t)nsec);
         return l2a_store(ctx, buf_va, b, sizeof(b));
     }
@@ -862,15 +852,24 @@ long sparc32_l2a_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg)
         return (rc < 0) ? -(long)errno : flags_host_to_guest(rc);
     case SP_F_SETFL: {
         int host = 0;
-        if ((arg & ~(SP_O_NONBLOCK | SP_O_APPEND)) != 0U) {
-            return -EINVAL; /* only O_NONBLOCK|O_APPEND are settable */
+        /* F_GETFL returns access/open-time bits; ignore them, set the rest. */
+        uint32_t w = arg & ~(3U | SP_O_CREAT | SP_O_TRUNC | SP_O_EXCL |
+            SP_O_NOCTTY | SP_O_DIRECTORY | SP_O_NOFOLLOW | SP_O_LARGEFILE |
+            SP_O_CLOEXEC | SP_O_PATH);
+        if ((w & ~(SP_O_NONBLOCK | SP_O_APPEND | SP_O_ASYNC | SP_O_DIRECT |
+                SP_O_NOATIME | SP_O_DSYNC | SP_O_SYNC)) != 0U) {
+            return -EINVAL;
         }
-        if ((arg & SP_O_APPEND) != 0U) {
-            host |= O_APPEND;
-        }
-        if ((arg & SP_O_NONBLOCK) != 0U) {
-            host |= O_NONBLOCK;
-        }
+        if ((w & SP_O_APPEND) != 0U) { host |= O_APPEND; }
+        if ((w & SP_O_NONBLOCK) != 0U) { host |= O_NONBLOCK; }
+        if ((w & SP_O_ASYNC) != 0U) { host |= O_ASYNC; }
+#ifdef O_DIRECT
+        if ((w & SP_O_DIRECT) != 0U) { host |= O_DIRECT; }
+#endif
+#ifdef O_NOATIME
+        if ((w & SP_O_NOATIME) != 0U) { host |= O_NOATIME; }
+#endif
+        if ((w & SP_O_SYNC) != 0U) { host |= O_SYNC; }
         return (fcntl((int)fd, F_SETFL, host) != 0) ? -(long)errno : 0;
     }
     default:

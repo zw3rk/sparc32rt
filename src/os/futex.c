@@ -259,11 +259,11 @@ long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
     if (l2a_range_ok(uaddr, 4U) != 0) {
         return -SP_EFAULT;
     }
+    /* Host key must match ordinary futex: keep PRIVATE and REALTIME bits. */
     if (cmd == FUTEX_SP_WAKE) {
 #if defined(__linux__) && defined(SYS_futex)
         uint32_t *host_ptr = (uint32_t *)sparc32_guest_ptr(ctx, uaddr);
-        long rc = syscall(SYS_futex, host_ptr, (int)(op & 15U), (int)val,
-            0, 0, 0);
+        long rc = syscall(SYS_futex, host_ptr, (int)op, (int)val, 0, 0, 0);
         return (rc < 0) ? -(long)errno : rc;
 #else
         return sparc32_futex_wake_emu(ctx, uaddr, val);
@@ -274,8 +274,8 @@ long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
         uint32_t *host_ptr = (uint32_t *)sparc32_guest_ptr(ctx, uaddr);
         uint32_t swapped = ((val & 0xFFU) << 24) | ((val & 0xFF00U) << 8) |
             ((val & 0xFF0000U) >> 8) | ((val & 0xFF000000U) >> 24);
-        long rc = syscall(SYS_futex, host_ptr, (int)(op & 15U),
-            (int)swapped, 0, 0, 0);
+        long rc = syscall(SYS_futex, host_ptr, (int)op, (int)swapped,
+            0, 0, 0);
         return (rc < 0) ? -(long)errno : rc;
 #else
         return sparc32_futex_wait_emu(ctx, uaddr, val, 0LL, 0LL, 0, 0);
@@ -303,7 +303,7 @@ long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
             long rc;
             hts[0] = (long long)sec;
             hts[1] = (long long)nsec;
-            rc = syscall(SYS_futex_time64, host_ptr, (int)(op & 15U),
+            rc = syscall(SYS_futex_time64, host_ptr, (int)op,
                 (int)swapped, hts, 0, 0);
             return (rc < 0) ? -(long)errno : rc;
         }
@@ -320,7 +320,7 @@ long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
             }
             hts.tv_sec = (time_t)sec;
             hts.tv_nsec = (long)nsec;
-            rc = syscall(SYS_futex, host_ptr, (int)(op & 15U),
+            rc = syscall(SYS_futex, host_ptr, (int)op,
                 (int)swapped, &hts, 0, 0);
             return (rc < 0) ? -(long)errno : rc;
         }

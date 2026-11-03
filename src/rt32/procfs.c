@@ -30,33 +30,6 @@
 #define PROCFS_SELF_LEN 11U
 #define PROCFS_PATH_MAX 4096U
 
-/* NUL-terminated guest string -> host out (0 ok, -EFAULT/-ENAMETOOLONG). */
-static long procfs_copy_in(sparc32_ctx_t *ctx, uint32_t va, char *out,
-                           uint32_t cap)
-{
-    uint32_t i;
-    if (cap == 0U || l2a_range_ok_prot(va, 1U, 1U) != 0) {
-        return (cap == 0U) ? -ENAMETOOLONG : -EFAULT;
-    }
-    for (i = 0U; i < cap; i++) {
-        uint32_t a = va + i;
-        const uint8_t *p;
-        if (a < va) {
-            return -ENAMETOOLONG;
-        }
-        if (l2a_range_ok_prot(a, 1U, 1U) != 0) {
-            return -EFAULT;
-        }
-        p = (const uint8_t *)sparc32_guest_ptr(ctx, a);
-        out[i] = (char)*p;
-        if (*p == 0U) {
-            return 0;
-        }
-    }
-    out[cap - 1U] = '\0';
-    return -ENAMETOOLONG;
-}
-
 static long procfs_copy_out(sparc32_ctx_t *ctx, uint32_t va, const void *src,
                             uint64_t len)
 {
@@ -89,43 +62,44 @@ static const char *procfs_exe_path(const sparc32_ctx_t *ctx)
     return NULL;
 }
 
-/* Hand the guest the read end of a pipe pre-filled with [data, len). */
+/* Hand the guest a seekable unlinked temp file holding [data, len).
+ * A pipe would deadlock once content exceeds pipe capacity; a temp file
+ * grows with the content and reads back from offset 0. */
 static long procfs_serve_bytes(const void *data, size_t len, int host_flags)
 {
-    int fds[2];
+    char tmpl[] = "/tmp/sparc32rt-procfs-XXXXXX";
+    int fd = mkstemp(tmpl);
     size_t done = 0;
     int rw_flags;
-#if defined(__linux__)
-    if (pipe2(fds, (host_flags & O_CLOEXEC) != 0 ? O_CLOEXEC : 0) != 0) {
+    if (fd < 0) {
         return -(long)errno;
     }
-#else
-    if (pipe(fds) != 0) {
-        return -(long)errno;
-    }
-    if ((host_flags & O_CLOEXEC) != 0) {
-        (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-        (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-    }
-#endif
-    rw_flags = fcntl(fds[0], F_GETFL);
-    if (rw_flags >= 0 && (host_flags & O_NONBLOCK) != 0) {
-        (void)fcntl(fds[0], F_SETFL, rw_flags | O_NONBLOCK);
-    }
+    (void)unlink(tmpl);
     while (done < len) {
-        ssize_t n = write(fds[1], (const uint8_t *)data + done, len - done);
+        ssize_t n = write(fd, (const uint8_t *)data + done, len - done);
         if (n < 0) {
-            if (errno == EINTR) {
+            int e = errno;
+            if (e == EINTR) {
                 continue;
             }
-            close(fds[0]);
-            close(fds[1]);
-            return -(long)errno;
+            close(fd);
+            return -(long)e;
         }
         done += (size_t)n;
     }
-    close(fds[1]);
-    return (long)fds[0];
+    if (lseek(fd, 0, SEEK_SET) != 0) {
+        int e = errno;
+        close(fd);
+        return -(long)e;
+    }
+    if ((host_flags & O_CLOEXEC) != 0) {
+        (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+    rw_flags = fcntl(fd, F_GETFL);
+    if (rw_flags >= 0 && (host_flags & O_NONBLOCK) != 0) {
+        (void)fcntl(fd, F_SETFL, rw_flags | O_NONBLOCK);
+    }
+    return (long)fd;
 }
 
 static long procfs_open_exe(sparc32_ctx_t *ctx, int host_flags)
@@ -309,7 +283,7 @@ static long procfs_readlink_at(sparc32_ctx_t *ctx, int dirfd, uint32_t path_va,
 {
     char path[PROCFS_PATH_MAX];
     const char *rel;
-    long rc = procfs_copy_in(ctx, path_va, path, PROCFS_PATH_MAX);
+    long rc = l2a_copy_cstring(ctx, path_va, path, PROCFS_PATH_MAX);
     if (rc != 0) {
         return rc;
     }
