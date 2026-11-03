@@ -50,13 +50,6 @@ void sparc32_l2a_set_blocked_mask(sparc32_ctx_t *ctx, uint64_t mask)
     }
 }
 
-static int l2a_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
-{
-    uint8_t b[4];
-    put_be32(b, v);
-    return l2a_store(ctx, va, b, sizeof(b));
-}
-
 #define SP_CLOCK_REALTIME 0U
 #define SP_CLOCK_MONOTONIC 1U
 

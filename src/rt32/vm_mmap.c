@@ -220,6 +220,7 @@ static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
                 return (uint32_t)(-ENOMEM);
             }
         }
+#if defined(__APPLE__)
         if ((host_flags & MAP_ANONYMOUS) == 0) {
             struct stat eof_st;
             if (fstat(fd, &eof_st) == 0) {
@@ -245,6 +246,7 @@ static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
                 }
             }
         }
+#endif
         if (update_cursor) {
             g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + aligned_len);
         }

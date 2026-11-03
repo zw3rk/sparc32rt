@@ -1,24 +1,12 @@
 /*
  * src/os/threads.c — Phase-4 process/thread machinery (lane L4a)
- *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
- *
- * fork/vfork, wait4/waitpid, clone via host pthreads,
- * rt_sigpending/rt_sigsuspend. The kill family (kill/tkill/tgkill,
- * gettid, set_tid_address) lives in threads_kill.c; pipe/pipe2 and
- * the guest FD table live in threads_fd.c; execve lives in
- * threads_exec.c (splits for the 900-line discipline). Oracle
- * evidence in the commit message.
- * vfork is fork + document. Async (#5): host handlers only set the
- * process-pending word; delivery at safe points. RC4 hookups for
- * threaded proof are listed in threads.h.
- *
- * Lock order (S32-R3-2, S32-R3-3): thr_live_lock -> sigact_lock ->
- * thr_fd_lock -> g_dbt_lock -> VM spinlock. vm_lock_acquire()
- * performs the DBT quiescence step itself; fork prepare takes the
- * five in order and holds them across fork() so the child inherits
- * no partial mutation and no lock owned by a vanished thread.
+ * fork/vfork, wait4/waitpid, clone via host pthreads. Kill family in
+ * threads_kill.c; FD table in threads_fd.c; execve in threads_exec.c.
+ * Async (#5): handlers set process-pending word; delivery at safe points.
+ * Lock order: thr_live_lock -> sigact_lock -> thr_fd_lock -> g_dbt_lock
+ * -> VM spinlock; fork prepare holds all five across fork().
  */
 /* sched_yield/pthread + syscall() under strict -std=c11 with musl. */
 #define _GNU_SOURCE
@@ -68,10 +56,8 @@ int thr_gettid(void)
 #endif
 }
 
-/* Live contexts (normal thread context only; the async handler never
- * reads this table) + the stable process-pending word + exec retire.
- * Each slot also stores the host pthread for non-Linux wakeup
- * (S32-R4-8): pthread_kill(pt) instead of kill(host_tid). */
+/* Live contexts + process-pending word + exec retire. Each slot stores
+ * host pthread for non-Linux wakeup (S32-R4-8): pthread_kill(pt). */
 typedef struct {
     sparc32_ctx_t *ctx;
     pthread_t pt;
@@ -82,12 +68,10 @@ static pthread_mutex_t thr_live_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool thr_init_done = false;
 static _Atomic uint64_t g_process_pending = 0ULL;
 static _Atomic bool g_exec_retiring = false;
+_Atomic uint32_t g_wakeup_suppress[65];
 
-/* Sticky per-context retirement marks (S32-R3-4 follow-up #4): every
- * context ever marked retired stays marked until its own storage is
- * freed, so a slow sibling that missed the wait still observes the
- * flag after the globals stop changing. Guarded by thr_live_lock;
- * readers use acquire loads so the hot poll stays lock-free. */
+/* Sticky retirement marks (S32-R3-4 #4): marked contexts stay marked until
+ * freed; guarded by thr_live_lock, polled with acquire loads. */
 static sparc32_ctx_t *thr_retired[THR_MAX_LIVE];
 
 static void thr_retired_add_locked(sparc32_ctx_t *ctx)
@@ -130,8 +114,7 @@ static bool thr_retired_contains(const sparc32_ctx_t *ctx)
     return false;
 }
 
-/* Live-registry lock + lookup shared by the threads_*.c splits (see
- * threads.h). The pointer is only valid while the lock is held. */
+/* Live-registry lock/lookup shared by threads_*.c; valid only while locked. */
 void thr_live_enter(void)
 {
     pthread_mutex_lock(&thr_live_lock);
@@ -176,6 +159,25 @@ bool thr_live_pt_for_tid(int32_t tid, pthread_t *out)
     }
     pthread_mutex_unlock(&thr_live_lock);
     return ok;
+}
+
+/* S32-R4-8: pthread_kill under thr_live_lock; -ESRCH when absent. */
+long thr_live_pthread_kill(int32_t tid, int hsig)
+{
+    size_t i;
+    long rc = -ESRCH;
+    pthread_mutex_lock(&thr_live_lock);
+    for (i = 0U; i < THR_MAX_LIVE; i++) {
+        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i].ctx,
+            __ATOMIC_ACQUIRE);
+        if (c != NULL && c->host_tid == tid && thr_live[i].pt_valid) {
+            int prc = pthread_kill(thr_live[i].pt, hsig);
+            rc = (prc == 0) ? 0 : -(long)prc;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&thr_live_lock);
+    return rc;
 }
 
 static void thr_live_set_pt_locked(sparc32_ctx_t *ctx, pthread_t pt)
@@ -230,18 +232,13 @@ static void thr_deregister(sparc32_ctx_t *ctx)
             thr_live[i].pt_valid = 0;
         }
     }
-    /* A context that frees its own storage drops its retirement mark
-     * with it, so a later allocation that reuses the address is never
-     * mistaken for a retired sibling (S32-R3-4 follow-up #4). */
+    /* Freeing drops its mark so address reuse is never mistaken (S32-R3-4 #4). */
     thr_retired_remove_locked(ctx);
     pthread_mutex_unlock(&thr_live_lock);
 }
 
-/* Context teardown (S32-R3-1): the async handler never dereferences a
- * live context (it only sets g_process_pending), so freeing after
- * deregistering under thr_live_lock is safe. Normal-context readers
- * (tkill scans) hold the same lock across load + pending-bit update,
- * so no thread observes the freed pointer. */
+/* Teardown (S32-R3-1): handler only sets g_process_pending, so free after
+ * deregister under thr_live_lock is safe; tkill scans hold the same lock. */
 static void thr_drop_context(sparc32_ctx_t *ctx)
 {
     if (ctx == NULL) {
@@ -251,15 +248,20 @@ static void thr_drop_context(sparc32_ctx_t *ctx)
     free(ctx);
 }
 
-/* Host async note (S32-R3-1, S32-R3-7): set the stable process-pending
- * bit only. Atomic fetch_or; no context access, no table read. */
+/* Host async note (S32-R3-1/R3-7): set process-pending bit only. */
 void sparc32_thr_note_signal(int sig)
 {
+    /* S32-R4-6: consume one wakeup token instead of setting a dup bit. */
     if (sig < 1 || sig > 64) {
         return;
     }
-    atomic_fetch_or_explicit(&g_process_pending, sparc32_thr_sigbit(sig),
-        memory_order_release);
+    if (atomic_load_explicit(&g_wakeup_suppress[sig], memory_order_acquire) != 0U) {
+        if (atomic_fetch_sub_explicit(&g_wakeup_suppress[sig], 1U, memory_order_acq_rel) != 0U) {
+            return;
+        }
+        atomic_fetch_add_explicit(&g_wakeup_suppress[sig], 1U, memory_order_release);
+    }
+    atomic_fetch_or_explicit(&g_process_pending, sparc32_thr_sigbit(sig), memory_order_release);
 }
 
 void sparc32_thr_host_handler(int sig)
@@ -272,9 +274,7 @@ void sparc32_thr_host_handler(int sig)
     sparc32_thr_note_signal(sig);
 }
 
-/* Thread-directed note: set one context's own pending bit. The caller
- * either holds thr_live_lock (tkill scan) or owns the context
- * exclusively (self delivery, no registry access). */
+/* Thread-directed note: caller holds thr_live_lock or owns ctx exclusively. */
 void sparc32_thr_note_thread(sparc32_ctx_t *ctx, int sig)
 {
     if (ctx == NULL || sig < 1 || sig > 64) {
@@ -283,8 +283,7 @@ void sparc32_thr_note_thread(sparc32_ctx_t *ctx, int sig)
     __atomic_fetch_or(&ctx->pending_signals, sparc32_thr_sigbit(sig), __ATOMIC_RELEASE);
 }
 
-/* Single-winner claim of one process-pending bit (S32-R3-7): exactly
- * one polling thread delivers each process-directed signal. */
+/* Single-winner claim of one process-pending bit (S32-R3-7). */
 bool sparc32_thr_claim_global(int sig)
 {
     uint64_t old;
@@ -307,9 +306,7 @@ bool sparc32_thr_claim_global(int sig)
     }
 }
 
-/* True when any live context holds thread bit sig (S32-R3-7 echo
- * attribution): a claimed process bit with a surviving thread owner
- * elsewhere is a host-wakeup echo, not a second signal. */
+/* True when any live ctx holds thread bit sig (S32-R3-7 echo attribution). */
 bool sparc32_thr_thread_has_pending(int sig)
 {
     uint64_t bit;
@@ -346,8 +343,7 @@ void sparc32_thr_discard_signal(sparc32_ctx_t *ctx, int sig)
         memory_order_acq_rel);
 }
 
-/* True when this context or the process queue holds an undelivered
- * signal (fast-path guard for the safe-point poll). */
+/* True when this ctx or the process queue holds an undelivered signal. */
 bool sparc32_thr_has_pending(const sparc32_ctx_t *ctx)
 {
     if (ctx != NULL && __atomic_load_n(&ctx->pending_signals,
@@ -368,9 +364,7 @@ void sparc32_thr_clear_process_pending(void)
     atomic_store_explicit(&g_process_pending, 0ULL, memory_order_release);
 }
 
-/* Retired-context exit (S32-R3-4): a guest thread that observes the
- * exec-retire flag deregisters and frees only its own context, then
- * leaves the process (which survives while the exec survivor runs). */
+/* Retired-context exit (S32-R3-4): deregister/free own ctx, leave process. */
 void sparc32_thr_self_retire(sparc32_ctx_t *ctx)
 {
     if (ctx == NULL) {
@@ -412,15 +406,8 @@ static int thr_st(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
     return l2a_store(ctx, va, b, sizeof(b));
 }
 
-/* Coordinated fork (S32-R3-2): quiesce admission and execution in the
- * documented lock order (thr_live_lock -> sigact_lock -> thr_fd_lock
- * -> g_dbt_lock -> VM spinlock), fork, then rebuild single-threaded
- * state. The child inherits all five locks held by the surviving
- * (forking) thread, so it owns and then reinitializes them; no lock
- * is ever owned by a vanished thread, and no reader/runner survives
- * to observe a torn VM table. A sibling inside rt_sigaction or an
- * open-family call at fork time no longer leaves the child with a
- * permanently locked mutex (S32-R3-2 follow-up #3). */
+/* Coordinated fork (S32-R3-2): quiesce in lock order, fork, rebuild state.
+ * Child inherits all five locks held, then reinitializes them (S32-R3-2 #3). */
 void sparc32_thr_fork_prepare(void)
 {
     pthread_mutex_lock(&thr_live_lock);
@@ -467,9 +454,7 @@ void sparc32_thr_fork_child(sparc32_ctx_t *ctx)
     }
 }
 
-/* fork(2): E04 dual-return (parent o0=pid/o1=0, child o0=0/o1=1). DBT
- * cache survives as shared COW mappings; pending queues restart empty
- * in the child (fresh process, no inherited pendings). */
+/* fork(2): dual-return (parent o0=pid/o1=0, child o0=0/o1=1); child queues restart empty. */
 long sparc32_thr_fork(sparc32_ctx_t *ctx)
 {
     pid_t pid;
@@ -499,13 +484,8 @@ long sparc32_thr_vfork(sparc32_ctx_t *ctx)
     return sparc32_thr_fork(ctx);
 }
 
-/* execve sibling retirement (S32-R3-4, follow-up #4): old guest
- * threads must not survive the image replacement. The survivor marks
- * every other live context retired; every clone-thread loop polls
- * sparc32_thr_is_retired() — including inside the inner interp_step
- * loop, so compute-bound siblings observe it — and exits through the
- * normal thread-finish path (which deregisters and frees its own
- * context, so no cross-thread free ever runs). */
+/* execve sibling retirement (S32-R3-4 #4): survivor marks others retired;
+ * clone loops poll is_retired() incl. inner step loop, exit via finish path. */
 void sparc32_thr_exec_retire_begin(sparc32_ctx_t *survivor)
 {
     size_t i;
@@ -605,6 +585,18 @@ static long thr_wait_common(sparc32_ctx_t *ctx, uint32_t pid,
     }
     if (got < 0) {
         return -(long)errno;
+    }
+    /* Host-to-SPARC signal translation (S32-R4-4): WTERMSIG + WSTOPSIG. */
+    if ((status & 0x7f) != 0 && (status & 0x7f) != 0x7f) {
+        int gs = sparc32_sig_from_host(status & 0x7f);
+        if (gs >= 1 && gs <= 64) {
+            status = (status & ~0x7f) | (gs & 0x7f);
+        }
+    } else if ((status & 0xff) == 0x7f) {
+        int gs = sparc32_sig_from_host((status >> 8) & 0xff);
+        if (gs >= 1 && gs <= 64) {
+            status = (status & 0xff) | ((gs & 0xff) << 8);
+        }
     }
     /* Status is host-endian; the guest observes the BE word
      * (E04: exit(7) -> 0x0700). rusage is zero-filled (RC-H). */

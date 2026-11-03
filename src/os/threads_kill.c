@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -30,6 +31,11 @@
 #include "sparc32rt.h"
 #include "os/syscalls_min.h"
 #include "os/threads.h"
+
+/* S32-R4-6 wakeup suppression (defined in threads.c). */
+extern _Atomic uint32_t g_wakeup_suppress[65];
+/* S32-R4-8 locked non-Linux wakeup (defined in threads.c). */
+extern long thr_live_pthread_kill(int32_t tid, int hsig);
 
 /* Self-directed process signal (S32-R3-7): the signal is
  * process-directed, so it joins the process queue for single-winner
@@ -106,15 +112,8 @@ static long thr_host_tgkill(uint32_t tgid, int host_tid, uint32_t sig)
     rc = syscall(SYS_tkill, (pid_t)host_tid, hsig);
     return (rc == 0) ? 0 : -(long)errno;
 #else /* #ifndef __linux__: pthread delivery (S32-R4-8) */
-    pthread_t pt;
-    long rc;
     (void)tgid;
-    if (thr_live_pt_for_tid(host_tid, &pt)) {
-        int prc = pthread_kill(pt, hsig);
-        return (prc == 0) ? 0 : -(long)prc;
-    }
-    rc = kill((pid_t)host_tid, hsig);
-    return (rc == 0) ? 0 : -(long)errno;
+    return thr_live_pthread_kill((int32_t)host_tid, hsig);
 #endif
 }
 
@@ -245,16 +244,23 @@ static long thr_kill_tid(sparc32_ctx_t *ctx, uint32_t tgid,
         }
         return 0;
     }
-    if (disp == SPARC32_SIG_DISP_CAUGHT && !is_self_target) {
-        /* Wakeup for a target that may park in sigsuspend. The handler
-         * only sets the process bit; the poll dedups it against the
-         * thread bit above. Uses the copied TID, never the
-         * possibly-freed target pointer. */
-        thr_host_tgkill(tgid, target_host_tid, sig);
-        if ((int32_t)tid == self_tid) {
-            return thr_kill_self(ctx, (int)sig);
+    if (disp == SPARC32_SIG_DISP_CAUGHT) {
+        /* Thread bit is already queued above. A local target returns
+         * immediately: self needs no wakeup, a remote target gets a
+         * suppressed wakeup whose handler token blocks the duplicate
+         * process bit. Never falls through to thr_kill_self. */
+        if (is_self_target || (int32_t)tid == self_tid) {
+            return 0;
         }
-    } else if ((int32_t)tid == self_tid) {
+        atomic_fetch_add_explicit(&g_wakeup_suppress[sig], 1U,
+            memory_order_release);
+        if (thr_host_tgkill(tgid, target_host_tid, sig) != 0) {
+            atomic_fetch_sub_explicit(&g_wakeup_suppress[sig], 1U,
+                memory_order_release);
+        }
+        return 0;
+    }
+    if ((int32_t)tid == self_tid) {
         return thr_kill_self(ctx, (int)sig);
     }
     return 0;

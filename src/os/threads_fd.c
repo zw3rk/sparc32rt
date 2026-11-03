@@ -50,7 +50,7 @@ static bool thr_fd_ensure_locked(int fd)
     size_t need;
     uint8_t *nu;
     uint8_t *nc;
-    if (fd < 0) {
+    if (fd < 0 || fd >= 65536) {
         return false;
     }
     need = (size_t)fd + 1U;
@@ -112,7 +112,6 @@ long sparc32_fd_close_tracked(int fd)
         return -EBADF;
     }
     pthread_mutex_lock(&thr_fd_lock);
-    (void)thr_fd_ensure_locked(fd);
     rc = close(fd);
     if ((size_t)fd < thr_fd_cap) {
         thr_fd_used[fd] = 0U;

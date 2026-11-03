@@ -105,10 +105,15 @@ static inline int l2a_load(const sparc32_ctx_t *ctx, uint32_t va, void *dst,
     return 0;
 }
 
+bool sparc32_thr_is_retired(const sparc32_ctx_t *ctx);
+
 static inline int l2a_store(sparc32_ctx_t *ctx, uint32_t va, const void *src,
     uint64_t len)
 {
     bool has_code = false;
+    if (sparc32_thr_is_retired(ctx)) {
+        return -EFAULT;
+    }
     sparc32_vm_access_enter();
     if (l2a_range_ok_prot(va, len, 2U) != 0) {
         sparc32_vm_access_leave();
