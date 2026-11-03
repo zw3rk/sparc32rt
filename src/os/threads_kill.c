@@ -80,7 +80,10 @@ long sparc32_thr_kill(sparc32_ctx_t *ctx, uint32_t pid, uint32_t sig)
             return thr_kill_self(ctx, s);
         }
     }
-    if (sig != 0U &&
+    /* S32-R11-1: pure-emulation signals (7/SIGEMT, 29/SIGLOST) have no
+     * host image: skip the host kill and keep only the translator
+     * pending bit below, so one guest kill never pends two signals. */
+    if (sig != 0U && !sparc32_sig_pure_emu((int)sig) &&
         kill((pid_t)(int32_t)pid,
             sparc32_sig_to_host((int)sig)) != 0) {
         return -(long)errno;
@@ -100,8 +103,15 @@ long sparc32_thr_kill(sparc32_ctx_t *ctx, uint32_t pid, uint32_t sig)
  * the default action (fatal signals terminate; raise/abort work). */
 static long thr_host_tgkill(uint32_t tgid, int host_tid, uint32_t sig)
 {
+    int hsig;
+    /* S32-R11-1: pure-emulation signals have no host image. The
+     * translator thread bit queued by the caller is the whole delivery;
+     * no host tgkill/tkill/pthread wakeup may run for them. */
+    if (sparc32_sig_pure_emu((int)sig)) {
+        return 0;
+    }
     /* Host numbering (S32-R4-4): the caller passes SPARC numbers. */
-    int hsig = sparc32_sig_to_host((int)sig);
+    hsig = sparc32_sig_to_host((int)sig);
 #if defined(__linux__) && defined(SYS_tgkill)
     long rc = syscall(SYS_tgkill, (pid_t)(int32_t)tgid, (pid_t)host_tid,
         hsig);
@@ -250,6 +260,12 @@ static long thr_kill_tid(sparc32_ctx_t *ctx, uint32_t tgid,
          * suppressed wakeup whose handler token blocks the duplicate
          * process bit. Never falls through to thr_kill_self. */
         if (is_self_target || (int32_t)tid == self_tid) {
+            return 0;
+        }
+        /* S32-R11-1: no host wakeup exists for pure-emulation signals,
+         * and no host signal would ever consume the suppress token, so
+         * the queued thread bit is the whole delivery. */
+        if (sparc32_sig_pure_emu((int)sig)) {
             return 0;
         }
         atomic_fetch_add_explicit(&g_wakeup_suppress[sig], 1U,

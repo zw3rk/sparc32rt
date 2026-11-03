@@ -44,9 +44,26 @@
  * Every host sigaction/kill/tgkill/pthread_kill argument goes through
  * to_host; the async host handler maps back through from_host before
  * touching guest state. Signals 1..9, 11, 13..15 (and 29/32..64) are
- * identity on both hosts. */
+ * identity on both hosts.
+ *
+ * S32-R11-1: SPARC SIGEMT (7) and SIGLOST (29) are pure-emulation
+ * signals with no host image (on Linux 7 is SIGBUS and 29 is SIGIO, so
+ * identity delegation would alias guest 7 with guest 10 and guest 29
+ * with guest 23 through the same host handler). They are never passed
+ * to host sigaction/kill/tgkill; only the translator pending bits carry
+ * them. to_host reports -1 for them so an unguarded host call fails
+ * closed (EINVAL) instead of delivering the wrong signal; from_host keeps
+ * mapping host SIGBUS/SIGIO to guest 10/23 (on Linux a host 7/29 always
+ * means the host SIGBUS/SIGIO, never guest 7/29). */
+static inline bool sparc32_sig_pure_emu(int sig)
+{
+    return sig == 7 || sig == 29;
+}
 static inline int sparc32_sig_to_host(int sig)
 {
+    if (sig == 7 || sig == 29) {
+        return -1;
+    }
     switch (sig) {
     case 10:
         return SIGBUS;
@@ -87,6 +104,9 @@ static inline int sparc32_sig_to_host(int sig)
     }
 }
 
+/* S32-R11-1: host SIGBUS/SIGIO always mean guest 10/23 here. Pure-
+ * emulation signals 7/29 are only ever set as translator pending bits;
+ * on Linux a host 7/29 therefore never reports guest 7/29. */
 static inline int sparc32_sig_from_host(int sig)
 {
     if (sig == SIGBUS) {

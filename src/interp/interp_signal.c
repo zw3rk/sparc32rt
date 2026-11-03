@@ -60,6 +60,10 @@ static uint32_t interp_delivery_sp(sparc32_ctx_t *ctx, uint32_t flags)
         if (sparc32_sigaltstack_state_ctx(ctx, &asp, &asize, &onstack) == 0 &&
             !onstack) {
             sparc32_sigaltstack_set_onstack_ctx(ctx, 1);
+            /* S32-R11-4: an autodisarm stack disables on delivery; the
+             * frame below then reports SS_DISABLE and later signals use
+             * the main stack until the guest re-enables it. */
+            sparc32_sigaltstack_auto_disarm_ctx(ctx);
             sp = asp + asize;
         }
     }
@@ -650,8 +654,11 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
             if (sparc32_signal_get(s, &handler, &restorer) != 0) {
                 __atomic_fetch_and(&ctx->pending_signals, ~bit,
                     __ATOMIC_ACQ_REL);
+                /* S32-R11-1: pure-emulation signals (7/29) have no host
+                 * image; the host kill is skipped for them. */
                 if (sparc32_signal_disposition(s) ==
                         SPARC32_SIG_DISP_DFL &&
+                    !sparc32_sig_pure_emu(s) &&
                     interp_dfl_terminates(s)) {
                     /* Default termination at delivery time: the
                      * signal was queued while blocked and is now
@@ -681,8 +688,11 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
             continue;
         }
         if (sparc32_signal_get(s, &handler, &restorer) != 0) {
+            /* S32-R11-1: pure-emulation signals (7/29) have no host
+             * image; the host kill is skipped for them. */
             if (sparc32_signal_disposition(s) ==
                     SPARC32_SIG_DISP_DFL &&
+                !sparc32_sig_pure_emu(s) &&
                 interp_dfl_terminates(s)) {
                 /* Process-directed default termination at unmask
                  * time (S32-R4-5), mirroring the thread queue above. */

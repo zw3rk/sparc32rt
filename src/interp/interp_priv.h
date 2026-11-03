@@ -44,6 +44,7 @@ bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
 #define SPARC32_SA_SIGINFO 0x200U
 #define SPARC32_SS_ONSTACK 1U
 #define SPARC32_SS_DISABLE 2U
+#define SPARC32_SS_AUTODISARM 0x80000000U
 #define SPARC32_MINSIGSTKSZ 4096U
 #define SPARC32_SIGFPU_SIZE 136U
 /* C2-3 signal extensions (implemented in os/syscalls_sig.c, consulted
@@ -60,6 +61,9 @@ void sparc32_sigaltstack_set_onstack(int onstack);
 int sparc32_sigaltstack_state_ctx(const sparc32_ctx_t *ctx, uint32_t *sp,
     uint32_t *size, int *onstack);
 void sparc32_sigaltstack_set_onstack_ctx(sparc32_ctx_t *ctx, int onstack);
+/* S32-R11-4: drop ALT_ENABLED when the stack was installed with
+ * SS_AUTODISARM (delivery + sigreturn call this; plain stacks ignore). */
+void sparc32_sigaltstack_auto_disarm_ctx(sparc32_ctx_t *ctx);
 void sparc32_l2a_set_blocked_mask(sparc32_ctx_t *ctx, uint64_t mask);
 /* Flush-windows trap (ta 3, C2-3): spill every cached caller window to
  * its recorded stack slot so setjmp/longjmp and signal frames observe

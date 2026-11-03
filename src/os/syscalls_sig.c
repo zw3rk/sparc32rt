@@ -24,6 +24,7 @@
 #define SPARC_SA_SIGINFO SPARC32_SA_SIGINFO
 #define SPARC_SS_ONSTACK SPARC32_SS_ONSTACK
 #define SPARC_SS_DISABLE SPARC32_SS_DISABLE
+#define SPARC_SS_AUTODISARM SPARC32_SS_AUTODISARM
 #define SPARC_MINSIGSTKSZ SPARC32_MINSIGSTKSZ
 
 static int sig_range_ok_prot(uint32_t va, uint32_t len, uint32_t req_prot)
@@ -99,6 +100,12 @@ static void sig_host_sync(int sig, int kind)
         return;
     }
     if (sig == 10 || sig == 11) {
+        return;
+    }
+    /* S32-R11-1: SIGEMT (7) / SIGLOST (29) are pure-emulation signals
+     * with no host image; installing a host handler for them would alias
+     * guest 7 with guest 10 (SIGBUS) and guest 29 with guest 23 (SIGIO). */
+    if (sparc32_sig_pure_emu(sig)) {
         return;
     }
     hsig = sparc32_sig_to_host(sig);
@@ -182,9 +189,11 @@ int sparc32_signal_get_action(int sig, uint32_t *handler_va,
 
 /* Per-thread alternate stack (S32-R3-5): address, size, and the
  * enabled/onstack bits live in the owning guest context. Bit 0 of
- * altstack_flags is ENABLED, bit 1 is ONSTACK (a handler runs on it). */
+ * altstack_flags is ENABLED, bit 1 is ONSTACK (a handler runs on it),
+ * bit 2 (S32-R11-4) records SS_AUTODISARM from install time. */
 #define ALT_ENABLED 1U
 #define ALT_ONSTACK 2U
+#define ALT_AUTODISARM 4U
 
 int sparc32_sigaltstack_state_ctx(const sparc32_ctx_t *ctx, uint32_t *sp,
     uint32_t *size, int *onstack)
@@ -215,11 +224,21 @@ void sparc32_sigaltstack_set_onstack_ctx(sparc32_ctx_t *ctx, int onstack)
     if (ctx == NULL) {
         return;
     }
-    f = ctx->altstack_flags & ALT_ENABLED;
+    f = ctx->altstack_flags & (ALT_ENABLED | ALT_AUTODISARM);
     if (onstack != 0) {
         f |= ALT_ONSTACK;
     }
     ctx->altstack_flags = f;
+}
+
+void sparc32_sigaltstack_auto_disarm_ctx(sparc32_ctx_t *ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    if ((ctx->altstack_flags & ALT_AUTODISARM) != 0U) {
+        ctx->altstack_flags &= (uint32_t)~ALT_ENABLED;
+    }
 }
 
 void sparc32_sigaltstack_set_onstack(int onstack)
@@ -434,17 +453,22 @@ long sparc32_sys_sigaltstack(sparc32_ctx_t *ctx, uint32_t uss_va,
         }
     }
     if (have_uss) {
-        if (in_flags == SPARC_SS_DISABLE) {
+        /* S32-R11-3: a live handler on the stack forbids both install
+         * and disable while ONSTACK is set. */
+        if ((ctx->altstack_flags & ALT_ONSTACK) != 0U) {
+            return -EPERM;
+        }
+        /* S32-R11-2: only DISABLE and AUTODISARM bits are settable;
+         * SS_ONSTACK is a query result and unknown bits are rejected. */
+        if ((in_flags & ~(SPARC_SS_DISABLE | SPARC_SS_AUTODISARM)) != 0U) {
+            return -EINVAL;
+        }
+        if ((in_flags & SPARC_SS_DISABLE) != 0U) {
+            /* S32-R11-4: DISABLE alone or with AUTODISARM disables. */
             ctx->altstack_flags = 0U;
             ctx->altstack_sp = 0U;
             ctx->altstack_size = 0U;
             return 0;
-        }
-        if (in_flags != 0U && in_flags != SPARC_SS_ONSTACK) {
-            return -EINVAL;
-        }
-        if ((ctx->altstack_flags & ALT_ONSTACK) != 0U) {
-            return -EPERM;
         }
         if (in_size < SPARC_MINSIGSTKSZ) {
             return -ENOMEM;
@@ -454,7 +478,9 @@ long sparc32_sys_sigaltstack(sparc32_ctx_t *ctx, uint32_t uss_va,
         }
         ctx->altstack_sp = in_sp;
         ctx->altstack_size = in_size;
-        ctx->altstack_flags = ALT_ENABLED;
+        /* S32-R11-4: record AUTODISARM; delivery auto-disarms. */
+        ctx->altstack_flags = ALT_ENABLED |
+            (((in_flags & SPARC_SS_AUTODISARM) != 0U) ? ALT_AUTODISARM : 0U);
     }
     return 0;
 }
@@ -528,6 +554,9 @@ static long sigreturn_restore_common(sparc32_ctx_t *ctx, uint32_t base,
     ctx->sig_mask = sparc32_thr_mask_sanitize(
         ((uint64_t)mask_hi << 32U) | (uint64_t)mask_lo);
     sparc32_sigaltstack_set_onstack_ctx(ctx, 0);
+    /* S32-R11-4: an autodisarm stack stays disabled (SS_DISABLE) once a
+     * handler has run on it; plain stacks keep ENABLED here. */
+    sparc32_sigaltstack_auto_disarm_ctx(ctx);
     return 0;
 }
 

@@ -144,9 +144,13 @@ long sparc32_thr_rt_sigsuspend(sparc32_ctx_t *ctx, uint32_t set_va,
                 /* No handler installed (S32-R5-5): only SIG_IGN and
                  * ignore-default DFL are discarded. Fatal-default DFL
                  * terminates like the kernel would; stop-default DFL
-                 * stays queued for normal polling. */
+                 * stays queued for normal polling. S32-R11-1: pure-
+                 * emulation signals (7/29) have no host image, so the
+                 * host kill is skipped for them (falls through to the
+                 * EINTR path below with no wrong-signal delivery). */
                 if (sparc32_signal_disposition(s) ==
                         SPARC32_SIG_DISP_DFL &&
+                    !sparc32_sig_pure_emu(s) &&
                     thr_sig_dfl_terminates(s)) {
                     sparc32_l2a_set_blocked_mask(ctx, old);
                     (void)sigprocmask(SIG_SETMASK, &old_host_set, NULL);
@@ -188,6 +192,7 @@ long sparc32_thr_rt_sigsuspend(sparc32_ctx_t *ctx, uint32_t set_va,
             if (sparc32_signal_get(s, &handler, &restorer) != 0) {
                 if (sparc32_signal_disposition(s) ==
                         SPARC32_SIG_DISP_DFL &&
+                    !sparc32_sig_pure_emu(s) &&
                     thr_sig_dfl_terminates(s)) {
                     if (!sparc32_thr_claim_global(s)) {
                         continue;
