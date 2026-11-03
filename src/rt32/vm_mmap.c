@@ -226,6 +226,8 @@ static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
                 target_va, (uint32_t)((uint64_t)target_va + aligned_len),
                 prot & 0x7U, flags, "[mmap]", rec_fd, rec_pgoff);
             if (rec_rc != 0) {
+                vm_file_unregister_range(target_va,
+                    (uint32_t)aligned_len);
                 (void)vm_reserve_prot_none(ctx, target_va,
                     (uint32_t)aligned_len);
                 vm_mmap_publish(ctx, target_va,
@@ -253,11 +255,20 @@ static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
                             target_va + (uint32_t)first_tail;
                         uint32_t tail_end = (uint32_t)(
                             (uint64_t)target_va + aligned_len);
-                        vm_mmap_publish(ctx, tail_start, tail_end, 0U, 0U);
-                        vm_mprotect_regions_locked(tail_start, tail_end, 0U);
-                        (void)rt_host_protect(
-                            sparc32_guest_ptr(ctx, tail_start),
-                            (size_t)(tail_end - tail_start), PROT_NONE);
+                        vm_mmap_publish(ctx, tail_start, tail_end,
+                            prot, 0U);
+                        vm_mprotect_regions_locked(tail_start, tail_end,
+                            prot & 0x7U);
+                        /* Zero-fill only private writable tails: the host
+                         * mapping mirrors guest prot, so a read-only tail
+                         * is host-read-only (memset would SIGSEGV) and a
+                         * shared tail past EOF is kernel-zeroed on read
+                         * (memset could SIGBUS). Either way reads see 0. */
+                        if ((host_flags & MAP_SHARED) == 0 &&
+                            (prot & 0x2U) != 0U) {
+                            memset(sparc32_guest_ptr(ctx, tail_start),
+                                0, (size_t)(tail_end - tail_start));
+                        }
                     }
                 }
             }

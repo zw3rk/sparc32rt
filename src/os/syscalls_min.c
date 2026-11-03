@@ -43,6 +43,7 @@
 #include "sparc32rt.h"
 #include "interp/interp.h"
 #include "interp/interp_priv.h"
+#include "os/backend.h"
 #include "os/l2a_access.h"
 #include "os/syscall_nr.h"
 #include "os/threads.h"
@@ -326,6 +327,56 @@ static long sys_mremap(sparc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                                        flags, new_addr));
 }
 
+/* madvise(75)/msync(65) with Linux numeric advice/flags. len 0 no-ops;
+ * addr must be page-aligned (EINVAL); the range must be mapped inside
+ * the task window (ENOMEM, fail-closed). DONTNEED(4) zeroes writable
+ * pages (the host mapping mirrors guest prot, so memset cannot fault),
+ * advises the host, and invalidates translated code. Valid advice is
+ * 0..4, 8..19, 100, 101; anything else is EINVAL like Linux. */
+static long sys_madvise(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
+                        uint32_t advice)
+{
+    if (len == 0U) {
+        return 0;
+    }
+    if ((addr & 0xFFFU) != 0U) {
+        return -EINVAL;
+    }
+    if (advice > 101U || (advice > 19U && advice < 100U) ||
+        (advice > 4U && advice < 8U)) {
+        return -EINVAL;
+    }
+    if ((uint64_t)addr + len > (uint64_t)SPARC32_TASK_SIZE_TOP ||
+        guest_range_ok_prot(addr, len, 1U) != 0) {
+        return -ENOMEM;
+    }
+    if (advice == 4U) {
+        if (guest_range_ok_prot(addr, len, 2U) == 0) {
+            memset(sparc32_guest_ptr(ctx, addr), 0, (size_t)len);
+        }
+        vm_invalidate_jit(ctx, addr, addr + len);
+    }
+    return (long)rt_host_madvise(sparc32_guest_ptr(ctx, addr), (size_t)len,
+        (int)advice);
+}
+
+static long sys_msync(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
+                      uint32_t flags)
+{
+    if (len == 0U) {
+        return 0;
+    }
+    if ((addr & 0xFFFU) != 0U || (flags & ~0x7U) != 0U) {
+        return -EINVAL;
+    }
+    if ((uint64_t)addr + len > (uint64_t)SPARC32_TASK_SIZE_TOP ||
+        guest_range_ok_prot(addr, len, 1U) != 0) {
+        return -ENOMEM;
+    }
+    return (long)rt_host_msync(sparc32_guest_ptr(ctx, addr), (size_t)len,
+        (int)flags);
+}
+
 /* struct utsname: six NUL-padded fields of 65 bytes each (390 total),
  * matching the sparc32 new_utsname layout the oracle exposes. */
 #define SPARC32_UTS_FIELD  65U
@@ -595,6 +646,12 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         break;
     case (long)SPARC32__NR_mremap:
         ret = sys_mremap(ctx, o0, o1, o2, o3, o4);
+        break;
+    case (long)SPARC32__NR_msync:
+        ret = sys_msync(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_madvise:
+        ret = sys_madvise(ctx, o0, o1, o2);
         break;
     case (long)SPARC32__NR_close:
         ret = sparc32_l2a_close((int)(int32_t)o0);

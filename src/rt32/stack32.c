@@ -106,6 +106,9 @@ static int push_string_table(sparc32_ctx_t *ctx, uint32_t *sp, char **strs,
         while (count < max_count && count < 511 && strs[count] != NULL) {
             count++;
         }
+        if (count == 511 && strs[511] != NULL) {
+            return -1;
+        }
         for (int i = count - 1; i >= 0; i--) {
             out_ptrs[i] = push_cstring(ctx, sp, strs[i]);
             if (out_ptrs[i] == 0U) {

@@ -68,7 +68,7 @@ static inline int l2a_range_ok_prot(uint32_t va, uint64_t len,
     }
     prot = sparc32_vm_prot_base();
     if (prot == NULL) {
-        return 0;
+        return -EFAULT;
     }
     pg = va >> 12;
     end_pg = (uint32_t)((end - 1ULL) >> 12);
@@ -173,7 +173,7 @@ static inline long l2a_copy_cstring(sparc32_ctx_t *ctx, uint32_t va, char *out,
         const uint8_t *p;
         if (a < va) {
             sparc32_vm_access_leave();
-            return -ENAMETOOLONG;
+            return -EFAULT;
         }
         if (l2a_range_ok_prot(a, 1U, 1U) != 0) {
             sparc32_vm_access_leave();

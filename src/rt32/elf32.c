@@ -380,6 +380,13 @@ static int load_elf32_image(sparc32_ctx_t *ctx, int fd, uint32_t default_pie_bas
             }
             return -ENOEXEC;
         }
+        if ((ph->p_offset & 0xFFFU) != (ph->p_vaddr & 0xFFFU)) {
+            if (commit) {
+                fprintf(stderr, "sparc32rt: %s: p_offset 0x%x / p_vaddr 0x%x page-congruence mismatch\n",
+                        label, ph->p_offset, ph->p_vaddr);
+            }
+            return -ENOEXEC;
+        }
 
         seg_vaddr64 = (uint64_t)load_bias + (uint64_t)ph->p_vaddr;
         memsz       = (uint64_t)ph->p_memsz;

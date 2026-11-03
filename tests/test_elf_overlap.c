@@ -13,7 +13,10 @@
  *   B. an interpreter truly overlapping an executable segment is
  *      rejected with -ENOEXEC;
  *   C. a rebased dynamic executable/interpreter pair is accepted;
- *   D. adjacent (touching but non-overlapping) images are accepted.
+ *   D. adjacent (touching but non-overlapping) images are accepted;
+ *   E. a PT_LOAD with mismatched p_offset/p_vaddr page congruence is
+ *      rejected with -ENOEXEC (S32-R9-7);
+ *   F. a congruent nonzero-offset unaligned PT_LOAD is accepted.
  * Prints ELF-OVERLAP: PASS and exits 0 on success.
  *
  * Build & run (host-native):
@@ -84,9 +87,12 @@ typedef struct {
 
 /* Minimal SPARC ELF32: ehdr + phdrs + optional PT_INTERP path. Segment
  * file bytes are never read in dry-run mode, so filesz only needs to
- * satisfy the header bounds checks. */
-static int write_image(const char *path, uint16_t etype, const tseg_t *segs,
-                       size_t nseg, uint32_t entry, const char *interp)
+ * satisfy the header bounds checks. offs optionally overrides the
+ * default file offsets (NULL keeps 0/0x1000); used for the page-offset
+ * congruence cases. */
+static int write_image_off(const char *path, uint16_t etype,
+                           const tseg_t *segs, const uint32_t *offs,
+                           size_t nseg, uint32_t entry, const char *interp)
 {
     uint8_t img[T_IMG_SIZE];
     size_t phnum = nseg + ((interp != NULL) ? 1U : 0U);
@@ -118,7 +124,8 @@ static int write_image(const char *path, uint16_t etype, const tseg_t *segs,
     put_be16(img + 50, 0U);
     for (i = 0U; i < nseg; i++) {
         uint8_t *ph = img + T_PHDR_OFF + i * 32U;
-        uint32_t off = (i == 0U) ? (uint32_t)T_SEG0_OFF : (uint32_t)T_SEGN_OFF;
+        uint32_t off = (offs != NULL) ? offs[i] :
+            ((i == 0U) ? (uint32_t)T_SEG0_OFF : (uint32_t)T_SEGN_OFF);
         uint32_t fsz = (i == 0U) ? (uint32_t)T_SEG0_FILESZ
                                  : (uint32_t)T_SEGN_FILESZ;
         put_be32(ph + 0, 1U);
@@ -150,6 +157,13 @@ static int write_image(const char *path, uint16_t etype, const tseg_t *segs,
         return -1;
     }
     return fclose(f);
+}
+
+static int write_image(const char *path, uint16_t etype,
+                       const tseg_t *segs, size_t nseg, uint32_t entry,
+                       const char *interp)
+{
+    return write_image_off(path, etype, segs, NULL, nseg, entry, interp);
 }
 
 /* Drive one prepare: returns the rt32_elf_prepare result code. */
@@ -236,6 +250,30 @@ int main(void)
             interp_path) == 0, "case D: write exec");
         rc = run_prepare(exec_path);
         expect(rc == 0, "case D: adjacent images accepted");
+    }
+
+    /* Case E: p_offset/p_vaddr page-congruence mismatch rejected. */
+    {
+        static const tseg_t exec_segs[] = {
+            { 0x10000U, 0x1000U, 5U },
+        };
+        static const uint32_t exec_offs[] = { 0x1U };
+        expect(write_image_off(exec_path, 2U, exec_segs, exec_offs, 1U,
+            0x10000U, NULL) == 0, "case E: write exec");
+        rc = run_prepare(exec_path);
+        expect(rc == -ENOEXEC, "case E: incongruent LOAD rejected");
+    }
+
+    /* Case F: nonzero but congruent p_offset/p_vaddr accepted. */
+    {
+        static const tseg_t exec_segs[] = {
+            { 0x11001U, 0x1000U, 5U },
+        };
+        static const uint32_t exec_offs[] = { 0x1001U };
+        expect(write_image_off(exec_path, 2U, exec_segs, exec_offs, 1U,
+            0x11004U, NULL) == 0, "case F: write exec");
+        rc = run_prepare(exec_path);
+        expect(rc == 0, "case F: congruent unaligned LOAD accepted");
     }
 
     (void)remove(exec_path);

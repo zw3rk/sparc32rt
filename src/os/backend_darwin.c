@@ -491,6 +491,59 @@ int rt_host_protect(void *host_addr, size_t len, int linux_prot)
 #endif
 }
 
+/* msync/madvise for the madvise(75)/msync(65) dispatch in
+ * src/os/syscalls_min.c (same unsuffixed names as backend_linux.c, so
+ * the Darwin link closes). Linux MS_SYNC(4)/MS_ASYNC(1)/MS_INVALIDATE(2)
+ * translate to Darwin MS_SYNC(0x10)/MS_ASYNC(1)/MS_INVALIDATE(2);
+ * Linux advice passes through where the numbers coincide (0..4 benign
+ * set) and the kernel rejects the rest, matching Linux EINVAL. */
+int rt_host_msync(void *host_addr, size_t len, int linux_flags)
+{
+#if defined(__APPLE__)
+    int flags = 0;
+    if (host_addr == NULL || len == 0u) {
+        return -EINVAL;
+    }
+    if ((linux_flags & 0x04) != 0) {
+        flags |= MS_SYNC;
+    } else if ((linux_flags & 0x01) != 0) {
+        flags |= MS_ASYNC;
+    } else {
+        flags |= MS_SYNC;
+    }
+    if ((linux_flags & 0x02) != 0) {
+        flags |= MS_INVALIDATE;
+    }
+    if (msync(host_addr, len, flags) != 0) {
+        return -errno;
+    }
+    return 0;
+#else
+    (void)host_addr;
+    (void)len;
+    (void)linux_flags;
+    return -ENOSYS;
+#endif
+}
+
+int rt_host_madvise(void *host_addr, size_t len, int linux_advice)
+{
+#if defined(__APPLE__)
+    if (host_addr == NULL || len == 0u) {
+        return -EINVAL;
+    }
+    if (madvise(host_addr, len, linux_advice) != 0) {
+        return -errno;
+    }
+    return 0;
+#else
+    (void)host_addr;
+    (void)len;
+    (void)linux_advice;
+    return -ENOSYS;
+#endif
+}
+
 /* Host entropy: getentropy(2) caps one call at 256 bytes and takes no
  * flags (always non-blocking); drain in chunks. */
 int64_t rt_host_getrandom(void *buf, size_t buflen, unsigned int flags)
