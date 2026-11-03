@@ -282,7 +282,8 @@ int sparc32_emit_alu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     if (d->cc != 0u) {
         /* commit_flags preserves host NZCV (MOV/CSET/ORR/LSL/BIC/STR
          * only), so the cc kind stays live for a following Bicc. */
-        if (d->op3 >= 0x11U && d->op3 <= 0x17U) {
+        if ((d->op3 >= 0x11U && d->op3 <= 0x13U) ||
+            (d->op3 >= 0x15U && d->op3 <= 0x17U)) {
             /* S32-R8-5: logic-cc leaves host C,V unchanged (ANDS/TST
              * LSL #0 keeps the shifter carry); the oracle clears both
              * (interp.c), so scrub them before the commit. */
