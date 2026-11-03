@@ -279,23 +279,41 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
  * interp_poll_async (interp step / syscall boundary), consulting the
  * merged per-thread + process-global mask. */
 
-/* Async frame build: same frozen 344 B + 136 B FPU layout as the sync path;
- * only si_code/si_addr differ (SI_USER(0)/0: sent, not faulted). */
-static bool interp_async_build(sparc32_ctx_t *ctx, int signo, uint32_t *frame)
-{
+/* Validated one-time snapshot of a caught signal's action (S32-R5-6): taken
+ * once before frame construction and shared by the build and the commit, so
+ * a concurrent sigaction change cannot mix handler/restorer/flags/sa_mask
+ * from two dispositions, and the commit never re-fetches unchecked. */
+struct interp_sig_action {
     uint32_t handler;
     uint32_t restorer;
-    uint32_t flags = 0U;
+    uint32_t flags;
+    uint64_t sa_mask;
+};
+
+static bool interp_sig_snapshot(int signo, struct interp_sig_action *out)
+{
+    if (out == NULL || signo < 1 || signo > 64) {
+        return false;
+    }
+    return sparc32_signal_get_action(signo, &out->handler, &out->restorer,
+        &out->flags, &out->sa_mask) == 0;
+}
+
+/* Async frame build: same frozen 344 B + 136 B FPU layout as the sync path;
+ * only si_code/si_addr differ (SI_USER(0)/0: sent, not faulted). Uses the
+ * validated snapshot (S32-R5-6) instead of fetching the action again. */
+static bool interp_async_build(sparc32_ctx_t *ctx, int signo,
+    const struct interp_sig_action *act, uint32_t *frame)
+{
+    uint32_t flags;
     uint64_t old_mask;
     uint32_t fr;
     uint32_t fpu_va;
     int i;
-    if (ctx == NULL || signo < 1 || signo > 64) {
+    if (ctx == NULL || act == NULL || signo < 1 || signo > 64) {
         return false;
     }
-    if (sparc32_signal_get_full(signo, &handler, &restorer, &flags) != 0) {
-        return false;
-    }
+    flags = act->flags;
     fr = (interp_delivery_sp(ctx, flags) -
         (SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE)) & ~15U;
     fpu_va = fr + SPARC32_RT_SIGFRAME_SIZE;
@@ -405,38 +423,58 @@ static bool interp_async_build(sparc32_ctx_t *ctx, int signo, uint32_t *frame)
     return true;
 }
 
-static void interp_async_commit(sparc32_ctx_t *ctx, int signo, uint32_t frame)
+/* Commit a built async frame with the validated snapshot (S32-R5-6).
+ * from_process (S32-R5-4) records which queue the signal was dequeued from:
+ * a thread-directed delivery consumes only the thread pending bit, while a
+ * process-directed delivery (already single-winner-claimed by the caller)
+ * leaves the thread bit alone so a same-numbered thread signal survives. */
+static void interp_async_commit(sparc32_ctx_t *ctx, int signo, uint32_t frame,
+    const struct interp_sig_action *act, bool from_process)
 {
-    uint32_t handler;
-    uint32_t restorer;
-    uint32_t flags = 0U;
-    uint64_t sa_mask = 0ULL;
     uint64_t bit = 1ULL << (uint64_t)((uint32_t)(signo - 1) % 32U);
     if ((uint32_t)signo <= 32U) {
         bit <<= 32U;
     }
-    __atomic_fetch_and(&ctx->pending_signals, ~bit, __ATOMIC_ACQ_REL);
-    (void)sparc32_signal_get_action(signo, &handler, &restorer, &flags,
-        &sa_mask);
-    interp_apply_delivery_mask(ctx, signo, flags, sa_mask);
+    if (!from_process) {
+        __atomic_fetch_and(&ctx->pending_signals, ~bit, __ATOMIC_ACQ_REL);
+    }
+    interp_apply_delivery_mask(ctx, signo, act->flags, act->sa_mask);
     ctx->r[SPARC32_SP] = frame;
     ctx->r[SPARC32_O0] = (uint32_t)signo;
     ctx->r[SPARC32_O1] = frame + 0x60U;
     ctx->r[SPARC32_O2] = frame + 0xe0U;
-    ctx->r[SPARC32_O7] = restorer;
-    ctx->pc = handler;
-    ctx->npc = handler + 4U;
+    ctx->r[SPARC32_O7] = act->restorer;
+    ctx->pc = act->handler;
+    ctx->npc = act->handler + 4U;
     ctx->sig_last_frame_va = frame;
     ctx->exit_reason = SPARC32_EXIT_NONE;
 }
 
 bool interp_try_deliver_async(sparc32_ctx_t *ctx, int signo)
 {
+    struct interp_sig_action act;
     uint32_t frame;
-    if (!interp_async_build(ctx, signo, &frame)) {
+    if (!interp_sig_snapshot(signo, &act)) {
         return false;
     }
-    interp_async_commit(ctx, signo, frame);
+    if (!interp_async_build(ctx, signo, &act, &frame)) {
+        return false;
+    }
+    interp_async_commit(ctx, signo, frame, &act, false);
+    return true;
+}
+
+bool interp_try_deliver_async_process(sparc32_ctx_t *ctx, int signo)
+{
+    struct interp_sig_action act;
+    uint32_t frame;
+    if (!interp_sig_snapshot(signo, &act)) {
+        return false;
+    }
+    if (!interp_async_build(ctx, signo, &act, &frame)) {
+        return false;
+    }
+    interp_async_commit(ctx, signo, frame, &act, true);
     return true;
 }
 
@@ -445,21 +483,22 @@ bool interp_try_deliver_async(sparc32_ctx_t *ctx, int signo)
  * (npc/npc+4) together with %o0=EINTR (4) and PSR.C=1 for sigreturn
  * restore, while live ctx enters the handler directly with %o0=signo,
  * pc=handler, and npc=handler+4 (S32-R2-11). */
-bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
-    bool carry)
+static bool interp_deliver_syscall_source(sparc32_ctx_t *ctx, int signo,
+    bool carry, bool from_process)
 {
+    struct interp_sig_action act;
     uint32_t frame;
-    uint32_t handler;
-    uint32_t restorer;
-    uint32_t flags = 0U;
-    uint64_t sa_mask = 0ULL;
     uint32_t resume;
-    uint64_t bit = 1ULL << (uint64_t)((uint32_t)(signo - 1) % 32U);
-    if ((uint32_t)signo <= 32U) {
-        bit <<= 32U;
+    if (ctx == NULL) {
+        return false;
+    }
+    /* Snapshot once up front (S32-R5-6): a failed snapshot means the
+     * disposition raced away, so there is nothing to deliver. */
+    if (!interp_sig_snapshot(signo, &act)) {
+        return false;
     }
     resume = ctx->npc;
-    if (!interp_async_build(ctx, signo, &frame)) {
+    if (!interp_async_build(ctx, signo, &act, &frame)) {
         return false;
     }
     if (!interp_st_be(ctx, frame + 0xe4U, 4U, resume)) {
@@ -468,12 +507,16 @@ bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
     if (!interp_st_be(ctx, frame + 0xe8U, 4U, resume + 4U)) {
         return false;
     }
-    /* Mirror the resume point into the sigreturn compat slots too. */
-    if (!interp_st_be(ctx, frame + 100U, 4U, resume)) {
-        return false;
-    }
-    if (!interp_st_be(ctx, frame + 104U, 4U, resume + 4U)) {
-        return false;
+    /* Mirror the resume point into the sigreturn compat slots too, but only
+     * for old-style handlers (S32-R5-7): under SA_SIGINFO offsets 100/104
+     * carry si_errno/si_code and must not be clobbered. */
+    if ((act.flags & SPARC32_SA_SIGINFO) == 0U) {
+        if (!interp_st_be(ctx, frame + 100U, 4U, resume)) {
+            return false;
+        }
+        if (!interp_st_be(ctx, frame + 104U, 4U, resume + 4U)) {
+            return false;
+        }
     }
     {
         uint32_t psr = ctx->psr & ~SPARC32_PSR_C;
@@ -487,20 +530,20 @@ bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
             return false;
         }
     }
-    __atomic_fetch_and(&ctx->pending_signals, ~bit, __ATOMIC_ACQ_REL);
-    (void)sparc32_signal_get_action(signo, &handler, &restorer, &flags,
-        &sa_mask);
-    interp_apply_delivery_mask(ctx, signo, flags, sa_mask);
-    ctx->r[SPARC32_SP] = frame;
-    ctx->r[SPARC32_O0] = (uint32_t)signo;
-    ctx->r[SPARC32_O1] = frame + 0x60U;
-    ctx->r[SPARC32_O2] = frame + 0xe0U;
-    ctx->r[SPARC32_O7] = restorer;
-    ctx->pc = handler;
-    ctx->npc = handler + 4U;
-    ctx->sig_last_frame_va = frame;
-    ctx->exit_reason = SPARC32_EXIT_NONE;
+    interp_async_commit(ctx, signo, frame, &act, from_process);
     return true;
+}
+
+bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
+    bool carry)
+{
+    return interp_deliver_syscall_source(ctx, signo, carry, false);
+}
+
+bool interp_deliver_async_for_syscall_process(sparc32_ctx_t *ctx, int signo,
+    bool carry)
+{
+    return interp_deliver_syscall_source(ctx, signo, carry, true);
 }
 
 /* Default-terminate set (S32-R4-5): SPARC signals whose Linux default
@@ -607,9 +650,10 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
             continue;
         }
         /* Process-directed delivery is independent of thread queues
-         * (S32-R4-6): never discard a claimed bit just because another
-         * thread holds the same signal pending. */
-        return interp_try_deliver_async(ctx, s);
+         * (S32-R4-6, S32-R5-4): never discard a claimed bit just because
+         * another thread holds the same signal pending, and never clear
+         * the thread bit for a process-queued signal. */
+        return interp_try_deliver_async_process(ctx, s);
     }
     return false;
 }
@@ -622,27 +666,77 @@ static bool sparc32_fault_insn_word(const sparc32_ctx_t *ctx, uint32_t va,
     uint32_t *out)
 {
     const uint8_t *p;
-    if (out == NULL || !interp_range_ok(ctx, va, 4U, 1U)) {
+    uint32_t word;
+    bool ok;
+    if (out == NULL) {
         return false;
     }
-    p = (const uint8_t *)sparc32_guest_ptr(ctx, va);
-    *out = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-    return true;
+    /* Hold the VM gate across the cover check and the word load (S32-R5-3):
+     * a concurrent munmap/mprotect must not retire the code page between
+     * validation and dereference. */
+    sparc32_vm_access_enter();
+    ok = interp_range_ok(ctx, va, 4U, 1U);
+    if (ok) {
+        p = (const uint8_t *)sparc32_guest_ptr(ctx, va);
+        word = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+            ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+        *out = word;
+    }
+    sparc32_vm_access_leave();
+    return ok;
+}
+
+/* Required access width of a faulting load/store (S32-R5-2, V8 widths):
+ * 1 for byte ops, 2 for halfword ops, 4 for word/single-FP/RMW ops, 8 for
+ * doubleword ops (integer LDD/STD/LDDA/STDA and FP LDDF/STDF, which both
+ * engines fault on (addr & 7) per S32-R5-1). Raw V8 op3 values are used so
+ * byte/halfword alternates need no new decoder symbols. */
+static uint32_t sparc32_fault_req_align(uint32_t op, uint32_t op3)
+{
+    if (op != 3U) {
+        return 4U;
+    }
+    switch (op3) {
+    case 0x01U: /* LDUB */
+    case 0x09U: /* LDSB */
+    case 0x05U: /* STB */
+    case 0x0DU: /* LDSTUB */
+    case 0x11U: /* LDUBA */
+    case 0x19U: /* LDSBA */
+    case 0x15U: /* STBA */
+    case 0x1DU: /* LDSTUBA */
+        return 1U;
+    case 0x02U: /* LDUH */
+    case 0x0AU: /* LDSH */
+    case 0x06U: /* STH */
+    case 0x12U: /* LDUHA */
+    case 0x1AU: /* LDSHA */
+    case 0x16U: /* STHA */
+        return 2U;
+    case 0x03U: /* LDD */
+    case 0x07U: /* STD */
+    case 0x13U: /* LDDA */
+    case 0x17U: /* STDA */
+    case 0x23U: /* LDDF */
+    case 0x27U: /* STDF */
+        return 8U;
+    default:
+        return 4U;
+    }
 }
 
 /*
- * Fault -> signal classification (RC-U3-r2 #2, S32-11). Both engines report
- * alignment violations as EXIT_FAULT with fault_addr = VA, but
- * (fault_addr & 3) alone cannot see a 4-byte-aligned, 8-byte-misaligned
- * LDD/STD: that fault MUST deliver SIGBUS (10, BUS_ADRALN), never
- * SIGSEGV (11). Decode the faulting instruction (resolving one CTI
+ * Fault -> signal classification (RC-U3-r2 #2, S32-11, S32-R5-1, S32-R5-2).
+ * Both engines report alignment violations as EXIT_FAULT with
+ * fault_addr = VA. Decode the faulting instruction FIRST (resolving one CTI
  * delay slot, since a faulting delay reports pc at the transfer for
- * JMPL but at the CTI for the other CTI classes) and report SIGBUS
- * only when a doubleword access (LDD/STD/LDDA/STDA) faulted on
- * (va & 7). FP LDDF/STDF are excluded on purpose: the interpreter
- * faults those only as 4-byte halves, so their 4-mod-8 faults are
- * mapping faults (SIGSEGV). Undecodable PCs keep the old heuristic.
+ * JMPL but at the CTI for the other CTI classes) to learn its required
+ * access width, then report SIGBUS (10, BUS_ADRALN) only when
+ * (va & (width - 1)) != 0; otherwise the fault is a mapping fault and
+ * delivers SIGSEGV (11). In particular a 4-byte-aligned, 8-byte-misaligned
+ * LDD/STD/LDDA/STDA/LDDF/STDF fault delivers SIGBUS, while an unmapped
+ * byte access (LDSB/LDUB/STB) at an odd address or an aligned halfword
+ * fault delivers SIGSEGV. Undecodable PCs report SIGSEGV.
  */
 int sparc32_classify_fault(const sparc32_ctx_t *ctx)
 {
@@ -651,13 +745,8 @@ int sparc32_classify_fault(const sparc32_ctx_t *ctx)
     uint32_t word;
     sparc32_decoded_t d;
     unsigned depth;
-    if ((va & 3U) != 0U) {
-        return 10;
-    }
-    if ((va & 7U) == 0U) {
-        return 11;
-    }
     for (depth = 0U; depth < 2U; depth++) {
+        uint32_t width;
         if (!sparc32_fault_insn_word(ctx, pc, &word)) {
             return 11;
         }
@@ -670,12 +759,8 @@ int sparc32_classify_fault(const sparc32_ctx_t *ctx)
             pc += 4U;
             continue;
         }
-        if (d.op == 3U &&
-            (d.op3 == SPARC32_OP3_LDD || d.op3 == SPARC32_OP3_STD ||
-             d.op3 == SPARC32_OP3_LDDA || d.op3 == SPARC32_OP3_STDA)) {
-            return 10;
-        }
-        return 11;
+        width = sparc32_fault_req_align(d.op, d.op3);
+        return ((va & (width - 1U)) != 0U) ? 10 : 11;
     }
     return 11;
 }

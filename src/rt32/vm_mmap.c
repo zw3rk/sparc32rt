@@ -69,10 +69,16 @@ static void vm_mmap_publish(sparc32_ctx_t *ctx, uint32_t start, uint32_t end,
     }
 }
 
+/* File-tracking range retirement (src/vm/vm_file.c). */
+extern void vm_file_unregister_range(uint32_t gva, uint32_t len);
+extern void vm_file_reset(void);
+
 /* Record a file-backed mapping in the Provider-A family table (RC-U3-r2
  * #4): fstat the host fd for its (dev, ino) identity so later
- * truncate/write hooks can match the mapping. Size is kept (UINT64_MAX)
- * here; only identity registration and the code-generation clock move. */
+ * truncate/write hooks can match the mapping. The range is registered
+ * BEFORE the size is recorded (S32-R5-8) so the fresh entry observes the
+ * initial file size; the reverse order would leave it at 0 and the first
+ * post-mmap ftruncate shrink would compare against 0 instead. */
 static void vm_mmap_note_file(int host_fd, uint32_t map_gva,
     uint32_t map_pages, uint64_t map_off)
 {
@@ -80,10 +86,10 @@ static void vm_mmap_note_file(int host_fd, uint32_t map_gva,
     if (host_fd < 0 || fstat(host_fd, &st) != 0) {
         return;
     }
-    vm_file_note_mutation((uint64_t)st.st_dev, (uint64_t)st.st_ino,
-        host_fd, (uint64_t)st.st_size);
     vm_file_note_mapping((uint64_t)st.st_dev, (uint64_t)st.st_ino,
         host_fd, map_gva, map_pages, map_off);
+    vm_file_note_mutation((uint64_t)st.st_dev, (uint64_t)st.st_ino,
+        host_fd, (uint64_t)st.st_size);
 }
 
 static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t prot,
@@ -124,6 +130,11 @@ static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
         if ((flags & RT32_MAP_FIXED_NOREPLACE) != 0U &&
             vm_range_overlaps_locked(addr, (uint32_t)((uint64_t)addr + aligned_len))) {
             return (uint32_t)(-EEXIST);
+        }
+        /* MAP_FIXED replaces whatever lived here (S32-R5-9): retire the
+         * overwritten file-tracking range before the host mapping lands. */
+        if ((flags & RT32_MAP_FIXED_NOREPLACE) == 0U) {
+            vm_file_unregister_range(addr, (uint32_t)aligned_len);
         }
         target_va = addr;
     } else {
@@ -385,6 +396,9 @@ int vm_munmap_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len)
     vm_mmap_ensure_regime(ctx);
     vm_mmap_publish(ctx, start, end, 0U, 0U);
 
+    /* Retire the unmapped file-tracking range (S32-R5-9) so later shrinks
+     * skip it and its table slot is recycled. */
+    vm_file_unregister_range(start, end - start);
     vm_unmap_regions_pub(start, end);
     if (g_vm_mmap_cursor == end && start >= RT32_MMAP_BASE_32) {
         g_vm_mmap_cursor = start;
@@ -689,6 +703,9 @@ void rt32_vm_reset_for_exec(sparc32_ctx_t *ctx)
                (size_t)(RT32_WINDOW_SIZE - (uint64_t)SPARC32_LOW_GUARD_SIZE),
                PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     vm32_reset();
+    /* The old address space is gone (S32-R5-9): retire every file-tracking
+     * record with it so no stale mapping survives into the new image. */
+    vm_file_reset();
     vm_invalidate_jit_locked(ctx, SPARC32_LOW_GUARD_SIZE, 0xFFFFFFFFU);
     vm_lock_release();
 

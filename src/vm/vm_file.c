@@ -1,29 +1,18 @@
 /*
- * src/vm/vm_file.c — Provider A: in-place non-relocating COW & family
- * inode table (Wave U3, lane U3-sparc32)
+ * src/vm/vm_file.c — Provider-A file-tracking table (Wave U3, lane U3-sparc32)
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Implements UNIFICATION-PLAN.md Rev 4 section 5.1 for sparc32rt. Every
- * guest page keeps its fixed canonical arena address HVA = G + gva, so
- * sibling CLONE_VM threads, futex keys, and fork() children never
- * observe a relocation:
- *
- * - H == 4096: MAP_PRIVATE file pages map natively at HVA with
- *   PAGE_COW_CLEAN; the first write lets the kernel COW in place and
- *   this unit flips the page PAGE_COW_CLEAN -> PAGE_COW_DIRTY without
- *   changing HVA or addend.
- * - H > 4096: file pages keep MAP_PRIVATE|MAP_ANONYMOUS arena backing
- *   at HVA, populated by pread64 at mmap time; the first write only
- *   flips the state bit in place.
- * - MAP_SHARED mappings use direct MAP_SHARED|MAP_FIXED when
- *   (gva ^ file_offset) is host-page aligned, else a family-shared
- *   backing page synced back on msync/write/ftruncate/munmap.
- * - The family inode table (keyed by (st_dev, st_ino), MAP_SHARED so it
- *   survives fork()) tracks file_size / resize_seq /
- *   min_shrunk_size_since_epoch / code_generation with ordered
- *   shrink-then-regrow discard and complete mutation-hook coverage.
+ * Implements a process-local table of guest file mappings for shrink and
+ * mutation handling. Each mmap of a file registers one entry keyed by
+ * ((st_dev, st_ino), map_gva) holding the guest range, the backing file
+ * offset, and the tracked file_size / resize_seq / code_generation
+ * clocks. Host truncate/write hooks (vm_file_note_mutation) bump the
+ * clocks and revert pages that fall beyond a shrunk EOF to clean.
+ * munmap, MAP_FIXED replacement, mremap source retirement, and exec
+ * reset retire entries via vm_file_unregister_range / vm_file_reset so
+ * unmapped records are skipped by later hooks and their slots recycled.
  *
  * No AArch64 assembly in this unit.
  */
@@ -40,20 +29,6 @@
 #include "sparc32rt.h"
 #include "os/backend.h"
 #include "dbt/aot/mem_site.h"
-
-/* Page-state aliases (canonical bits live in mem_site.h). */
-#define VMF_COW_CLEAN RT_PAGE_COW_CLEAN
-#define VMF_COW_DIRTY RT_PAGE_COW_DIRTY
-
-/* File-backed page descriptor (per 4 KiB guest page, dense table). */
-typedef struct {
-    uint64_t inode_key; /* (st_dev ^ st_ino) identity, 0 = anonymous */
-    uint64_t file_offset; /* Backing offset of this page */
-    uint8_t state; /* RT_PAGE_* bits */
-    uint8_t shared; /* 1 = MAP_SHARED, 0 = private/anonymous */
-    uint8_t present; /* 1 = mapped at HVA */
-    uint8_t reserved;
-} vm_file_page_t;
 
 /* Family-shared inode entry (section 5.1.3; MAP_SHARED in full impl). */
 #define VMF_MAX_INODES 128u
@@ -83,17 +58,28 @@ static uint64_t vmf_key(uint64_t dev, uint64_t ino)
     return (dev * 1469598103934665603ULL) ^ (ino + 1099511628211ULL);
 }
 
-/* Intern by (inode key, mapped gva): a second mmap of the same file at a
- * different gva allocates a separate entry rather than overwriting the
- * earlier mapping's range (RC-U3-r5), so shrink handling reaches every
- * mapping of the inode. */
-static vm_inode_shared_t *vmf_intern(uint64_t key, int host_fd,
+/* Allocate a table slot, recycling a retired entry first (S32-R5-9) so
+ * the 128-entry table is not permanently exhausted by churn. */
+static vm_inode_shared_t *vmf_alloc(uint64_t key, int host_fd,
     uint32_t map_gva)
 {
     uint64_t i;
     for (i = 0u; i < g_inode_count; i++) {
-        if (g_inodes[i].live && g_inodes[i].inode_key == key &&
-            g_inodes[i].map_gva == map_gva) {
+        if (!g_inodes[i].live) {
+            g_inodes[i].inode_key = key;
+            g_inodes[i].host_fd = host_fd;
+            g_inodes[i].live = true;
+            g_inodes[i].map_gva = map_gva;
+            g_inodes[i].map_pages = 0u;
+            g_inodes[i].map_off = 0u;
+            atomic_store_explicit(&g_inodes[i].file_size, 0u,
+                memory_order_relaxed);
+            atomic_store_explicit(&g_inodes[i].resize_seq, 0u,
+                memory_order_relaxed);
+            atomic_store_explicit(&g_inodes[i].min_shrunk, 0u,
+                memory_order_relaxed);
+            atomic_store_explicit(&g_inodes[i].code_generation, 1u,
+                memory_order_relaxed);
             return &g_inodes[i];
         }
     }
@@ -117,48 +103,21 @@ static vm_inode_shared_t *vmf_intern(uint64_t key, int host_fd,
     return &g_inodes[g_inode_count++];
 }
 
-/*
- * Promote PAGE_COW_CLEAN -> PAGE_COW_DIRTY in place at the same HVA
- * (section 5.1.1). HVA and the Soft-TLB addend never change, so warm
- * sibling read_tags, futex keys, and linear G+gva spans stay coherent.
- * Returns the page state after promotion.
- */
-uint32_t vm_file_promote_cow(vm_file_page_t *page)
+/* Intern by (inode key, mapped gva): a second mmap of the same file at a
+ * different gva allocates a separate entry rather than overwriting the
+ * earlier mapping's range (RC-U3-r5), so shrink handling reaches every
+ * mapping of the inode. */
+static vm_inode_shared_t *vmf_intern(uint64_t key, int host_fd,
+    uint32_t map_gva)
 {
-    if (page == NULL || page->present == 0u) {
-        return 0u;
-    }
-    page->state &= (uint8_t)~VMF_COW_CLEAN;
-    page->state |= (uint8_t)VMF_COW_DIRTY;
-    return (uint32_t)page->state;
-}
-
-/*
- * Ordered shrink-then-regrow discard (section 5.1.3): pages wholly at or
- * past the shrunk size revert CLEAN (refilled from the file on next
- * fault); the partial tail page keeps its DIRTY bytes. Returns the
- * number of pages discarded.
- */
-uint32_t vm_file_apply_shrink(vm_file_page_t *pages, uint32_t page_count,
-    uint32_t page_shift, uint64_t shrunk_size)
-{
-    uint32_t i;
-    uint32_t dropped = 0u;
-    if (pages == NULL) {
-        return 0u;
-    }
-    for (i = 0u; i < page_count; i++) {
-        uint64_t page_end = ((uint64_t)i + 1u) << page_shift;
-        if (page_end <= shrunk_size) {
-            continue;
-        }
-        if (((uint64_t)i << page_shift) >= shrunk_size) {
-            pages[i].state &= (uint8_t)~VMF_COW_DIRTY;
-            pages[i].state |= (uint8_t)VMF_COW_CLEAN;
-            dropped++;
+    uint64_t i;
+    for (i = 0u; i < g_inode_count; i++) {
+        if (g_inodes[i].live && g_inodes[i].inode_key == key &&
+            g_inodes[i].map_gva == map_gva) {
+            return &g_inodes[i];
         }
     }
-    return dropped;
+    return vmf_alloc(key, host_fd, map_gva);
 }
 
 /*
@@ -244,26 +203,97 @@ void vm_file_note_mutation(uint64_t dev, uint64_t ino, int host_fd,
     }
 }
 
-/* Current code generation for an inode (SMC/mutation invalidation). */
-uint64_t vm_file_generation(uint64_t dev, uint64_t ino)
+/* Retire (part of) a guest range from the file-tracking table (S32-R5-9).
+ * Called on munmap, MAP_FIXED replacement, and mremap source retirement so
+ * later mutation hooks skip unmapped records and vmf_alloc recycles their
+ * slots. Full coverage retires the entry; partial coverage trims it; a
+ * hole in the middle splits the tail into a recycled slot when one is
+ * free (otherwise the tail tracking is dropped). */
+void vm_file_unregister_range(uint32_t gva, uint32_t len)
 {
+    uint32_t start = gva & ~(uint32_t)4095U;
+    uint64_t end64 = (uint64_t)gva + (uint64_t)len;
+    uint32_t end;
     uint64_t i;
-    uint64_t key = vmf_key(dev, ino);
-    for (i = 0u; i < g_inode_count; i++) {
-        if (g_inodes[i].live && g_inodes[i].inode_key == key) {
-            return atomic_load_explicit(&g_inodes[i].code_generation,
+    if (len == 0U) {
+        return;
+    }
+    end = (uint32_t)((end64 + 4095ULL) & ~4095ULL);
+    if (end <= start) {
+        return;
+    }
+    for (i = 0u; i < (uint64_t)VMF_MAX_INODES; i++) {
+        vm_inode_shared_t *e = &g_inodes[i];
+        uint32_t elo;
+        uint32_t ehi;
+        if (!e->live || e->map_pages == 0u) {
+            continue;
+        }
+        elo = e->map_gva;
+        ehi = elo + e->map_pages * 4096U;
+        if (ehi <= start || elo >= end) {
+            continue;
+        }
+        if (start <= elo && end >= ehi) {
+            e->live = false;
+            e->map_pages = 0u;
+            continue;
+        }
+        if (start <= elo) {
+            uint32_t drop = (end - elo) / 4096U;
+            e->map_gva += drop * 4096U;
+            e->map_off += (uint64_t)drop * 4096ULL;
+            e->map_pages -= drop;
+            if (e->map_pages == 0u) {
+                e->live = false;
+            }
+            continue;
+        }
+        if (end >= ehi) {
+            e->map_pages = (start - elo) / 4096U;
+            if (e->map_pages == 0u) {
+                e->live = false;
+            }
+            continue;
+        }
+        {
+            uint32_t front_pages = (start - elo) / 4096U;
+            uint32_t tail_gva = end;
+            uint32_t tail_pages = (ehi - end) / 4096U;
+            uint64_t tail_off = e->map_off + (uint64_t)(end - elo);
+            vm_inode_shared_t *t;
+            e->map_pages = front_pages;
+            t = vmf_alloc(e->inode_key, e->host_fd, tail_gva);
+            if (t == NULL) {
+                continue;
+            }
+            t->map_pages = tail_pages;
+            t->map_off = tail_off;
+            atomic_store_explicit(&t->file_size,
+                atomic_load_explicit(&e->file_size, memory_order_relaxed),
+                memory_order_relaxed);
+            atomic_store_explicit(&t->resize_seq,
+                atomic_load_explicit(&e->resize_seq, memory_order_relaxed),
+                memory_order_relaxed);
+            atomic_store_explicit(&t->min_shrunk,
+                atomic_load_explicit(&e->min_shrunk, memory_order_relaxed),
+                memory_order_relaxed);
+            atomic_store_explicit(&t->code_generation,
+                atomic_load_explicit(&e->code_generation,
+                    memory_order_relaxed),
                 memory_order_relaxed);
         }
     }
-    return 0u;
 }
 
-/*
- * MAP_SHARED alignment probe (section 5.1.2): direct MAP_SHARED|MAP_FIXED
- * at HVA is valid iff (gva ^ file_offset) is host-page aligned.
- */
-bool vm_file_shared_direct_ok(uint32_t gva, uint64_t file_offset)
+/* Retire every file-tracking record (S32-R5-9): exec reset destroys the
+ * whole address space, so no mapping survives into the new image. */
+void vm_file_reset(void)
 {
-    size_t host_page = rt_host_page_size();
-    return ((uint64_t)gva ^ file_offset) % (uint64_t)host_page == 0u;
+    uint64_t i;
+    for (i = 0u; i < (uint64_t)VMF_MAX_INODES; i++) {
+        g_inodes[i].live = false;
+        g_inodes[i].map_pages = 0u;
+    }
+    g_inode_count = 0u;
 }

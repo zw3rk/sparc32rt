@@ -62,12 +62,20 @@ static struct futex_emu_slot *futex_emu_find(uint32_t uaddr, int create)
 {
     unsigned i;
     struct futex_emu_slot *free_slot = 0;
+    struct futex_emu_slot *idle_slot = 0;
     for (i = 0U; i < FUTEX_EMU_SLOTS; i++) {
-        if (futex_emu_slots[i].in_use &&
-            futex_emu_slots[i].uaddr == uaddr) {
-            return &futex_emu_slots[i];
+        if (futex_emu_slots[i].in_use) {
+            if (futex_emu_slots[i].uaddr == uaddr) {
+                return &futex_emu_slots[i];
+            }
+            /* A live slot with no waiters holds no state worth keeping
+             * (S32-R5-10): it is recyclable once the free list runs out. */
+            if (futex_emu_slots[i].waiters == 0 && idle_slot == 0) {
+                idle_slot = &futex_emu_slots[i];
+            }
+            continue;
         }
-        if (!futex_emu_slots[i].in_use && free_slot == 0) {
+        if (free_slot == 0) {
             free_slot = &futex_emu_slots[i];
         }
     }
@@ -80,6 +88,14 @@ static struct futex_emu_slot *futex_emu_find(uint32_t uaddr, int create)
         free_slot->uaddr = uaddr;
         free_slot->waiters = 0;
         return free_slot;
+    }
+    /* Table full but an idle slot exists: recycle it for the new address
+     * instead of permanently exhausting the table after 64 distinct
+     * addresses. The condvar stays valid; nobody waits on it. */
+    if (create && idle_slot != 0) {
+        idle_slot->uaddr = uaddr;
+        idle_slot->waiters = 0;
+        return idle_slot;
     }
     return 0;
 }

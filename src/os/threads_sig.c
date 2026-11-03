@@ -16,12 +16,19 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include "sparc32rt.h"
 #include "interp/interp_priv.h"
 #include "os/l2a_access.h"
 #include "os/syscalls_min.h"
 #include "os/threads.h"
+
+/* Process-queue variant of the sigsuspend delivery helper (defined in
+ * src/interp/interp_signal.c alongside interp_deliver_async_for_syscall):
+ * declared here so the frozen threads.h need not change. */
+bool interp_deliver_async_for_syscall_process(sparc32_ctx_t *ctx, int signo,
+    bool carry);
 
 /* rt_sigpending(104): kernel-layout BE quad (signals 1..32 in the high
  * word). sigsetsize must be 8 (E05 rule). Reports the thread bits plus
@@ -46,6 +53,40 @@ long sparc32_thr_rt_sigpending(sparc32_ctx_t *ctx, uint32_t set_va,
         return (long)l2a_store(ctx, set_va, out, sizeof(out));
     }
     return 0;
+}
+
+/* Default-action sets for DFL disposition routing in rt_sigsuspend
+ * (S32-R5-5): fatal-default signals terminate, ignore-default signals
+ * (URG/CHLD/WINCH/CONT) are discarded, and stop-default signals stay
+ * queued for normal polling. Mirrors interp_dfl_terminates. */
+static bool thr_sig_dfl_terminates(int sig)
+{
+    switch (sig) {
+    case 16:
+    case 17:
+    case 18:
+    case 19:
+    case 20:
+    case 21:
+    case 22:
+    case 28:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static bool thr_sig_dfl_ignores(int sig)
+{
+    switch (sig) {
+    case 16:
+    case 19:
+    case 20:
+    case 28:
+        return true;
+    default:
+        return false;
+    }
 }
 
 /* rt_sigsuspend(107): replace mask, sleep for an unblocked pending
@@ -82,7 +123,9 @@ long sparc32_thr_rt_sigsuspend(sparc32_ctx_t *ctx, uint32_t set_va,
     sigemptyset(&wait_host_set);
     (void)sigprocmask(SIG_SETMASK, &block_set, &old_host_set);
     for (;;) {
-        /* Phase 1: own thread bits (S32-R3-7). */
+        /* Phase 1: own thread bits (S32-R3-7). Thread-directed delivery
+         * consumes only the thread bit (S32-R5-4): the process word is
+         * never claimed or cleared here. */
         for (s = 1; s <= 64; s++) {
             uint64_t bit = 1ULL << (uint64_t)((uint32_t)(s - 1) % 32U);
             uint32_t handler;
@@ -98,13 +141,31 @@ long sparc32_thr_rt_sigsuspend(sparc32_ctx_t *ctx, uint32_t set_va,
                 continue;
             }
             if (sparc32_signal_get(s, &handler, &restorer) != 0) {
+                /* No handler installed (S32-R5-5): only SIG_IGN and
+                 * ignore-default DFL are discarded. Fatal-default DFL
+                 * terminates like the kernel would; stop-default DFL
+                 * stays queued for normal polling. */
+                if (sparc32_signal_disposition(s) ==
+                        SPARC32_SIG_DISP_DFL &&
+                    thr_sig_dfl_terminates(s)) {
+                    sparc32_l2a_set_blocked_mask(ctx, old);
+                    (void)sigprocmask(SIG_SETMASK, &old_host_set, NULL);
+                    (void)kill(getpid(), sparc32_sig_to_host(s));
+                    return -EINTR;
+                }
+                if (sparc32_signal_disposition(s) ==
+                        SPARC32_SIG_DISP_DFL &&
+                    !thr_sig_dfl_ignores(s)) {
+                    sparc32_l2a_set_blocked_mask(ctx, old);
+                    (void)sigprocmask(SIG_SETMASK, &old_host_set, NULL);
+                    return -EINTR;
+                }
                 __atomic_fetch_and(&ctx->pending_signals, ~bit,
                     __ATOMIC_ACQ_REL);
                 continue;
             }
             sparc32_l2a_set_blocked_mask(ctx, old);
             (void)sigprocmask(SIG_SETMASK, &old_host_set, NULL);
-            (void)sparc32_thr_claim_global(s);
             if (!interp_deliver_async_for_syscall(ctx, s, true)) {
                 __atomic_fetch_and(&ctx->pending_signals, ~bit,
                     __ATOMIC_ACQ_REL);
@@ -112,26 +173,50 @@ long sparc32_thr_rt_sigsuspend(sparc32_ctx_t *ctx, uint32_t set_va,
             }
             return 0;
         }
-        /* Phase 2: single-winner process claims (S32-R3-7); echoes
-         * owned by another thread bit stay with their owner. */
+        /* Phase 2: single-winner process claims (S32-R3-7). A signal
+         * owned by another thread's pending bit is never stolen
+         * (S32-R5-4): the thread check runs before the claim so the
+         * process word survives for its owner. Unhandled signals route
+         * like Phase 1 (S32-R5-5) instead of being silently dropped. */
         for (s = 1; s <= 64; s++) {
             uint32_t handler;
             uint32_t restorer;
             if (sparc32_thr_sig_blocked(ctx, s) != 0) {
                 continue;
             }
-            if (!sparc32_thr_claim_global(s)) {
+            if (sparc32_thr_thread_has_pending(s)) {
                 continue;
             }
             if (sparc32_signal_get(s, &handler, &restorer) != 0) {
+                if (sparc32_signal_disposition(s) ==
+                        SPARC32_SIG_DISP_DFL &&
+                    thr_sig_dfl_terminates(s)) {
+                    if (!sparc32_thr_claim_global(s)) {
+                        continue;
+                    }
+                    sparc32_l2a_set_blocked_mask(ctx, old);
+                    (void)sigprocmask(SIG_SETMASK, &old_host_set, NULL);
+                    (void)kill(getpid(), sparc32_sig_to_host(s));
+                    return -EINTR;
+                }
+                if (sparc32_signal_disposition(s) ==
+                        SPARC32_SIG_DISP_DFL &&
+                    !thr_sig_dfl_ignores(s)) {
+                    sparc32_l2a_set_blocked_mask(ctx, old);
+                    (void)sigprocmask(SIG_SETMASK, &old_host_set, NULL);
+                    return -EINTR;
+                }
+                if (!sparc32_thr_claim_global(s)) {
+                    continue;
+                }
                 continue;
             }
-            if (sparc32_thr_thread_has_pending(s)) {
+            if (!sparc32_thr_claim_global(s)) {
                 continue;
             }
             sparc32_l2a_set_blocked_mask(ctx, old);
             (void)sigprocmask(SIG_SETMASK, &old_host_set, NULL);
-            if (!interp_deliver_async_for_syscall(ctx, s, true)) {
+            if (!interp_deliver_async_for_syscall_process(ctx, s, true)) {
                 return -EINTR;
             }
             return 0;

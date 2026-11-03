@@ -156,64 +156,10 @@ static int difftest_cmp_state(const sparc32_ctx_t *a, const sparc32_ctx_t *b,
     return n;
 }
 
-/* Safe guest instruction-word fetch for fault classification: reads
- * through the [G, G + 4 GiB) window only when [va, va + 4) is covered by
- * a readable tracked region, and never touches exit state. */
-static bool difftest_insn_word(const sparc32_ctx_t *ctx, uint32_t va,
-    uint32_t *out)
-{
-    const uint8_t *p;
-    if (out == NULL || !interp_range_ok(ctx, va, 4U, 1U)) {
-        return false;
-    }
-    p = (const uint8_t *)sparc32_guest_ptr(ctx, va);
-    *out = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-    return true;
-}
-
-/*
- * Fault -> signal classification (RC-U3-r2 #2, mirrors main.c): a
- * 4-byte-aligned, 8-byte-misaligned LDD/STD/LDDA/STDA fault MUST deliver
- * SIGBUS (10, BUS_ADRALN), never SIGSEGV (11). Decode the faulting
- * instruction (resolving one CTI delay slot) and report SIGBUS only
- * for doubleword accesses faulting on (va & 7).
- */
-static int difftest_classify_fault(const sparc32_ctx_t *ctx)
-{
-    uint32_t va = ctx->fault_addr;
-    uint32_t pc = ctx->pc;
-    uint32_t word;
-    sparc32_decoded_t d;
-    unsigned depth;
-    if ((va & 3U) != 0U) {
-        return 10;
-    }
-    if ((va & 7U) == 0U) {
-        return 11;
-    }
-    for (depth = 0U; depth < 2U; depth++) {
-        if (!difftest_insn_word(ctx, pc, &word)) {
-            return 11;
-        }
-        sparc32_decode_word(word, &d);
-        if (d.cls == (uint32_t)SPARC32_OP_CALL ||
-            d.cls == (uint32_t)SPARC32_OP_BRANCH ||
-            d.cls == (uint32_t)SPARC32_OP_FBRANCH ||
-            d.cls == (uint32_t)SPARC32_OP_JMPL ||
-            d.cls == (uint32_t)SPARC32_OP_TRAP) {
-            pc += 4U;
-            continue;
-        }
-        if (d.op == 3U &&
-            (d.op3 == SPARC32_OP3_LDD || d.op3 == SPARC32_OP3_STD ||
-             d.op3 == SPARC32_OP3_LDDA || d.op3 == SPARC32_OP3_STDA)) {
-            return 10;
-        }
-        return 11;
-    }
-    return 11;
-}
+/* Shared fault -> signal classifier (S32-R5-11): interp and dbt must
+ * agree on SIGBUS vs SIGSEGV, so there is exactly one implementation in
+ * src/interp/interp_signal.c. */
+int sparc32_classify_fault(const sparc32_ctx_t *ctx);
 
 static const char *difftest_reason_name(uint32_t reason)
 {
@@ -414,11 +360,9 @@ int difftest_run(sparc32_ctx_t *ctx)
             break;
         case SPARC32_EXIT_FAULT:
             /* Matching fault: state and fault address must agree first,
-             * then attempt synchronous delivery on both copies (same
-             * decode-gated signo rule as main.c: sub-word misalignment
-             * and 8-byte-misaligned LDD/STD -> SIGBUS, else SIGSEGV).
-             * Delivery is deterministic, so identical pre-states stay
-             * identical. */
+             * then attempt synchronous delivery on both copies with the
+             * shared width-gated classifier (S32-R5-11). Delivery is
+             * deterministic, so identical pre-states stay identical. */
             n = difftest_cmp_state(&a, &b, step_pc);
             if (a.fault_addr != b.fault_addr) {
                 printf("difftest: divergence at pc=0x%08x: fault_addr interp=0x%08x dbt=0x%08x\n",
@@ -430,7 +374,7 @@ int difftest_run(sparc32_ctx_t *ctx)
                 return 1;
             }
             {
-                int signo = difftest_classify_fault(&a);
+                int signo = sparc32_classify_fault(&a);
                 bool da = interp_try_deliver_sync(&a, signo);
                 bool db = interp_try_deliver_sync(&b, signo);
                 if (da && db) {

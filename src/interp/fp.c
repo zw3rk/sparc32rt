@@ -231,6 +231,13 @@ bool sparc32_fp_mem(sparc32_ctx_t *ctx, uint32_t pc,
         if ((d->rd & 1U) != 0U) {
             return fp_undef(ctx, pc);
         }
+        /* V8 LDDF needs 8-byte alignment (S32-R5-1): fault like the DBT
+         * helper instead of succeeding as two 4-byte halves. */
+        if ((addr & 7U) != 0U) {
+            ctx->exit_reason = SPARC32_EXIT_FAULT;
+            ctx->fault_addr = addr;
+            return false;
+        }
         if (!interp_ld_be(ctx, addr, 4U, &hi)) {
             return false;
         }
@@ -247,6 +254,13 @@ bool sparc32_fp_mem(sparc32_ctx_t *ctx, uint32_t pc,
     case SPARC32_OP3_STDF:
         if ((d->rd & 1U) != 0U) {
             return fp_undef(ctx, pc);
+        }
+        /* V8 STDF needs 8-byte alignment (S32-R5-1): fault like the DBT
+         * helper instead of succeeding as two 4-byte halves. */
+        if ((addr & 7U) != 0U) {
+            ctx->exit_reason = SPARC32_EXIT_FAULT;
+            ctx->fault_addr = addr;
+            return false;
         }
         if (!interp_st_be(ctx, addr, 4U, fp_get_s(ctx, d->rd))) {
             return false;
