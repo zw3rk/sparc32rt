@@ -48,23 +48,29 @@ static void fp_flags_commit(a64_buf_t *b);
 /* Lane P5: fast-path FSR status. The inline FP sequence is valid only
  * when FSR.TEM == 0 (bits 27:23, no trapped exception) and FSR.RD == 0
  * (bits 31:30, round-to-nearest matches the host FPCR default);
- * otherwise exit UNDEF so the dispatcher replays via interp. */
+ * otherwise exit UNDEF so the dispatcher replays via interp. S32-R7-16:
+ * TEM is rechecked on every op (an LDFSR earlier in the block may have
+ * set it), while the RD check stays once-per-block (arith/cmp ignore RD). */
 static int fp_guard_fast(sparc32_emit_ctx_t *ec)
 {
     a64_buf_t *b = ec->buf;
     size_t p_rd;
     size_t p_tem;
-    if (b->fp_fast_checked) {
-        return 0;
+    if (!b->fp_fast_checked) {
+        a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
+        a64_emit_ubfm_w(b, FS1, FS0, 30U, 31U);
+        p_rd = a64_emit_cbz_w_placeholder(b, false, FS1);
+        a64_emit_exit_undef(b, ec->fault_pc);
+        if (b->overflow) {
+            return -1;
+        }
+        a64_patch_cbz_w(b, p_rd, b->count);
+        if (!b->overflow) {
+            b->fp_fast_checked = true;
+        }
+    } else {
+        a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
     }
-    a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
-    a64_emit_ubfm_w(b, FS1, FS0, 30U, 31U);
-    p_rd = a64_emit_cbz_w_placeholder(b, false, FS1);
-    a64_emit_exit_undef(b, ec->fault_pc);
-    if (b->overflow) {
-        return -1;
-    }
-    a64_patch_cbz_w(b, p_rd, b->count);
     a64_emit_ubfm_w(b, FS1, FS0, 23U, 27U);
     p_tem = a64_emit_cbz_w_placeholder(b, false, FS1);
     a64_emit_exit_undef(b, ec->fault_pc);
@@ -72,9 +78,24 @@ static int fp_guard_fast(sparc32_emit_ctx_t *ec)
         return -1;
     }
     a64_patch_cbz_w(b, p_tem, b->count);
-    if (!b->overflow) {
-        b->fp_fast_checked = true;
+    return b->overflow ? -1 : 0;
+}
+
+/* S32-R7-16: converts honor RD via FPCR, so only TEM forces a bail to
+ * the interpreter (which owns IEEE trap+FTT semantics). */
+static int fp_guard_tem(sparc32_emit_ctx_t *ec)
+{
+    a64_buf_t *b = ec->buf;
+    size_t p_tem;
+
+    a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
+    a64_emit_ubfm_w(b, FS1, FS0, 23U, 27U);
+    p_tem = a64_emit_cbz_w_placeholder(b, false, FS1);
+    a64_emit_exit_undef(b, ec->fault_pc);
+    if (b->overflow) {
+        return -1;
     }
+    a64_patch_cbz_w(b, p_tem, b->count);
     return b->overflow ? -1 : 0;
 }
 
@@ -339,8 +360,10 @@ static void fp_flags_commit(a64_buf_t *b)
 }
 
 /* fcc commit (FCMP/FCMPE): map NZCV to fcc (V->3, Z->0, N^V->1,
- * else 2); replace the fcc field, set FSR bit 9 when unordered.
- * NVC (cexc bit4 + accrue) fires on IOC, or on FCMPE-unordered
+ * else 2); replace the fcc field. NVA (FSR bit 9) is V for FCMPE and
+ * V & IOC for quiet compares: the host FCMP signals IOC only on SNaN,
+ * so a quiet unordered qNaN pair sets no NVA (S32-R7-19) while SNaN
+ * still does. NVC (cexc bit4 + accrue) is IOC, or IOC|V for FCMPE
  * (matching fp_cmp_f32/f64: signal || SNaN). */
 
 static void fp_fcc_commit(a64_buf_t *b, int signal)
@@ -362,18 +385,20 @@ static void fp_fcc_commit(a64_buf_t *b, int signal)
     a64_emit_csel_w(b, FS0, FS3, FS0, A64_COND_EQ);
     /* The SUBS comparisons above are not live cc results. */
     b->nzcv_valid = 0;
-    /* Merge: clear fcc + cexc, OR fcc << 10 and unordered << 9. */
+    /* Merge: clear fcc + cexc, OR fcc << 10 (fcc now spent). */
     a64_emit_ldr_imm_w(b, FS2, A64_XCTX, FP_FSR_OFF);
     a64_emit_mov_imm32(b, FS3, 0xFFFFF3E0U);
     a64_emit_and_reg_w(b, false, FS2, FS2, FS3, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, FS2, FS2, FS0, A64_SHIFT_LSL, 10U);
-    a64_emit_orr_reg_w(b, FS2, FS2, FS1, A64_SHIFT_LSL, 9U);
-    /* NVC: IOC from a fresh FPSR read (NZCV consumed above; FS0 is
-     * spent holding fcc). V is still in FS1. */
+    /* IOC from a fresh FPSR read (NZCV consumed above). V is in FS1. */
     a64_emit(b, 0xD53B4420U | (uint32_t)FS0); /* MRS FS0, FPSR */
     a64_emit_ubfm_w(b, FS0, FS0, 0U, 0U);     /* FS0 = IOC */
     if (signal != 0) {
+        a64_emit_orr_reg_w(b, FS2, FS2, FS1, A64_SHIFT_LSL, 9U);
         a64_emit_orr_reg_w(b, FS0, FS0, FS1, A64_SHIFT_LSL, 0U);
+    } else {
+        a64_emit_and_reg_w(b, false, FS1, FS1, FS0, A64_SHIFT_LSL, 0U);
+        a64_emit_orr_reg_w(b, FS2, FS2, FS1, A64_SHIFT_LSL, 9U);
     }
     a64_emit_orr_reg_w(b, FS2, FS2, FS0, A64_SHIFT_LSL, 4U);
     a64_emit_orr_reg_w(b, FS2, FS2, FS0, A64_SHIFT_LSL, 9U);
@@ -512,6 +537,9 @@ static int fp_emit_convert(sparc32_emit_ctx_t *ec, uint32_t opf,
     uint32_t rd, uint32_t rs2)
 {
     a64_buf_t *b = ec->buf;
+    if (fp_guard_tem(ec) != 0) {
+        return -1;
+    }
     sparc32_emit_fp_flush(b);
     fp_fpsr_clear(b);
     /* FP operands first (double loads use xFS1), then RD/FPCR. */

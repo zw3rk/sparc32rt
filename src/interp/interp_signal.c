@@ -147,7 +147,8 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
     size_t k;
     int i;
     if (ctx == NULL ||
-        (signo != 4 && signo != 8 && signo != 10 && signo != 11)) {
+        (signo != 4 && signo != 5 && signo != 8 && signo != 10 &&
+            signo != 11)) {
         return false;
     }
     if (sparc32_signal_get_action(signo, &handler, &restorer, &flags,
@@ -174,6 +175,9 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
                 break;
             }
         }
+    } else if (signo == 5) {
+        /* SIGTRAP: software breakpoint (ta 1) -> TRAP_BRKPT(1). */
+        code = 1U;
     } else if (signo == 8) {
         /* SIGFPE: DIV_ZERO -> FPE_INTDIV(1), TAG_OVERFLOW -> FPE_INTOVF(2),
          * FP (0x07) decodes the enabled cexc, default 1. */
@@ -787,8 +791,21 @@ int sparc32_classify_fault(const sparc32_ctx_t *ctx)
     }
     if (d.cls == (uint32_t)SPARC32_OP_CALL ||
         d.cls == (uint32_t)SPARC32_OP_BRANCH ||
-        d.cls == (uint32_t)SPARC32_OP_FBRANCH ||
-        d.cls == (uint32_t)SPARC32_OP_TRAP) {
+        d.cls == (uint32_t)SPARC32_OP_FBRANCH) {
+        /* N-2: the DBT still reports delay-slot faults with pc at the
+         * branch, so classify from the delay slot at pc + 4 (width and
+         * alignment of the faulting load/store). */
+        uint32_t dword;
+        sparc32_decoded_t dd;
+
+        if (sparc32_fault_insn_word(ctx, pc + 4U, &dword)) {
+            sparc32_decode_word(dword, &dd);
+            width = sparc32_fault_req_align(dd.op, dd.op3);
+            return ((va & (width - 1U)) != 0U) ? 10 : 11;
+        }
+        return ((va & 3U) != 0U) ? 10 : 11;
+    }
+    if (d.cls == (uint32_t)SPARC32_OP_TRAP) {
         return ((va & 3U) != 0U) ? 10 : 11;
     }
     width = sparc32_fault_req_align(d.op, d.op3);
@@ -798,7 +815,8 @@ int sparc32_classify_fault(const sparc32_ctx_t *ctx)
 /* S32-R7-15: architectural traps -> guest signals. Integer traps
  * (DIV_ZERO 0x2A, TAG_OVERFLOW 0x01, FP 0x07) become SIGFPE (8);
  * privileged/illegal and all other trap numbers become SIGILL (4);
- * undecodable instructions become SIGILL (4). */
+ * undecodable instructions become SIGILL (4). S32-N-4: software Ticc
+ * traps carry bit 8 (0x100 | no); ta 1 is SIGTRAP (5), the rest SIGILL. */
 int sparc32_trap_signo(const sparc32_ctx_t *ctx)
 {
     if (ctx == NULL) {
@@ -809,6 +827,12 @@ int sparc32_trap_signo(const sparc32_ctx_t *ctx)
     }
     if (ctx->exit_reason != (uint32_t)SPARC32_EXIT_TRAP) {
         return 0;
+    }
+    if ((ctx->exit_arg & 0x100U) != 0U) {
+        if (ctx->exit_arg == (0x100U | 0x01U)) {
+            return 5;
+        }
+        return 4;
     }
     if (ctx->exit_arg == 0x2AU || ctx->exit_arg == 0x01U ||
         ctx->exit_arg == 0x07U) {

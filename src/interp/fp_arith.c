@@ -281,6 +281,7 @@ uint32_t fp_to_f32(sparc32_ctx_t *ctx, double v, uint32_t rd)
     double back;
     bool ovf;
     bool tiny;
+    uint32_t inexact;
     fp_clear_cexc(ctx);
     if (isnan(v)) {
         /* Narrow the payload; never a zero fraction (that is inf). */
@@ -323,32 +324,30 @@ uint32_t fp_to_f32(sparc32_ctx_t *ctx, double v, uint32_t rd)
     if (back == v) {
         return fp_f32_to_u32(frn);
     }
-    fp_raise(ctx, FP_FSR_NXC_BIT);
+    /* S32-N-5: raise once so a trapped OF/UF sees clean aexc and a
+     * complete cexc (no NX accrued before the trapping raise). */
     tiny = (fpclassify(frn) == FP_SUBNORMAL) || (frn == 0.0F);
-    if (tiny && v != 0.0) {
-        fp_raise(ctx, FP_FSR_UFC_BIT);
-    }
-    if (rd == FP_RD_RN) {
-        return fp_f32_to_u32(frn);
-    }
+    inexact = ((tiny && v != 0.0) ?
+        (FP_FSR_UFC_BIT | FP_FSR_NXC_BIT) : FP_FSR_NXC_BIT);
     if (rd == FP_RD_RZ) {
         if (fabs(back) > fabs(v)) {
             frn = nextafterf(frn, 0.0F);
         }
-        return fp_f32_to_u32(frn);
-    }
-    if (rd == FP_RD_RP) {
+    } else if (rd == FP_RD_RP) {
         if (back < v) {
             frn = nextafterf(frn, (float)INFINITY);
         }
-        /* S32-R7-22: directed adjustment can overflow to infinity. */
-        if (!isfinite(frn)) fp_raise(ctx, FP_FSR_OFC_BIT | FP_FSR_NXC_BIT);
+    } else if (rd == FP_RD_RM) {
+        if (back > v) {
+            frn = nextafterf(frn, -(float)INFINITY);
+        }
+    }
+    /* S32-R7-22: directed adjustment can overflow to infinity. */
+    if (!isfinite(frn)) {
+        fp_raise(ctx, FP_FSR_OFC_BIT | FP_FSR_NXC_BIT);
         return fp_f32_to_u32(frn);
     }
-    if (back > v) {
-        frn = nextafterf(frn, -(float)INFINITY);
-    }
-    if (!isfinite(frn)) fp_raise(ctx, FP_FSR_OFC_BIT | FP_FSR_NXC_BIT);
+    fp_raise(ctx, inexact);
     return fp_f32_to_u32(frn);
 }
 

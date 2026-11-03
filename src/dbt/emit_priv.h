@@ -152,55 +152,25 @@ static uint32_t sparc32_rt_muldiv(sparc32_ctx_t *ctx, uint32_t op3,
         interp_wreg(ctx, rd, (uint32_t)(uint64_t)p);
         return SPARC32_EXIT_NONE;
     }
-    case 0x1AU: { /* UMULcc: V is the signed overflow (E03). */
+    case 0x1AU: { /* UMULcc (S32-R7-8): V = 0, C = 0. */
         uint64_t p = (uint64_t)a * (uint64_t)b;
-        int64_t sp = (int64_t)(int32_t)a * (int64_t)(int32_t)b;
 
         ctx->y = (uint32_t)(p >> 32);
         ctx->psr &= ~SPARC32_PSR_ICC_MASK;
         rt_icc_nz(ctx, (uint32_t)p);
-        if (sp != (int64_t)(int32_t)(uint32_t)p) {
-            ctx->psr |= SPARC32_PSR_V;
-        }
         interp_wreg(ctx, rd, (uint32_t)p);
         return SPARC32_EXIT_NONE;
     }
-    case 0x1BU: { /* SMULcc */
+    case 0x1BU: { /* SMULcc (S32-R7-8): V = 0, C = 0. */
         int64_t p = (int64_t)(int32_t)a * (int64_t)(int32_t)b;
 
         ctx->y = (uint32_t)((uint64_t)p >> 32);
         ctx->psr &= ~SPARC32_PSR_ICC_MASK;
         rt_icc_nz(ctx, (uint32_t)(uint64_t)p);
-        if (p != (int64_t)(int32_t)(uint32_t)(uint64_t)p) {
-            ctx->psr |= SPARC32_PSR_V;
-        }
         interp_wreg(ctx, rd, (uint32_t)(uint64_t)p);
         return SPARC32_EXIT_NONE;
     }
-    case 0x0EU: { /* UDIV: (Y:rs1) dividend, div-by-zero traps. */
-        uint64_t dvd = ((uint64_t)ctx->y << 32) | (uint64_t)a;
-
-        if (b == 0u) {
-            return rt_trap(ctx, 0x2Au, pc);
-        }
-        interp_wreg(ctx, rd, (uint32_t)(dvd / (uint64_t)b));
-        return SPARC32_EXIT_NONE;
-    }
-    case 0x0FU: { /* SDIV: truncates toward zero. */
-        int64_t dvd = (int64_t)(((uint64_t)ctx->y << 32) | (uint64_t)a);
-        int32_t dvs = (int32_t)b;
-
-        if (dvs == 0) {
-            return rt_trap(ctx, 0x2Au, pc);
-        }
-        if (dvd == (int64_t)0x8000000000000000LL && dvs == -1) {
-            interp_wreg(ctx, rd, 0x80000000u);
-            return SPARC32_EXIT_NONE;
-        }
-        interp_wreg(ctx, rd, (uint32_t)(uint64_t)(dvd / (int64_t)dvs));
-        return SPARC32_EXIT_NONE;
-    }
-    case 0x1EU: { /* UDIVcc: V iff the quotient exceeds 32 bits (E03). */
+    case 0x0EU: { /* UDIV (S32-R7-6): saturate on overflow. */
         uint64_t dvd = ((uint64_t)ctx->y << 32) | (uint64_t)a;
         uint64_t q;
 
@@ -208,7 +178,41 @@ static uint32_t sparc32_rt_muldiv(sparc32_ctx_t *ctx, uint32_t op3,
             return rt_trap(ctx, 0x2Au, pc);
         }
         q = dvd / (uint64_t)b;
-        res = (uint32_t)q;
+        interp_wreg(ctx, rd,
+            q > (uint64_t)0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)q);
+        return SPARC32_EXIT_NONE;
+    }
+    case 0x0FU: { /* SDIV (S32-R7-6): saturate on overflow. */
+        int64_t dvd = (int64_t)(((uint64_t)ctx->y << 32) | (uint64_t)a);
+        int32_t dvs = (int32_t)b;
+        int64_t q;
+
+        if (dvs == 0) {
+            return rt_trap(ctx, 0x2Au, pc);
+        }
+        if (dvd == (int64_t)0x8000000000000000LL && dvs == -1) {
+            interp_wreg(ctx, rd, 0x7FFFFFFFu);
+            return SPARC32_EXIT_NONE;
+        }
+        q = dvd / (int64_t)dvs;
+        if (q > (int64_t)0x7FFFFFFFLL) {
+            interp_wreg(ctx, rd, 0x7FFFFFFFu);
+        } else if (q < (int64_t)0xFFFFFFFF80000000LL) {
+            interp_wreg(ctx, rd, 0x80000000u);
+        } else {
+            interp_wreg(ctx, rd, (uint32_t)(uint64_t)q);
+        }
+        return SPARC32_EXIT_NONE;
+    }
+    case 0x1EU: { /* UDIVcc (S32-R7-6): saturate, N/Z from result. */
+        uint64_t dvd = ((uint64_t)ctx->y << 32) | (uint64_t)a;
+        uint64_t q;
+
+        if (b == 0u) {
+            return rt_trap(ctx, 0x2Au, pc);
+        }
+        q = dvd / (uint64_t)b;
+        res = q > (uint64_t)0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)q;
         ctx->psr &= ~SPARC32_PSR_ICC_MASK;
         rt_icc_nz(ctx, res);
         if (q > (uint64_t)0xFFFFFFFFu) {
@@ -217,7 +221,7 @@ static uint32_t sparc32_rt_muldiv(sparc32_ctx_t *ctx, uint32_t op3,
         interp_wreg(ctx, rd, res);
         return SPARC32_EXIT_NONE;
     }
-    case 0x1FU: { /* SDIVcc */
+    case 0x1FU: { /* SDIVcc (S32-R7-6): saturate, N/Z from result. */
         int64_t dvd = (int64_t)(((uint64_t)ctx->y << 32) | (uint64_t)a);
         int32_t dvs = (int32_t)b;
         int64_t q;
@@ -227,12 +231,18 @@ static uint32_t sparc32_rt_muldiv(sparc32_ctx_t *ctx, uint32_t op3,
         }
         ctx->psr &= ~SPARC32_PSR_ICC_MASK;
         if (dvd == (int64_t)0x8000000000000000LL && dvs == -1) {
-            ctx->psr |= SPARC32_PSR_V | SPARC32_PSR_N;
-            interp_wreg(ctx, rd, 0x80000000u);
+            ctx->psr |= SPARC32_PSR_V;
+            interp_wreg(ctx, rd, 0x7FFFFFFFu);
             return SPARC32_EXIT_NONE;
         }
         q = dvd / (int64_t)dvs;
-        res = (uint32_t)(uint64_t)q;
+        if (q > (int64_t)0x7FFFFFFFLL) {
+            res = 0x7FFFFFFFu;
+        } else if (q < (int64_t)0xFFFFFFFF80000000LL) {
+            res = 0x80000000u;
+        } else {
+            res = (uint32_t)(uint64_t)q;
+        }
         rt_icc_nz(ctx, res);
         if (q != (int64_t)(int32_t)res) {
             ctx->psr |= SPARC32_PSR_V;
@@ -256,36 +266,39 @@ static uint32_t sparc32_rt_muldiv(sparc32_ctx_t *ctx, uint32_t op3,
         }
         interp_wreg(ctx, rd, res);
         return SPARC32_EXIT_NONE;
-    case 0x22U: /* TADDccTV */
+    case 0x22U: { /* TADDccTV (S32-R7-9): trap before ICC/rd. */
+        int64_t s = (int64_t)(int32_t)a + (int64_t)(int32_t)b;
+
         res = a + b;
+        if ((((a & 3u) | (b & 3u)) != 0u) ||
+            (s != (int64_t)(int32_t)res)) {
+            return rt_trap(ctx, 0x01u, pc);
+        }
         rt_icc_add(ctx, res, a, b, 0u);
-        if (((a & 3u) | (b & 3u)) != 0u) {
-            ctx->psr |= SPARC32_PSR_V;
-        }
-        if ((ctx->psr & SPARC32_PSR_V) != 0u) {
-            return rt_trap(ctx, 0x01u, pc);
-        }
         interp_wreg(ctx, rd, res);
         return SPARC32_EXIT_NONE;
-    case 0x23U: /* TSUBccTV */
+    }
+    case 0x23U: { /* TSUBccTV (S32-R7-9): trap before ICC/rd. */
+        int64_t s = (int64_t)(int32_t)a - (int64_t)(int32_t)b;
+
         res = a - b;
-        rt_icc_sub(ctx, res, a, b, 0u);
-        if (((a & 3u) | (b & 3u)) != 0u) {
-            ctx->psr |= SPARC32_PSR_V;
-        }
-        if ((ctx->psr & SPARC32_PSR_V) != 0u) {
+        if ((((a & 3u) | (b & 3u)) != 0u) ||
+            (s != (int64_t)(int32_t)res)) {
             return rt_trap(ctx, 0x01u, pc);
         }
+        rt_icc_sub(ctx, res, a, b, 0u);
         interp_wreg(ctx, rd, res);
         return SPARC32_EXIT_NONE;
-    case 0x24U: { /* MULSCC */
-        int nv = (((ctx->psr & SPARC32_PSR_N) != 0u) !=
-            ((ctx->psr & SPARC32_PSR_V) != 0u));
-        uint32_t opnd = (nv != 0) ? b : 0u;
-        uint64_t full = (uint64_t)a + (uint64_t)opnd;
-        uint32_t sum = (uint32_t)full;
-        int64_t s = (int64_t)(int32_t)a + (int64_t)(int32_t)opnd;
+    }
+    case 0x24U: { /* MULSCC (S32-R7-7): shift-then-add. */
+        bool nv = ((ctx->psr & SPARC32_PSR_N) != 0u) !=
+            ((ctx->psr & SPARC32_PSR_V) != 0u);
         uint32_t yold = ctx->y;
+        uint32_t shifted = (nv ? 0x80000000u : 0u) | (a >> 1);
+        uint32_t opnd = ((yold & 1u) != 0u) ? b : 0u;
+        uint64_t full = (uint64_t)shifted + (uint64_t)opnd;
+        uint32_t sum = (uint32_t)full;
+        int64_t s = (int64_t)(int32_t)shifted + (int64_t)(int32_t)opnd;
 
         ctx->y = ((a & 1u) << 31) | (yold >> 1);
         ctx->psr &= ~SPARC32_PSR_ICC_MASK;
@@ -296,8 +309,7 @@ static uint32_t sparc32_rt_muldiv(sparc32_ctx_t *ctx, uint32_t op3,
         if ((full >> 32) != 0u) {
             ctx->psr |= SPARC32_PSR_C;
         }
-        interp_wreg(ctx, rd,
-            ((yold & 1u) != 0u ? 0x80000000u : 0u) | (sum >> 1));
+        interp_wreg(ctx, rd, sum);
         return SPARC32_EXIT_NONE;
     }
     default:

@@ -45,6 +45,7 @@ static int fpu_double_dest(uint32_t op3, uint32_t opf)
         case 0x046U: /* FSUBd */
         case 0x04AU: /* FMULd */
         case 0x04EU: /* FDIVd */
+        case 0x069U: /* FSMULD */
         case 0x0C8U: /* FiTOd */
         case 0x0C9U: /* FsTOd */
         case 0x0CBU: /* FqTOd */
@@ -54,16 +55,16 @@ static int fpu_double_dest(uint32_t op3, uint32_t opf)
         }
     }
     if (op3 == SPARC32_OP3_FPOP2) {
-        /* FsMULd (single x single -> double); FDMULq is quad-dest and
-         * passes through for Phase 3 to trap on this LEON target. */
-        return opf == 0x069U;
+        /* FPop2 carries compares only (S32-R7-23); quad forms trap in
+         * Phase 3 on this LEON target. */
+        return 0;
     }
     return 0;
 }
 
 /* S32-R7-23: validate the (op3, opf) pair. FPop1 carries moves,
- * arithmetic, sqrt and conversions; FPop2 carries compares and
- * FSMULD. Cross-group opcodes decode ILLEGAL. */
+ * arithmetic, sqrt, conversions and FSMULD (V8 opf 0x069); FPop2
+ * carries compares only. Cross-group opcodes decode ILLEGAL. */
 static int fpop_valid(uint32_t op3, uint32_t opf)
 {
     if (op3 == SPARC32_OP3_FPOP1) {
@@ -84,6 +85,7 @@ static int fpop_valid(uint32_t op3, uint32_t opf)
         case 0x04AU:
         case 0x04DU:
         case 0x04EU:
+        case 0x069U:
         case 0x0C4U:
         case 0x0C6U:
         case 0x0C8U:
@@ -102,7 +104,6 @@ static int fpop_valid(uint32_t op3, uint32_t opf)
         case 0x052U:
         case 0x055U:
         case 0x056U:
-        case 0x069U:
             return 1;
         default:
             return 0;

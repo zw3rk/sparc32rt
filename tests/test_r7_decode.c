@@ -76,6 +76,9 @@ int main(void)
     /* S32-R7-23: FCMPS under FPop2 is legal, under FPop1 illegal. */
     expect_cls(0x81A80A20U, (uint32_t)SPARC32_OP_FPU, "fcmps-fpop2-ok");
     expect_cls(0x81A00A20U, (uint32_t)SPARC32_OP_ILLEGAL, "fcmps-fpop1-bad");
+    /* N-1: FSMULD (opf 0x069) under FPop1 is legal, under FPop2 illegal. */
+    expect_cls(0x81A00D20U, (uint32_t)SPARC32_OP_FPU, "fsmuld-fpop1-ok");
+    expect_cls(0x81A80D20U, (uint32_t)SPARC32_OP_ILLEGAL, "fsmuld-fpop2-bad");
     if (failures != 0) {
         printf("R7-DECODE: %d FAILURES\n", failures);
         return 1;

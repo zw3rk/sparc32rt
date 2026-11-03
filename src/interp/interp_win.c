@@ -171,10 +171,11 @@ bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
             ctx->r[SPARC32_I0 + i] = old_o[i];
             ctx->r[SPARC32_L0 + i] = interp_winfile[tgt][i];
         }
-        if (interp_win_valid[tgt] != 0U) {
-            for (i = 0; i < 8U; i++) {
-                ctx->r[SPARC32_O0 + i] = interp_win_o[tgt][i];
-            }
+        /* S32-R7-1: RESTORE saves the popped window's %o into
+         * interp_win_o before clearing validity, so the image survives
+         * for the next SAVE to this level; always restore it here. */
+        for (i = 0; i < 8U; i++) {
+            ctx->r[SPARC32_O0 + i] = interp_win_o[tgt][i];
         }
         ctx->cwp = tgt;
         /* The reused slot keeps its recorded (valid, home) image: the

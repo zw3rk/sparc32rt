@@ -91,16 +91,14 @@ bool sparc32_fp_step(sparc32_ctx_t *ctx, uint32_t pc,
         if (opf == (uint32_t)FP_OPF_FCMPS ||
             opf == (uint32_t)FP_OPF_FCMPD ||
             opf == (uint32_t)FP_OPF_FCMPES ||
-            opf == (uint32_t)FP_OPF_FCMPED ||
-            opf == (uint32_t)FP_OPF_FSMULD) {
+            opf == (uint32_t)FP_OPF_FCMPED) {
             return fp_undef(ctx, pc);
         }
     } else if (d->op3 == (uint32_t)SPARC32_OP3_FPOP2) {
         if (opf != (uint32_t)FP_OPF_FCMPS &&
             opf != (uint32_t)FP_OPF_FCMPD &&
             opf != (uint32_t)FP_OPF_FCMPES &&
-            opf != (uint32_t)FP_OPF_FCMPED &&
-            opf != (uint32_t)FP_OPF_FSMULD) {
+            opf != (uint32_t)FP_OPF_FCMPED) {
             return fp_undef(ctx, pc);
         }
     } else {

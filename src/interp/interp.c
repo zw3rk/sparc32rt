@@ -56,6 +56,9 @@
 #define SPARC32_TRAP_PRIV_INSN 0x03U
 #define SPARC32_TRAP_DIV_ZERO 0x2AU
 #define SPARC32_TRAP_SYSCALL 0x10U
+/* S32-N-4: software Ticc traps carry bit 8 so they never collide with
+ * the internal hardware trap codes 0x01/0x07/0x2a. */
+#define SPARC32_TRAP_SW_BIT 0x100U
 
 static void interp_icc_logic(sparc32_ctx_t *ctx, uint32_t res)
 {
@@ -212,7 +215,10 @@ static bool interp_trap_insn(sparc32_ctx_t *ctx, uint32_t pc,
             }
             return true;
         }
-        return interp_trap_taken(ctx, num);
+        if (num == SPARC32_TRAP_SYSCALL) {
+            return interp_trap_taken(ctx, num);
+        }
+        return interp_trap_taken(ctx, num | SPARC32_TRAP_SW_BIT);
     }
 }
 
