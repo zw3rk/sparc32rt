@@ -47,7 +47,7 @@
 #define SP_O_DSYNC 0x2000U
 #define SP_O_SYNC 0x802000U
 #define SP_O_NONBLOCK 0x4000U
-#define SP_O_ASYNC 0x2000U /* FASYNC shares the O_DSYNC bit; F_SETFL takes ASYNC. */
+#define SP_O_ASYNC 0x0040U
 #define SP_O_NDELAY 0x4004U
 #define SP_O_NOCTTY 0x8000U
 #define SP_O_LARGEFILE 0x40000U
@@ -819,10 +819,12 @@ static long flags_host_to_guest(int host)
         g |= SP_O_NONBLOCK;
     }
 #ifdef O_SYNC
-    if ((host & O_SYNC) != 0) {
-        g |= SP_O_SYNC;
-    }
+    if ((host & O_SYNC) == O_SYNC) g |= SP_O_SYNC;
+#ifdef O_DSYNC
+    else if ((host & O_DSYNC) != 0) g |= SP_O_DSYNC;
 #endif
+#endif
+    if ((host & O_ASYNC) != 0) g |= SP_O_ASYNC;
     return (long)g;
 }
 
@@ -869,7 +871,10 @@ long sparc32_l2a_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg)
 #ifdef O_NOATIME
         if ((w & SP_O_NOATIME) != 0U) { host |= O_NOATIME; }
 #endif
-        if ((w & SP_O_SYNC) != 0U) { host |= O_SYNC; }
+        if ((w & SP_O_SYNC) == SP_O_SYNC) { host |= O_SYNC; }
+#ifdef O_DSYNC
+        else if ((w & SP_O_DSYNC) != 0U) { host |= O_DSYNC; }
+#endif
         return (fcntl((int)fd, F_SETFL, host) != 0) ? -(long)errno : 0;
     }
     default:
