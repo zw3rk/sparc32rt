@@ -352,7 +352,8 @@ static void fp_flags_commit(a64_buf_t *b)
     a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 4U);
     /* fsr = (fsr & ~0x1F) | cexc | (cexc << 5). */
     a64_emit_ldr_imm_w(b, FS2, A64_XCTX, FP_FSR_OFF);
-    a64_emit_mov_imm32(b, FS3, 0xFFFFFFE0U);
+    /* S32-R8-6: clear cexc (bits 4:0) and stale FTT (bits 16:14). */
+    a64_emit_mov_imm32(b, FS3, 0xFFFE3FE0U);
     a64_emit_and_reg_w(b, false, FS2, FS2, FS3, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, FS2, FS2, FS1, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, FS2, FS2, FS1, A64_SHIFT_LSL, 5U);
@@ -387,7 +388,8 @@ static void fp_fcc_commit(a64_buf_t *b, int signal)
     b->nzcv_valid = 0;
     /* Merge: clear fcc + cexc, OR fcc << 10 (fcc now spent). */
     a64_emit_ldr_imm_w(b, FS2, A64_XCTX, FP_FSR_OFF);
-    a64_emit_mov_imm32(b, FS3, 0xFFFFF3E0U);
+    /* S32-R8-6: clear cexc + fcc, and stale FTT bit 16. */
+    a64_emit_mov_imm32(b, FS3, 0xFFFEF3E0U);
     a64_emit_and_reg_w(b, false, FS2, FS2, FS3, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, FS2, FS2, FS0, A64_SHIFT_LSL, 10U);
     /* IOC from a fresh FPSR read (NZCV consumed above). V is in FS1. */

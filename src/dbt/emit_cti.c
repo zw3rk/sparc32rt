@@ -81,8 +81,11 @@ int sparc32_emit_exit_singlestep(sparc32_emit_ctx_t *ec, uint32_t pc)
  * inlined (the outer transfer is cancelled / UNDEF per interp_single), so
  * the whole CTI falls back to SINGLE_STEP and interp_step replays it.
  * FPU/FBfcc/ILLEGAL delays become EXIT_UNDEF at the delay address, exactly
- * like interp_single. ec->fault_pc must already hold the CTI address so a
- * faulting delay reports the CTI as the fault site. */
+ * like interp_single. ec->fault_pc must already hold the delay address
+ * (npc) so a faulting delay reports the delay as the fault site
+ * (S32-R8-3, matching interp_cti); the taken copy additionally arms
+ * jmpl_target with the static target so a delay fault commits
+ * npc = target (S32-R8-4). */
 
 static int e_emit_delay(sparc32_emit_ctx_t *ec, uint32_t npc)
 {
@@ -157,7 +160,9 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     size_t p_end;
     int rc;
 
-    ec->fault_pc = pc;
+    /* S32-R8-3: the delay slot runs at npc, so helper fault exits must
+     * carry npc (matching interp_cti, like JMPL below). */
+    ec->fault_pc = npc;
     if (cond == 0x0u) {
         if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
             if (page_final) {
@@ -172,6 +177,9 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     if (cond == 0x8u) {
         if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
+            /* S32-R8-4: taken delay faults commit npc = target. */
+            a64_emit_mov_pc32(b, ES0, target);
+            a64_jmpl_record(b, ES0, ES2, ES1);
             if (page_final) {
                 return e_page_final(ec, npc, target);
             }
@@ -204,6 +212,9 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         b->gpr_cache_valid = 0;
         b->fpr_valid = 0;
         if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
+            /* S32-R8-4: taken delay faults commit npc = target. */
+            a64_emit_mov_pc32(b, ES0, target);
+            a64_jmpl_record(b, ES0, ES2, ES1);
             rc = e_emit_delay(ec, npc);
             if (rc != 0) {
                 return rc;
@@ -225,6 +236,9 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     b->gpr_cache_valid = 0;
     b->fpr_valid = 0;
     if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
+        /* S32-R8-4: taken delay faults commit npc = target. */
+        a64_emit_mov_pc32(b, ES0, target);
+        a64_jmpl_record(b, ES0, ES2, ES1);
         rc = e_emit_delay(ec, npc);
         if (rc != 0) {
             return rc;
@@ -247,11 +261,16 @@ int sparc32_emit_call(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     uint32_t target = pc + (uint32_t)d->disp;
     int rc;
 
-    ec->fault_pc = pc;
+    /* S32-R8-3: the delay slot runs at npc, so helper fault exits must
+     * carry npc (matching interp_cti, like JMPL below). */
+    ec->fault_pc = npc;
     if ((pc & 0xFFFu) == 0xFFCu) {
         a64_emit_mov_pc32(b, ES0, pc);
         cti_stgreg(b, SPARC32_O7, ES0);
         b->is_call = true;
+        /* S32-R8-4: taken delay faults commit npc = target. */
+        a64_emit_mov_pc32(b, ES0, target);
+        a64_jmpl_record(b, ES0, ES2, ES1);
         return e_page_final(ec, npc, target);
     }
     if (ec->delay == NULL || ec->delay->cls == (uint32_t)SPARC32_OP_CALL ||
@@ -268,6 +287,9 @@ int sparc32_emit_call(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     cti_stgreg(b, SPARC32_O7, ES0);
     b->nzcv_valid = 0;
     b->is_call = true;
+    /* S32-R8-4: taken delay faults commit npc = target. */
+    a64_emit_mov_pc32(b, ES0, target);
+    a64_jmpl_record(b, ES0, ES2, ES1);
     rc = e_emit_delay(ec, npc);
     if (rc != 0) {
         return rc;

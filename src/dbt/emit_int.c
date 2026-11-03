@@ -282,6 +282,16 @@ int sparc32_emit_alu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     if (d->cc != 0u) {
         /* commit_flags preserves host NZCV (MOV/CSET/ORR/LSL/BIC/STR
          * only), so the cc kind stays live for a following Bicc. */
+        if (d->op3 >= 0x11U && d->op3 <= 0x17U) {
+            /* S32-R8-5: logic-cc leaves host C,V unchanged (ANDS/TST
+             * LSL #0 keeps the shifter carry); the oracle clears both
+             * (interp.c), so scrub them before the commit. */
+            a64_emit_mrs_nzcv(b, ES1);
+            a64_emit_mov_imm32(b, ES2, 0x30000000U);
+            a64_emit_bic_reg_w(b, false, ES1, ES1, ES2,
+                A64_SHIFT_LSL, 0u);
+            a64_emit_msr_nzcv(b, ES1);
+        }
         sparc32_emit_commit_flags(b, d->op3 == 0x14U || d->op3 == 0x1CU);
         sparc32_emit_track_cc(b, d->op3);
     }
@@ -402,6 +412,10 @@ int sparc32_emit_trap(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     a64_emit_movz_w(b, ES1, (uint16_t)SPARC32_EXIT_SYSCALL, 0u);
     a64_emit_ret(b);
     a64_patch_b_cond(b, p_end, b->count);
+    /* S32-R8-2: software traps carry bit 8 (SPARC32_TRAP_SW_BIT, cf
+     * interp.c) so the signal classifier sees SIGTRAP/SIGILL. */
+    a64_emit_mov_imm32(b, ES0, 0x100u);
+    a64_emit_orr_reg_w(b, EKEEP, EKEEP, ES0, A64_SHIFT_LSL, 0u);
     a64_emit_str_imm_w(b, EKEEP, A64_XCTX,
         (uint32_t)offsetof(sparc32_ctx_t, exit_arg));
     a64_emit_exit_trap(b, pc);

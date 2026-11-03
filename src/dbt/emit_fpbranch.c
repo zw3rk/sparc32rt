@@ -23,6 +23,7 @@
 /* Scratch allocation (same FP set as emit_fp.c; v-regions untouched). */
 #define FS0 15u /* w15/x15: scratch / exit guest PC */
 #define FS1 16u /* w16: scratch / taken bit */
+#define FS2 17u /* w17/x17: scratch / jmpl-record tmp */
 
 /* ctx field offsets used by this emitter. */
 #define FP_FSR_OFF ((uint32_t)offsetof(sparc32_ctx_t, fsr))
@@ -33,7 +34,7 @@
 /* Taken predicate: 4-bit mask over fcc (GAS-verified numbering). */
 static const uint32_t fp_taken_mask[16] = {
     0x0U, 0xEU, 0x6U, 0xAU, 0x2U, 0xCU, 0x4U, 0x8U,
-    0xFU, 0x1U, 0x9U, 0x5U, 0xDU, 0x3U, 0xBU, 0x8U
+    0xFU, 0x1U, 0x9U, 0x5U, 0xDU, 0x3U, 0xBU, 0x7U
 };
 
 static void fp_taken_compute(a64_buf_t *b, uint32_t cond)
@@ -78,8 +79,9 @@ static int fp_delay_tail(sparc32_emit_ctx_t *ec, uint32_t npc,
 }
 
 /* Integer delay-slot classes route to the public L2c emitters (the
- * delay address is in ec->pc, the CTI address stays in ec->fault_pc,
- * exactly like the integer e_emit_delay). One case per line to hold
+ * delay address is in ec->pc, and ec->fault_pc already holds the delay
+ * address too so a faulting delay reports the delay, exactly like the
+ * integer e_emit_delay, S32-R8-3). One case per line to hold
  * the 900-line file budget. */
 static int fp_emit_int_delay(sparc32_emit_ctx_t *ec,
     const sparc32_decoded_t *d)
@@ -169,12 +171,17 @@ int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     cond = d->cond;
     annul = d->annul != 0U;
     page_final = ((pc & 0xFFFU) == 0xFFCU) ? 1 : 0;
-    ec->fault_pc = pc;
+    /* S32-R8-3: the delay slot runs at npc, so helper fault exits must
+     * carry npc (matching interp_cti, like JMPL). */
+    ec->fault_pc = npc;
     if (cond == 0x0U) { /* FBN: never branches. */
         return fp_delay_tail(ec, npc, npc + 4U,
             fp_delay_runs(cond, 0, annul), page_final);
     }
     if (cond == 0x8U) { /* FBA: always branches. */
+        /* S32-R8-4: taken delay faults commit npc = target. */
+        a64_emit_mov_pc32(b, FS0, target);
+        a64_jmpl_record(b, FS0, FS2, FS1);
         return fp_delay_tail(ec, npc, target,
             fp_delay_runs(cond, 1, annul), page_final);
     }
@@ -194,6 +201,9 @@ int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         /* Taken page-final always SINGLE_STEPs (emit_branch shape),
          * even when the delay was annulled away. */
         if (fp_delay_runs(cond, 1, annul) != 0) {
+            /* S32-R8-4: taken delay faults commit npc = target. */
+            a64_emit_mov_pc32(b, FS0, target);
+            a64_jmpl_record(b, FS0, FS2, FS1);
             rc = fp_emit_delay(ec, npc);
             if (rc != 0) {
                 return rc;
@@ -216,6 +226,9 @@ int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     b->gpr_cache_valid = 0;
     b->fpr_valid = 0;
     if (fp_delay_runs(cond, 1, annul) != 0) {
+        /* S32-R8-4: taken delay faults commit npc = target. */
+        a64_emit_mov_pc32(b, FS0, target);
+        a64_jmpl_record(b, FS0, FS2, FS1);
         rc = fp_emit_delay(ec, npc);
         if (rc != 0) {
             return rc;

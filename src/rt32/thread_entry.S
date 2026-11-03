@@ -29,7 +29,8 @@
  *         x2 = chaining entry for x27, x3 = epoch word for x28 (block only;
  *         step installs its own zero word, so x3 is ignored there).
  *   x19 = ctx (xCtx); x20 = G loaded from ctx->guest_base at 0x130 (xG, so
- *         guest memory is addressed [x20, wAddr, uxtw]); x24 = 0 on entry
+ *         guest memory is addressed [x20, wAddr, uxtw]); x25 = the
+ *         g_vm32_prot_jit base (like the L2b trampoline); x24 = 0 on entry
  *         and the chain_hits delta on exit; x27/x28 = chaining registers;
  *         x29/x30 = frame/link; d8-d15 preserved across the call.
  *   x0-x3 still hold the C arguments on fragment entry (the trampoline
@@ -106,6 +107,16 @@
     .macro THREAD_CORE
     mov x19, x0
     ldr x20, [x0, #0x130]
+    /* S32-R8-7: install the x25 prot-table base like the L2b trampoline
+     * (trampoline_a64.S), so inline fast-path loads/stores can probe
+     * [x25, wVpn, uxtw]. */
+#ifdef __APPLE__
+    adrp x25, _g_vm32_prot_jit@PAGE
+    ldr x25, [x25, _g_vm32_prot_jit@PAGEOFF]
+#else
+    adrp x25, g_vm32_prot_jit
+    ldr x25, [x25, #:lo12:g_vm32_prot_jit]
+#endif
     msr nzcv, xzr
     mov x24, xzr
     blr x1

@@ -8,8 +8,9 @@
  * (src/rt32/thread_entry.S) establishes the translated-code register
  * conventions on any host thread and reports exits identically to the main
  * dispatcher entry (src/dbt/trampoline_a64.S):
- *   x19 = ctx, x20 = G (ctx->guest_base), NZCV = 0, SP 16-aligned at
- *   fragment entry; w16 -> ctx->exit_reason, w15 -> ctx->exit_dest, and the
+ *   x19 = ctx, x20 = G (ctx->guest_base), x25 = prot-table base, NZCV = 0,
+ *   SP 16-aligned at fragment entry; w16 -> ctx->exit_reason,
+ *   w15 -> ctx->exit_dest, and the
  *   x24 chain_hits delta folded into ctx->chain_hits on return; x27/x28
  *   carry the chaining registers (block: live epoch word; step: zero word
  *   so epoch-gated chain probes bail).
@@ -58,6 +59,12 @@ extern void rt32_thread_enter_step(sparc32_ctx_t *ctx, const void *entry,
 
 static int failures = 0;
 
+/* S32-R8-7 anchor: THREAD_CORE installs x25 = g_vm32_prot_jit (owned by
+ * src/vm/vm32.c in the full binary); this standalone probe TU provides
+ * the table itself so the link holds and the probe can verify x25. */
+static uint8_t tentry_prot_table[16];
+uint8_t *g_vm32_prot_jit = tentry_prot_table;
+
 #define EXPECT(tag, cond)                                                     \
     do {                                                                      \
         if (!(cond)) {                                                        \
@@ -103,6 +110,7 @@ struct tentry_rec {
     uint64_t x28_seen;   /* +40: x28 at fragment entry */
     uint32_t epoch_word; /* +48: word under x28 (epoch probe target) */
     uint32_t pad;        /* +52 */
+    uint64_t x25_seen;   /* +56: x25 (prot-table base) at fragment entry */
 };
 
 _Static_assert(offsetof(struct tentry_rec, ctx_seen) == 0, "rec.ctx");
@@ -112,6 +120,7 @@ _Static_assert(offsetof(struct tentry_rec, sp_residue) == 24, "rec.sp");
 _Static_assert(offsetof(struct tentry_rec, x27_seen) == 32, "rec.x27");
 _Static_assert(offsetof(struct tentry_rec, x28_seen) == 40, "rec.x28");
 _Static_assert(offsetof(struct tentry_rec, epoch_word) == 48, "rec.epoch");
+_Static_assert(offsetof(struct tentry_rec, x25_seen) == 56, "rec.x25");
 
 #ifdef __APPLE__
 #define TENTRY_ASM_NAME(x) "_" #x
@@ -141,6 +150,7 @@ TENTRY_ASM_NAME(tentry_probe) ":\n"
 "  str x28, [x2, #40]\n"
 "  ldr w4, [x28]\n"
 "  str w4, [x2, #48]\n"
+"  str x25, [x2, #56]\n"
 "  add x24, x24, #7\n"
 "  movz w15, #0x1000\n"
 "  movz w16, #1\n"
@@ -169,11 +179,11 @@ static void tentry_poison_host_flags(void)
 
 static void tentry_dump_rec(const struct tentry_rec *r)
 {
-    printf("  rec: ctx=%llx g=%llx nzcv=%llx sp_res=%llu x27=%llx x28=%llx epoch=%lx\n",
+    printf("  rec: ctx=%llx g=%llx nzcv=%llx sp_res=%llu x27=%llx x28=%llx epoch=%lx x25=%llx\n",
         (unsigned long long)r->ctx_seen, (unsigned long long)r->g_seen,
         (unsigned long long)r->nzcv, (unsigned long long)r->sp_residue,
         (unsigned long long)r->x27_seen, (unsigned long long)r->x28_seen,
-        (unsigned long)r->epoch_word);
+        (unsigned long)r->epoch_word, (unsigned long long)r->x25_seen);
 }
 
 static void run_entry(const char *tag, int use_step)
@@ -202,6 +212,7 @@ static void run_entry(const char *tag, int use_step)
 
     EXPECT(tag, rec.ctx_seen == (uint64_t)(uintptr_t)&ctx);
     EXPECT(tag, rec.g_seen == (uint64_t)TENTRY_WANT_G);
+    EXPECT(tag, rec.x25_seen == (uint64_t)(uintptr_t)tentry_prot_table);
     EXPECT(tag, rec.nzcv == 0U);
     EXPECT(tag, rec.sp_residue == 0U);
     EXPECT(tag, rec.x27_seen == (uint64_t)(uintptr_t)&rec);
