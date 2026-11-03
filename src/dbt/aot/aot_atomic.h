@@ -37,6 +37,7 @@
 #include "interp/interp_priv.h"
 
 extern void vm_invalidate_jit(sparc32_ctx_t *ctx, uint32_t start, uint32_t end);
+extern uint8_t sparc32_ldstub_exchange(uint8_t *cell);
 
 /* Encode a guest word to the 32-bit cell image stored at HVA (BE bytes). */
 static inline uint32_t sparc32_be_cell_encode(uint32_t v)
@@ -102,7 +103,9 @@ static inline bool sparc32_atomic_ldstub(sparc32_ctx_t *ctx, uint32_t va,
         return false;
     }
     cell = (uint8_t *)hva;
-    old = __atomic_exchange_n(cell, (uint8_t)0xFFU, __ATOMIC_SEQ_CST);
+    sparc32_vm_access_leave();
+    old = sparc32_ldstub_exchange(cell);
+    sparc32_vm_access_enter();
     vm32_note_page_write(va, 1U);
     has_code = vm32_range_has_code(va, 1U);
     sparc32_vm_access_leave();

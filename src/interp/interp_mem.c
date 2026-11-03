@@ -12,7 +12,39 @@ G-window loads/stores with region coverage checks, shared by the
 
 #include "interp/interp_priv.h"
 
+#include <sched.h>
 #include <string.h>
+
+uint8_t sparc32_ldstub_exchange(uint8_t *cell)
+{
+    static uint32_t gate = 0U;
+    static uint8_t *active_cell = NULL;
+    unsigned spins = 0U;
+    for (;;) {
+        uint8_t *act;
+        while (__atomic_exchange_n(&gate, 1U, __ATOMIC_ACQUIRE) != 0U) {
+            sched_yield();
+        }
+        act = __atomic_load_n(&active_cell, __ATOMIC_ACQUIRE);
+        if (act == NULL || act == cell ||
+            __atomic_load_n(act, __ATOMIC_SEQ_CST) != 0xFFU ||
+            spins >= 1024U) {
+            uint8_t old = __atomic_exchange_n(cell, (uint8_t)0xFFU,
+                __ATOMIC_SEQ_CST);
+            if (old == 0U) {
+                __atomic_store_n(&active_cell, cell, __ATOMIC_RELEASE);
+            }
+            __atomic_store_n(&gate, 0U, __ATOMIC_RELEASE);
+            if (old != 0U) {
+                sched_yield();
+            }
+            return old;
+        }
+        __atomic_store_n(&gate, 0U, __ATOMIC_RELEASE);
+        spins++;
+        sched_yield();
+    }
+}
 
 void interp_wreg(sparc32_ctx_t *ctx, uint32_t rd, uint32_t v)
 {

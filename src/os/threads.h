@@ -192,7 +192,9 @@ struct thr_start {
     sparc32_ctx_t *ctx;
     uint32_t clear_tid_va;
     uint32_t child_tid_va;
+    uint32_t parent_tid_va;
     bool flags_cleartid;
+    bool flags_parent_settid;
     pthread_mutex_t lock;
     pthread_cond_t ready;
     bool tid_ready;

@@ -478,7 +478,9 @@ long sparc32_thr_fork(sparc32_ctx_t *ctx)
         return -(long)e;
     }
     if (pid == 0) {
+        struct timespec ts = { 0, 1000000L };
         sparc32_thr_fork_child(ctx);
+        (void)nanosleep(&ts, NULL);
         ctx->r[SPARC32_O1] = 1U;
         return 0;
     }
@@ -689,14 +691,17 @@ static void *thr_thread_entry(void *arg)
     pthread_mutex_lock(&thr_live_lock);
     thr_live_set_pt_locked(ctx, pthread_self());
     pthread_mutex_unlock(&thr_live_lock);
+    if (st->flags_parent_settid && st->parent_tid_va != 0U) {
+        (void)thr_st(ctx, st->parent_tid_va, (uint32_t)ctx->host_tid);
+    }
+    if (st->flags_cleartid && st->child_tid_va != 0U) {
+        (void)thr_st(ctx, st->child_tid_va, (uint32_t)ctx->host_tid);
+    }
     pthread_mutex_lock(&st->lock);
     st->child_tid = (long)ctx->host_tid;
     st->tid_ready = true;
     pthread_cond_signal(&st->ready);
     pthread_mutex_unlock(&st->lock);
-    if (st->flags_cleartid && st->child_tid_va != 0U) {
-        (void)thr_st(ctx, st->child_tid_va, (uint32_t)ctx->host_tid);
-    }
     rt32_vm_sync_ctx(ctx);
     for (;;) {
         if (sparc32_thr_is_retired(ctx)) {
@@ -839,12 +844,20 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
     st->ctx = child;
     st->clear_tid_va = child->clear_child_tid;
     st->child_tid_va = child_tid_va;
+    st->parent_tid_va = parent_tid_va;
     st->flags_cleartid = (flags & THR_CLONE_CHILD_CLEARTID) != 0U;
+    st->flags_parent_settid = (flags & THR_CLONE_PARENT_SETTID) != 0U;
     st->tid_ready = false;
     st->child_tid = -1L;
     st->refs = 2;
     interp_window_clone_save(st->winfile, st->winsp, st->win_valid,
         st->wino);
+    if (stack != 0U) {
+        memset(st->win_valid, 0, sizeof(st->win_valid));
+        memset(st->winsp, 0, sizeof(st->winsp));
+        child->canrestore = 0U;
+        child->cansave = 7U;
+    }
     thr_register(child);
     if (pthread_mutex_init(&st->lock, NULL) != 0 ||
         pthread_cond_init(&st->ready, NULL) != 0 ||
@@ -870,9 +883,7 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
     thr_live_set_pt_locked(child, th);
     pthread_mutex_unlock(&thr_live_lock);
     /* Rendezvous on the real kernel TID (reported as the clone return
-     * value and stored to parent_tidptr). Refcounted (S32-R4-1): the
-     * parent drops one ref here, the child drops the other at finish;
-     * only the last to reach zero destroys lock/cond and frees st. */
+     * value and stored to parent_tidptr before signaling ready). */
     pthread_mutex_lock(&st->lock);
     while (!st->tid_ready) {
         pthread_cond_wait(&st->ready, &st->lock);
@@ -880,9 +891,6 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
     child_tid = st->child_tid;
     pthread_mutex_unlock(&st->lock);
     thr_start_release(st);
-    if ((flags & THR_CLONE_PARENT_SETTID) != 0U && parent_tid_va != 0U) {
-        (void)thr_st(ctx, parent_tid_va, (uint32_t)child_tid);
-    }
     ctx->r[SPARC32_O1] = 0U;
     return child_tid;
 }
