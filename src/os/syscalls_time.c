@@ -17,6 +17,7 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -28,7 +29,7 @@
 #include "os/threads.h"
 
 #define SP_FIONREAD 0x4004667fU
-#define SP_TCGETS 0x80245408U
+#define SP_TCGETS 0x40245408U
 #define SP_FUTEX_WAIT 0U
 #define SP_FUTEX_WAKE 1U
 
@@ -356,5 +357,33 @@ long sparc32_l2a_ioctl(sparc32_ctx_t *ctx, uint32_t fd, uint32_t request,
         }
         return l2a_st_be32(ctx, arg_va, (uint32_t)n);
     }
-    return (request == SP_TCGETS) ? (isatty((int)fd) ? 0 : -ENOTTY) : -ENOTTY;
+    if (request == SP_TCGETS) {
+        /* SPARC TCGETS returns the 36-byte BE struct termios:
+         * BE u32 c_iflag/c_oflag/c_cflag/c_lflag, u8 c_line,
+         * u8 c_cc[17], 2 bytes padding (struct alignment). */
+        uint8_t t[36];
+        struct termios ht;
+        size_t i;
+        memset(t, 0, sizeof(t));
+        if (l2a_range_ok_prot(arg_va, 36U, 2U) != 0) {
+            return -EFAULT;
+        }
+        if (!isatty((int)fd)) {
+            return -ENOTTY;
+        }
+        if (tcgetattr((int)fd, &ht) == 0) {
+            put_be32(t, (uint32_t)ht.c_iflag);
+            put_be32(t + 4, (uint32_t)ht.c_oflag);
+            put_be32(t + 8, (uint32_t)ht.c_cflag);
+            put_be32(t + 12, (uint32_t)ht.c_lflag);
+#if defined(__linux__)
+            t[16] = ht.c_line;
+#endif
+            for (i = 0; i < 17U; i++) {
+                t[17 + i] = ht.c_cc[i];
+            }
+        }
+        return l2a_store(ctx, arg_va, t, 36U);
+    }
+    return -ENOTTY;
 }

@@ -103,12 +103,13 @@ long sparc32_l2a_rt_sigprocmask(sparc32_ctx_t *ctx, uint32_t how,
 long sparc32_l2a_ioctl(sparc32_ctx_t *ctx, uint32_t fd, uint32_t request,
     uint32_t arg_va);
 
-/* SPARC Linux errnos are the asm-generic numbers. On the AArch64 Linux
- * deployment host they match the host values, but the mapping is kept
- * explicit (rather than identity) so the E04 carry convention holds on
- * any build host — e.g. macOS reports ENOSYS as 78, SPARC as 38. Only
- * errnos this layer can produce are listed; anything else falls back
- * to the raw value, which is correct on the Linux host. */
+/* SPARC Linux errnos follow SunOS numbering
+ * (arch/sparc/include/uapi/asm/errno.h), not the asm-generic numbers.
+ * On the AArch64 Linux deployment host they match the host values, but
+ * the mapping is kept explicit (rather than identity) so the E04 carry
+ * convention holds on any build host — e.g. macOS reports ENOSYS as 78,
+ * SPARC as 90. Only errnos this layer can produce are listed; anything
+ * else falls back to the raw value, which is correct on the Linux host. */
 static uint32_t sparc_errno_from_host(long host_errno)
 {
     switch (host_errno) {
@@ -140,11 +141,11 @@ static uint32_t sparc_errno_from_host(long host_errno)
     case ESPIPE: return 29U;
     case EROFS: return 30U;
     case EPIPE: return 32U;
-    case ENOSYS: return 38U;
-    case ENAMETOOLONG: return 36U;
-    case ELOOP: return 40U;
+    case ENOSYS: return 90U;
+    case ENAMETOOLONG: return 63U;
+    case ELOOP: return 62U;
     case ERANGE: return 34U;
-    case EOVERFLOW: return 75U;
+    case EOVERFLOW: return 92U;
     default: break;
     }
     return (uint32_t)host_errno;

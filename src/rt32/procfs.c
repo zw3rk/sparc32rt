@@ -122,7 +122,7 @@ static long procfs_open_exe(sparc32_ctx_t *ctx, int host_flags)
     return (long)fd;
 }
 
-static long procfs_open_maps(sparc32_ctx_t *ctx)
+static long procfs_open_maps(sparc32_ctx_t *ctx, int host_flags)
 {
     size_t total = 0;
     size_t i;
@@ -160,13 +160,13 @@ static long procfs_open_maps(sparc32_ctx_t *ctx)
         pos += (size_t)n;
     }
     {
-        long fd = procfs_serve_bytes(buf, total, O_RDONLY);
+        long fd = procfs_serve_bytes(buf, total, host_flags);
         free(buf);
         return fd;
     }
 }
 
-static long procfs_open_cmdline(sparc32_ctx_t *ctx)
+static long procfs_open_cmdline(sparc32_ctx_t *ctx, int host_flags)
 {
     size_t total = 0;
     int i;
@@ -194,12 +194,12 @@ static long procfs_open_cmdline(sparc32_ctx_t *ctx)
         memcpy(buf + pos, ctx->guest_argv[i], n);
         pos += n;
     }
-    fd = procfs_serve_bytes(buf, total, O_RDONLY);
+    fd = procfs_serve_bytes(buf, total, host_flags);
     free(buf);
     return fd;
 }
 
-static long procfs_open_stat(sparc32_ctx_t *ctx)
+static long procfs_open_stat(sparc32_ctx_t *ctx, int host_flags)
 {
     char buf[192];
     const char *ep = procfs_exe_path(ctx);
@@ -224,10 +224,10 @@ static long procfs_open_stat(sparc32_ctx_t *ctx)
     if (n < 0 || (size_t)n >= sizeof(buf)) {
         return -EIO;
     }
-    return procfs_serve_bytes(buf, (size_t)n, O_RDONLY);
+    return procfs_serve_bytes(buf, (size_t)n, host_flags);
 }
 
-static long procfs_open_auxv(sparc32_ctx_t *ctx)
+static long procfs_open_auxv(sparc32_ctx_t *ctx, int host_flags)
 {
     uint8_t out[256];
     size_t words;
@@ -245,7 +245,7 @@ static long procfs_open_auxv(sparc32_ctx_t *ctx)
         out[4U * i + 2U] = (uint8_t)(v >> 8);
         out[4U * i + 3U] = (uint8_t)v;
     }
-    return procfs_serve_bytes(out, words * sizeof(uint32_t), O_RDONLY);
+    return procfs_serve_bytes(out, words * sizeof(uint32_t), host_flags);
 }
 
 long rt32_procfs_openat(sparc32_ctx_t *ctx, int dirfd, const char *path,
@@ -260,16 +260,16 @@ long rt32_procfs_openat(sparc32_ctx_t *ctx, int dirfd, const char *path,
             return -EACCES;
         }
         if (strcmp(rel, "maps") == 0) {
-            return procfs_open_maps(ctx);
+            return procfs_open_maps(ctx, host_flags);
         }
         if (strcmp(rel, "cmdline") == 0) {
-            return procfs_open_cmdline(ctx);
+            return procfs_open_cmdline(ctx, host_flags);
         }
         if (strcmp(rel, "stat") == 0) {
-            return procfs_open_stat(ctx);
+            return procfs_open_stat(ctx, host_flags);
         }
         if (strcmp(rel, "auxv") == 0) {
-            return procfs_open_auxv(ctx);
+            return procfs_open_auxv(ctx, host_flags);
         }
     }
     {
