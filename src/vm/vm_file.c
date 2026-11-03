@@ -7,8 +7,8 @@
  * Implements a process-local table of guest file mappings for shrink and
  * mutation handling. Each mmap of a file registers one entry keyed by
  * ((st_dev, st_ino), map_gva) holding the guest range, the backing file
- * offset, and the tracked file_size / resize_seq / code_generation
- * clocks. Host truncate/write hooks (vm_file_note_mutation) bump the
+ * offset, and the tracked file_size / code_generation clocks.
+ * Host truncate/write hooks (vm_file_note_mutation) bump the
  * clocks and revert pages that fall beyond a shrunk EOF to clean.
  * munmap, MAP_FIXED replacement, mremap source retirement, and exec
  * reset retire entries via vm_file_unregister_range / vm_file_reset so
@@ -30,14 +30,12 @@
 #include "os/backend.h"
 #include "dbt/aot/mem_site.h"
 
-/* Family-shared inode entry (section 5.1.3; MAP_SHARED in full impl). */
+/* Process-local tracked inode entry. */
 #define VMF_MAX_INODES 128u
 
 typedef struct {
     uint64_t inode_key;
     _Atomic uint64_t file_size;
-    _Atomic uint64_t resize_seq;
-    _Atomic uint64_t min_shrunk;
     _Atomic uint64_t code_generation;
     int host_fd;
     bool live;
@@ -74,10 +72,6 @@ static vm_inode_shared_t *vmf_alloc(uint64_t key, int host_fd,
             g_inodes[i].map_off = 0u;
             atomic_store_explicit(&g_inodes[i].file_size, 0u,
                 memory_order_relaxed);
-            atomic_store_explicit(&g_inodes[i].resize_seq, 0u,
-                memory_order_relaxed);
-            atomic_store_explicit(&g_inodes[i].min_shrunk, 0u,
-                memory_order_relaxed);
             atomic_store_explicit(&g_inodes[i].code_generation, 1u,
                 memory_order_relaxed);
             return &g_inodes[i];
@@ -93,10 +87,6 @@ static vm_inode_shared_t *vmf_alloc(uint64_t key, int host_fd,
     g_inodes[g_inode_count].map_pages = 0u;
     g_inodes[g_inode_count].map_off = 0u;
     atomic_store_explicit(&g_inodes[g_inode_count].file_size, 0u,
-        memory_order_relaxed);
-    atomic_store_explicit(&g_inodes[g_inode_count].resize_seq, 0u,
-        memory_order_relaxed);
-    atomic_store_explicit(&g_inodes[g_inode_count].min_shrunk, 0u,
         memory_order_relaxed);
     atomic_store_explicit(&g_inodes[g_inode_count].code_generation, 1u,
         memory_order_relaxed);
@@ -193,11 +183,7 @@ void vm_file_note_mutation(uint64_t dev, uint64_t ino, int host_fd,
             memory_order_relaxed);
         if (new_size < old) {
             vmf_shrink_entry(e, new_size, old);
-            atomic_store_explicit(&e->min_shrunk, new_size,
-                memory_order_relaxed);
         }
-        atomic_fetch_add_explicit(&e->resize_seq, 1u,
-            memory_order_relaxed);
         atomic_fetch_add_explicit(&e->code_generation, 1u,
             memory_order_relaxed);
     }
@@ -271,12 +257,6 @@ void vm_file_unregister_range(uint32_t gva, uint32_t len)
             t->map_off = tail_off;
             atomic_store_explicit(&t->file_size,
                 atomic_load_explicit(&e->file_size, memory_order_relaxed),
-                memory_order_relaxed);
-            atomic_store_explicit(&t->resize_seq,
-                atomic_load_explicit(&e->resize_seq, memory_order_relaxed),
-                memory_order_relaxed);
-            atomic_store_explicit(&t->min_shrunk,
-                atomic_load_explicit(&e->min_shrunk, memory_order_relaxed),
                 memory_order_relaxed);
             atomic_store_explicit(&t->code_generation,
                 atomic_load_explicit(&e->code_generation,

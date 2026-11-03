@@ -131,11 +131,9 @@ static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
             vm_range_overlaps_locked(addr, (uint32_t)((uint64_t)addr + aligned_len))) {
             return (uint32_t)(-EEXIST);
         }
-        /* MAP_FIXED replaces whatever lived here (S32-R5-9): retire the
-         * overwritten file-tracking range before the host mapping lands. */
-        if ((flags & RT32_MAP_FIXED_NOREPLACE) == 0U) {
-            vm_file_unregister_range(addr, (uint32_t)aligned_len);
-        }
+        /* MAP_FIXED replaces whatever lived here (S32-R5-9): the
+         * overwritten file-tracking range is retired only after the host
+         * mapping succeeds (see below), so a failed mmap keeps tracking. */
         target_va = addr;
     } else {
         uint32_t hint_va = sparc32_page_down(addr);
@@ -202,6 +200,13 @@ static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
             return (uint32_t)(map_rc != 0 ? map_rc : -EEXIST);
         }
 
+        /* MAP_FIXED replacement (S32-R5-9): retire the overwritten
+         * file-tracking range only after the host mapping succeeded,
+         * right before registering the new mapping. */
+        if ((flags & RT32_MAP_FIXED) != 0U &&
+            (flags & RT32_MAP_FIXED_NOREPLACE) == 0U) {
+            vm_file_unregister_range(target_va, (uint32_t)aligned_len);
+        }
         /* Regime VM + Provider-A lifecycle (RC-U3-r2 #4): attach, publish
          * the committed protection, and register file-backed ranges by
          * inode identity. */
@@ -500,6 +505,8 @@ uint32_t rt32_vm_mremap(sparc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                 return old_addr;
             }
             if (new_aligned < old_aligned) {
+                /* mremap shrink (S32-R5-9): vm_munmap_locked retires the
+                 * file-tracking range of the shrunk-away tail. */
                 uint32_t unmap_addr = old_addr + (uint32_t)new_aligned;
                 uint32_t unmap_len  = (uint32_t)(old_aligned - new_aligned);
                 int rc = vm_munmap_locked(ctx, unmap_addr, unmap_len);
@@ -645,6 +652,10 @@ uint32_t rt32_vm_mremap(sparc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                 }
             }
             (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
+            /* mremap relocate (S32-R5-9): retire the old source range so
+             * later mutation hooks skip it (vm_munmap_locked already
+             * retires the covered tail; this guarantees the source). */
+            vm_file_unregister_range(old_addr, (uint32_t)old_aligned);
             vm_invalidate_jit_locked(ctx, old_addr,
                 (uint32_t)((uint64_t)old_addr + old_aligned));
             if (is_fixed || (prot & (uint32_t)PROT_EXEC) != 0U) {

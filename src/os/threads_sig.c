@@ -173,18 +173,16 @@ long sparc32_thr_rt_sigsuspend(sparc32_ctx_t *ctx, uint32_t set_va,
             }
             return 0;
         }
-        /* Phase 2: single-winner process claims (S32-R3-7). A signal
-         * owned by another thread's pending bit is never stolen
-         * (S32-R5-4): the thread check runs before the claim so the
-         * process word survives for its owner. Unhandled signals route
-         * like Phase 1 (S32-R5-5) instead of being silently dropped. */
+        /* Phase 2: single-winner process claims (S32-R3-7), matching
+         * interp_poll_async (S32-R5-4): a process-pending signal is not
+         * skipped just because another thread holds a blocked
+         * thread-directed pending bit of the same number. Unhandled
+         * signals route like Phase 1 (S32-R5-5) instead of being
+         * silently dropped. */
         for (s = 1; s <= 64; s++) {
             uint32_t handler;
             uint32_t restorer;
             if (sparc32_thr_sig_blocked(ctx, s) != 0) {
-                continue;
-            }
-            if (sparc32_thr_thread_has_pending(s)) {
                 continue;
             }
             if (sparc32_signal_get(s, &handler, &restorer) != 0) {
