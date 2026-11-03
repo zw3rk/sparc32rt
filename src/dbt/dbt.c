@@ -89,6 +89,7 @@ static const dbt_block_t *dbt_translate_locked(sparc32_ctx_t *ctx, uint32_t pc,
     bool have_insn = false;
     uint32_t limit = single ? 1U : (uint32_t)DBT_MAX_INSNS_PER_BLOCK;
 
+    memset(&last, 0, sizeof(last));
     mem = dbt_code_reserve_locked(ctx,
         single ? (size_t)DBT_STEP_RESERVE_WORDS
                : (size_t)DBT_BLOCK_RESERVE_WORDS);

@@ -14,6 +14,9 @@
  * never host values.
  */
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
@@ -21,6 +24,7 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "sparc32rt.h"
 
@@ -219,6 +223,7 @@ long sparc32_l2a_futex_emu32(sparc32_ctx_t *ctx, uint32_t uaddr,
 {
     uint32_t cmd = op & FUTEX_SP_CMD_MASK;
     int absolute = (op & FUTEX_SP_CLOCK_REALTIME) != 0U;
+    (void)absolute;
     if (cmd != FUTEX_SP_WAIT && cmd != FUTEX_SP_WAKE) {
         return -SP_ENOSYS;
     }
@@ -253,6 +258,7 @@ long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
 {
     uint32_t cmd = op & FUTEX_SP_CMD_MASK;
     int absolute = (op & FUTEX_SP_CLOCK_REALTIME) != 0U;
+    (void)absolute;
     if (cmd != FUTEX_SP_WAIT && cmd != FUTEX_SP_WAKE) {
         return -SP_ENOSYS;
     }

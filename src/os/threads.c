@@ -675,8 +675,8 @@ static void *thr_thread_entry(void *arg)
 {
     struct thr_start *st = (struct thr_start *)arg;
     sparc32_ctx_t *ctx = st->ctx;
-    interp_window_clone_restore(st->winfile, st->winsp, st->win_valid,
-        st->wino);
+    interp_window_clone_restore((const uint32_t (*)[16])st->winfile,
+        st->winsp, st->win_valid, (const uint32_t (*)[8])st->wino);
     ctx->host_tid = thr_gettid();
     pthread_mutex_lock(&thr_live_lock);
     thr_live_set_pt_locked(ctx, pthread_self());

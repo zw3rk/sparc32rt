@@ -363,6 +363,7 @@ long sparc32_l2a_ioctl(sparc32_ctx_t *ctx, uint32_t fd, uint32_t request,
          * u8 c_cc[17], 2 bytes padding (struct alignment). */
         uint8_t t[36];
         struct termios ht;
+        uint32_t lflag;
         size_t i;
         memset(t, 0, sizeof(t));
         if (l2a_range_ok_prot(arg_va, 36U, 2U) != 0) {
@@ -371,18 +372,35 @@ long sparc32_l2a_ioctl(sparc32_ctx_t *ctx, uint32_t fd, uint32_t request,
         if (!isatty((int)fd)) {
             return -ENOTTY;
         }
-        if (tcgetattr((int)fd, &ht) == 0) {
-            put_be32(t, (uint32_t)ht.c_iflag);
-            put_be32(t + 4, (uint32_t)ht.c_oflag);
-            put_be32(t + 8, (uint32_t)ht.c_cflag);
-            put_be32(t + 12, (uint32_t)ht.c_lflag);
-#if defined(__linux__)
-            t[16] = ht.c_line;
-#endif
-            for (i = 0; i < 17U; i++) {
-                t[17 + i] = ht.c_cc[i];
-            }
+        if (tcgetattr((int)fd, &ht) != 0) {
+            return -(long)errno;
         }
+        put_be32(t, (uint32_t)ht.c_iflag);
+        put_be32(t + 4, (uint32_t)ht.c_oflag);
+        put_be32(t + 8, (uint32_t)ht.c_cflag);
+        lflag = (uint32_t)ht.c_lflag;
+        if ((lflag & 0x1000U) != 0U) {
+            lflag = (lflag & ~0x1000U) | 0x2000U; /* generic FLUSHO -> SPARC FLUSHO */
+        }
+        put_be32(t + 12, lflag);
+#if defined(__linux__)
+        t[16] = ht.c_line;
+#endif
+        for (i = 0; i < 16U && i < (size_t)NCCS; i++) {
+            t[17 + i] = (uint8_t)ht.c_cc[i];
+        }
+#if defined(VEOF) && defined(VEOL) && defined(VMIN) && defined(VTIME) && defined(ICANON)
+        if ((ht.c_lflag & (tcflag_t)ICANON) != 0) {
+            t[17 + 4] = (uint8_t)ht.c_cc[VEOF];
+            t[17 + 5] = (uint8_t)ht.c_cc[VEOL];
+        } else {
+            t[17 + 4] = (uint8_t)ht.c_cc[VMIN];
+            t[17 + 5] = (uint8_t)ht.c_cc[VTIME];
+        }
+#endif
+#if defined(VEOL2)
+        t[17 + 6] = (uint8_t)ht.c_cc[VEOL2];
+#endif
         return l2a_store(ctx, arg_va, t, 36U);
     }
     return -ENOTTY;

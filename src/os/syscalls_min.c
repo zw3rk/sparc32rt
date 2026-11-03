@@ -245,7 +245,7 @@ static long sys_write(sparc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t
         if (guest_range_ok_prot(buf_va, 0U, 1U) != 0) {
             return -EFAULT;
         }
-        return host_ret(write((int)fd, sbuf, 0U));
+        return host_ret(write((int)fd, "", 0U));
     }
     if (count > sizeof(sbuf)) {
         if (guest_range_ok_prot(buf_va, count, 1U) != 0) {
