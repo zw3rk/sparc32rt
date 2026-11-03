@@ -327,29 +327,18 @@ static long sys_mremap(sparc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                                        flags, new_addr));
 }
 
-/* madvise(75)/msync(65) with Linux numeric advice/flags. len 0 no-ops;
- * addr must be page-aligned (EINVAL); the range must be mapped inside
- * the task window (ENOMEM, fail-closed). DONTNEED(4) zeroes writable
- * pages (the host mapping mirrors guest prot, so memset cannot fault),
- * advises the host, and invalidates translated code. Valid advice is
- * 0..4, 8..19, 100, 101; anything else is EINVAL like Linux. */
+/* madvise(75)/msync(65)/mincore(78): validate page alignment, mapped VMA
+ * coverage, and advice/flags. DONTNEED(4) zeroes writable pages, advises
+ * the host, and invalidates translated code. */
 static long sys_madvise(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
                         uint32_t advice)
 {
-    if (len == 0U) {
-        return 0;
-    }
-    if ((addr & 0xFFFU) != 0U) {
-        return -EINVAL;
-    }
+    if (len == 0U) return 0;
+    if ((addr & 0xFFFU) != 0U) return -EINVAL;
     if (advice > 101U || (advice > 19U && advice < 100U) ||
-        (advice > 4U && advice < 8U)) {
-        return -EINVAL;
-    }
+        (advice > 4U && advice < 8U)) return -EINVAL;
     if ((uint64_t)addr + len > (uint64_t)SPARC32_TASK_SIZE_TOP ||
-        guest_range_ok_prot(addr, len, 1U) != 0) {
-        return -ENOMEM;
-    }
+        guest_range_ok_prot(addr, len, 1U) != 0) return -ENOMEM;
     if (advice == 4U) {
         if (guest_range_ok_prot(addr, len, 2U) == 0) {
             memset(sparc32_guest_ptr(ctx, addr), 0, (size_t)len);
@@ -363,18 +352,26 @@ static long sys_madvise(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
 static long sys_msync(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
                       uint32_t flags)
 {
-    if (len == 0U) {
-        return 0;
-    }
-    if ((addr & 0xFFFU) != 0U || (flags & ~0x7U) != 0U) {
-        return -EINVAL;
-    }
+    if (len == 0U) return 0;
+    if ((addr & 0xFFFU) != 0U || (flags & ~0x7U) != 0U) return -EINVAL;
     if ((uint64_t)addr + len > (uint64_t)SPARC32_TASK_SIZE_TOP ||
-        guest_range_ok_prot(addr, len, 1U) != 0) {
-        return -ENOMEM;
-    }
+        guest_range_ok_prot(addr, len, 1U) != 0) return -ENOMEM;
     return (long)rt_host_msync(sparc32_guest_ptr(ctx, addr), (size_t)len,
         (int)flags);
+}
+
+static long sys_mincore(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
+                        uint32_t vec_va)
+{
+    uint64_t npages = ((uint64_t)len + 0xFFFULL) >> 12;
+    if ((addr & 0xFFFU) != 0U) return -EINVAL;
+    if (len == 0U) return 0;
+    if ((uint64_t)addr + (npages << 12) > (uint64_t)SPARC32_TASK_SIZE_TOP ||
+        guest_range_ok_prot(addr, (uint32_t)(npages << 12), 0U) != 0) return -ENOMEM;
+    if (guest_range_ok_prot(vec_va, (uint32_t)npages, 2U) != 0) return -EFAULT;
+    memset(sparc32_guest_ptr(ctx, vec_va), 1, (size_t)npages);
+    vm_invalidate_jit(ctx, vec_va, vec_va + (uint32_t)npages);
+    return 0;
 }
 
 /* struct utsname: six NUL-padded fields of 65 bytes each (390 total),
@@ -652,6 +649,9 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         break;
     case (long)SPARC32__NR_madvise:
         ret = sys_madvise(ctx, o0, o1, o2);
+        break;
+    case (long)SPARC32__NR_mincore:
+        ret = sys_mincore(ctx, o0, o1, o2);
         break;
     case (long)SPARC32__NR_close:
         ret = sparc32_l2a_close((int)(int32_t)o0);
