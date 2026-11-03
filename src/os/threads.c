@@ -73,6 +73,7 @@ _Atomic uint32_t g_wakeup_suppress[65];
 /* Sticky retirement marks (S32-R3-4 #4): marked contexts stay marked until
  * freed; guarded by thr_live_lock, polled with acquire loads. */
 static sparc32_ctx_t *thr_retired[THR_MAX_LIVE];
+static _Atomic uint32_t g_thr_retired_count = 0U;
 
 static void thr_retired_add_locked(sparc32_ctx_t *ctx)
 {
@@ -85,6 +86,8 @@ static void thr_retired_add_locked(sparc32_ctx_t *ctx)
     for (i = 0U; i < THR_MAX_LIVE; i++) {
         if (__atomic_load_n(&thr_retired[i], __ATOMIC_RELAXED) == NULL) {
             __atomic_store_n(&thr_retired[i], ctx, __ATOMIC_RELEASE);
+            atomic_fetch_add_explicit(&g_thr_retired_count, 1U,
+                memory_order_release);
             return;
         }
     }
@@ -96,6 +99,8 @@ static void thr_retired_remove_locked(sparc32_ctx_t *ctx)
     for (i = 0U; i < THR_MAX_LIVE; i++) {
         if (__atomic_load_n(&thr_retired[i], __ATOMIC_RELAXED) == ctx) {
             __atomic_store_n(&thr_retired[i], NULL, __ATOMIC_RELEASE);
+            atomic_fetch_sub_explicit(&g_thr_retired_count, 1U,
+                memory_order_release);
         }
     }
 }
@@ -103,7 +108,9 @@ static void thr_retired_remove_locked(sparc32_ctx_t *ctx)
 static bool thr_retired_contains(const sparc32_ctx_t *ctx)
 {
     size_t i;
-    if (ctx == NULL) {
+    if (ctx == NULL ||
+        atomic_load_explicit(&g_thr_retired_count, memory_order_acquire) ==
+            0U) {
         return false;
     }
     for (i = 0U; i < THR_MAX_LIVE; i++) {
@@ -444,6 +451,7 @@ void sparc32_thr_fork_child(sparc32_ctx_t *ctx)
         thr_live[i].pt_valid = 0;
         __atomic_store_n(&thr_retired[i], NULL, __ATOMIC_RELAXED);
     }
+    atomic_store_explicit(&g_thr_retired_count, 0U, memory_order_relaxed);
     atomic_store_explicit(&g_process_pending, 0ULL, memory_order_relaxed);
     atomic_store_explicit(&g_exec_retiring, false, memory_order_relaxed);
     if (ctx != NULL) {

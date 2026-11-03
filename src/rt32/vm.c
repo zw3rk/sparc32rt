@@ -859,16 +859,15 @@ uint32_t rt32_vm_brk(sparc32_ctx_t *ctx, uint32_t new_brk)
     }
 
     g_vm_brk_curr = new_brk;
+    if (new_page < old_page) {
+        vm_invalidate_jit(ctx, new_page, old_page);
+    }
     if (new_page != old_page) {
         vm_sync_to_ctx(ctx);
     } else {
         vm_sync_brk_to_ctx(ctx);
     }
     vm_lock_release();
-
-    if (new_page < old_page) {
-        vm_invalidate_jit(ctx, new_page, old_page);
-    }
     return new_brk;
 }
 

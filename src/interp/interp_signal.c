@@ -634,7 +634,11 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
     /* Per-thread mask only (S32-R3-5): no process-global merge. */
     blocked = ctx->sig_mask;
     p = __atomic_load_n(&ctx->pending_signals, __ATOMIC_ACQUIRE);
-    for (s = 1; s <= 64; s++) {
+    if ((p & ~blocked) == 0ULL &&
+        (sparc32_thr_process_pending() & ~blocked) == 0ULL) {
+        return false;
+    }
+    for (s = 1; (p & ~blocked) != 0ULL && s <= 64; s++) {
         uint64_t bit = 1ULL << (uint64_t)((uint32_t)(s - 1) % 32U);
         uint32_t w;
         if ((uint32_t)s <= 32U) {

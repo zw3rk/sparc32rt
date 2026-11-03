@@ -47,6 +47,7 @@ static pthread_mutex_t g_dbt_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_dbt_quiesce_cv = PTHREAD_COND_INITIALIZER;
 static uint32_t        g_dbt_active_runners;
 static bool            g_dbt_writer_waiting;
+static _Thread_local uint32_t t_dbt_quiesce_held;
 
 void dbt_lock_acquire(void)
 {
@@ -118,10 +119,12 @@ void dbt_quiesce_begin(void)
 {
     dbt_lock_acquire();
     dbt_wait_quiescent_locked();
+    t_dbt_quiesce_held = 1U;
 }
 
 void dbt_quiesce_end(void)
 {
+    t_dbt_quiesce_held = 0U;
     dbt_lock_release();
 }
 
@@ -145,6 +148,7 @@ void dbt_fork_child_reset(void)
 {
     __atomic_store_n(&g_dbt_active_runners, 0U, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_dbt_writer_waiting, false, __ATOMIC_SEQ_CST);
+    t_dbt_quiesce_held = 0U;
     pthread_mutex_unlock(&g_dbt_lock);
     pthread_mutex_destroy(&g_dbt_lock);
     pthread_mutex_init(&g_dbt_lock, NULL);
@@ -323,20 +327,10 @@ uint32_t dbt_cached_count(void)
     return c;
 }
 
-/* Range-selective invalidation (S32-4, S32-5): retire cached blocks
- * overlapping [start, end), clear RT_PAGE_HAS_CODE on unmapped/mprotected
- * pages, and bump g_cache_epoch only when a block was retired without
- * unmapping or stripping PROT_EXEC from g_arena_base. */
-void sparc32_dbt_invalidate_range(sparc32_ctx_t *ctx, uint32_t start,
-    uint32_t end)
+static void dbt_invalidate_range_locked(uint32_t start, uint32_t end)
 {
     bool invalidated = false;
     size_t i;
-    (void)ctx;
-    if (end <= start) {
-        return;
-    }
-    dbt_lock_acquire();
     for (i = 0U; i < DBT_CACHE_SIZE; i++) {
         if (g_blocks[i].valid &&
             g_blocks[i].end_pc > start &&
@@ -367,6 +361,27 @@ void sparc32_dbt_invalidate_range(sparc32_ctx_t *ctx, uint32_t start,
     if (invalidated) {
         dbt_bump_epoch_locked();
     }
+}
+
+/* Range-selective invalidation (S32-4, S32-5): retire cached blocks
+ * overlapping [start, end), clear RT_PAGE_HAS_CODE on unmapped/mprotected
+ * pages, and bump g_cache_epoch only when a block was retired without
+ * unmapping or stripping PROT_EXEC from g_arena_base. When called from
+ * a VM writer that already holds dbt_quiesce_begin (g_dbt_lock), skip
+ * re-acquiring the non-recursive mutex on the same thread. */
+void sparc32_dbt_invalidate_range(sparc32_ctx_t *ctx, uint32_t start,
+    uint32_t end)
+{
+    (void)ctx;
+    if (end <= start) {
+        return;
+    }
+    if (t_dbt_quiesce_held != 0U) {
+        dbt_invalidate_range_locked(start, end);
+        return;
+    }
+    dbt_lock_acquire();
+    dbt_invalidate_range_locked(start, end);
     dbt_lock_release();
 }
 
