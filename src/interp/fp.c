@@ -65,6 +65,20 @@ static bool fp_double_dest(uint32_t opf)
     }
 }
 
+/* S32-R7-16: when TEM traps, suppress the destination/FCC update and
+ * report EXIT_TRAP with the faulting PC. Helpers record FTT and cexc;
+ * this wrapper owns the PC and the exit transition. */
+static bool fp_take_trap(sparc32_ctx_t *ctx, uint32_t pc)
+{
+    if ((ctx->fsr & (uint32_t)FP_FSR_FTT_MASK) == 0U) {
+        return false;
+    }
+    ctx->exit_reason = SPARC32_EXIT_TRAP;
+    ctx->exit_arg = (uint32_t)FP_TRAP_FP_EXCEPTION;
+    ctx->exit_dest = pc;
+    return true;
+}
+
 bool sparc32_fp_step(sparc32_ctx_t *ctx, uint32_t pc,
     const sparc32_decoded_t *d)
 {
@@ -72,6 +86,26 @@ bool sparc32_fp_step(sparc32_ctx_t *ctx, uint32_t pc,
     uint32_t rs1 = d->rs1;
     uint32_t rs2 = d->rs2;
     uint32_t rd = d->rd;
+    /* S32-R7-23: enforce the (op3, opf) group before touching state. */
+    if (d->op3 == (uint32_t)SPARC32_OP3_FPOP1) {
+        if (opf == (uint32_t)FP_OPF_FCMPS ||
+            opf == (uint32_t)FP_OPF_FCMPD ||
+            opf == (uint32_t)FP_OPF_FCMPES ||
+            opf == (uint32_t)FP_OPF_FCMPED ||
+            opf == (uint32_t)FP_OPF_FSMULD) {
+            return fp_undef(ctx, pc);
+        }
+    } else if (d->op3 == (uint32_t)SPARC32_OP3_FPOP2) {
+        if (opf != (uint32_t)FP_OPF_FCMPS &&
+            opf != (uint32_t)FP_OPF_FCMPD &&
+            opf != (uint32_t)FP_OPF_FCMPES &&
+            opf != (uint32_t)FP_OPF_FCMPED &&
+            opf != (uint32_t)FP_OPF_FSMULD) {
+            return fp_undef(ctx, pc);
+        }
+    } else {
+        return fp_undef(ctx, pc);
+    }
     if (fp_double_dest(opf) && ((rd & 1U) != 0U)) {
         return fp_undef(ctx, pc);
     }
@@ -100,105 +134,211 @@ bool sparc32_fp_step(sparc32_ctx_t *ctx, uint32_t pc,
         fp_clear_cexc(ctx);
         fp_put_d(ctx, rd, fp_get_d(ctx, rs2) & 0x7FFFFFFFFFFFFFFFULL);
         return true;
-    case FP_OPF_FADDS:
-        fp_put_s(ctx, rd,
-            fp_add_f32(ctx, fp_get_s(ctx, rs1), fp_get_s(ctx, rs2)));
+    case FP_OPF_FADDS: {
+        uint32_t r =
+            fp_add_f32(ctx, fp_get_s(ctx, rs1), fp_get_s(ctx, rs2));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_s(ctx, rd, r);
         return true;
-    case FP_OPF_FADDD:
-        fp_put_d(ctx, rd,
-            fp_add_f64(ctx, fp_get_d(ctx, rs1), fp_get_d(ctx, rs2)));
+    }
+    case FP_OPF_FADDD: {
+        uint64_t r =
+            fp_add_f64(ctx, fp_get_d(ctx, rs1), fp_get_d(ctx, rs2));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_d(ctx, rd, r);
         return true;
-    case FP_OPF_FSUBS:
-        fp_put_s(ctx, rd,
-            fp_sub_f32(ctx, fp_get_s(ctx, rs1), fp_get_s(ctx, rs2)));
+    }
+    case FP_OPF_FSUBS: {
+        uint32_t r =
+            fp_sub_f32(ctx, fp_get_s(ctx, rs1), fp_get_s(ctx, rs2));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_s(ctx, rd, r);
         return true;
-    case FP_OPF_FSUBD:
-        fp_put_d(ctx, rd,
-            fp_sub_f64(ctx, fp_get_d(ctx, rs1), fp_get_d(ctx, rs2)));
+    }
+    case FP_OPF_FSUBD: {
+        uint64_t r =
+            fp_sub_f64(ctx, fp_get_d(ctx, rs1), fp_get_d(ctx, rs2));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_d(ctx, rd, r);
         return true;
-    case FP_OPF_FMULS:
-        fp_put_s(ctx, rd,
-            fp_mul_f32(ctx, fp_get_s(ctx, rs1), fp_get_s(ctx, rs2)));
+    }
+    case FP_OPF_FMULS: {
+        uint32_t r =
+            fp_mul_f32(ctx, fp_get_s(ctx, rs1), fp_get_s(ctx, rs2));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_s(ctx, rd, r);
         return true;
-    case FP_OPF_FMULD:
-        fp_put_d(ctx, rd,
-            fp_mul_f64(ctx, fp_get_d(ctx, rs1), fp_get_d(ctx, rs2)));
+    }
+    case FP_OPF_FMULD: {
+        uint64_t r =
+            fp_mul_f64(ctx, fp_get_d(ctx, rs1), fp_get_d(ctx, rs2));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_d(ctx, rd, r);
         return true;
-    case FP_OPF_FDIVS:
-        fp_put_s(ctx, rd,
-            fp_div_f32(ctx, fp_get_s(ctx, rs1), fp_get_s(ctx, rs2)));
+    }
+    case FP_OPF_FDIVS: {
+        uint32_t r =
+            fp_div_f32(ctx, fp_get_s(ctx, rs1), fp_get_s(ctx, rs2));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_s(ctx, rd, r);
         return true;
-    case FP_OPF_FDIVD:
-        fp_put_d(ctx, rd,
-            fp_div_f64(ctx, fp_get_d(ctx, rs1), fp_get_d(ctx, rs2)));
+    }
+    case FP_OPF_FDIVD: {
+        uint64_t r =
+            fp_div_f64(ctx, fp_get_d(ctx, rs1), fp_get_d(ctx, rs2));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_d(ctx, rd, r);
         return true;
-    case FP_OPF_FSQRTS:
-        fp_put_s(ctx, rd, fp_sqrt_f32(ctx, fp_get_s(ctx, rs2)));
+    }
+    case FP_OPF_FSQRTS: {
+        uint32_t r = fp_sqrt_f32(ctx, fp_get_s(ctx, rs2));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_s(ctx, rd, r);
         return true;
-    case FP_OPF_FSQRTD:
-        fp_put_d(ctx, rd, fp_sqrt_f64(ctx, fp_get_d(ctx, rs2)));
+    }
+    case FP_OPF_FSQRTD: {
+        uint64_t r = fp_sqrt_f64(ctx, fp_get_d(ctx, rs2));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_d(ctx, rd, r);
         return true;
+    }
     case FP_OPF_FCMPS:
         fp_cmp_f32(ctx, fp_get_s(ctx, rs1), fp_get_s(ctx, rs2), false);
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
         return true;
     case FP_OPF_FCMPD:
         fp_cmp_f64(ctx, fp_get_d(ctx, rs1), fp_get_d(ctx, rs2), false);
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
         return true;
     case FP_OPF_FCMPES:
         fp_cmp_f32(ctx, fp_get_s(ctx, rs1), fp_get_s(ctx, rs2), true);
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
         return true;
     case FP_OPF_FCMPED:
         fp_cmp_f64(ctx, fp_get_d(ctx, rs1), fp_get_d(ctx, rs2), true);
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
         return true;
     case FP_OPF_FSMULD: {
         uint64_t w;
         uint32_t a = fp_get_s(ctx, rs1);
         uint32_t b = fp_get_s(ctx, rs2);
+        float fa;
+        float fb;
         fp_clear_cexc(ctx);
         if (fp_f32_issnan(a) || fp_f32_issnan(b)) {
             uint32_t s = fp_f32_issnan(a) ? fp_f32_quiet(a)
                                           : fp_f32_quiet(b);
             fp_raise(ctx, FP_FSR_NVC_BIT);
+            if (fp_take_trap(ctx, pc)) {
+                return false;
+            }
             fp_put_d(ctx, rd, fp_f64_to_u64((double)fp_u32_to_f32(s)));
             return true;
         }
         if (fp_f32_isnan(a) || fp_f32_isnan(b)) {
             uint32_t n = fp_f32_pick_nan(a, b);
-            fp_put_d(ctx, rd, fp_f32_to_f64(ctx, n));
+            uint64_t d = fp_f32_to_f64(ctx, n);
+            if (fp_take_trap(ctx, pc)) {
+                return false;
+            }
+            fp_put_d(ctx, rd, d);
             return true;
         }
-        w = fp_f64_to_u64(
-            (double)fp_u32_to_f32(a) * (double)fp_u32_to_f32(b));
+        /* S32-R7-20: zero times infinity is invalid, like FMUL. */
+        fa = fp_u32_to_f32(a);
+        fb = fp_u32_to_f32(b);
+        if ((isinf(fa) && fb == 0.0F) || (isinf(fb) && fa == 0.0F)) {
+            fp_raise(ctx, FP_FSR_NVC_BIT);
+            if (fp_take_trap(ctx, pc)) {
+                return false;
+            }
+            fp_put_d(ctx, rd, (uint64_t)FP_F64_CANON_NAN);
+            return true;
+        }
+        w = fp_f64_to_u64((double)fa * (double)fb);
         fp_put_d(ctx, rd, w);
         return true;
     }
-    case FP_OPF_FITOS:
-        fp_put_s(ctx, rd, fp_to_f32(ctx,
-            (double)(int32_t)fp_get_s(ctx, rs2), fp_rd(ctx)));
+    case FP_OPF_FITOS: {
+        uint32_t r = fp_to_f32(ctx,
+            (double)(int32_t)fp_get_s(ctx, rs2), fp_rd(ctx));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_s(ctx, rd, r);
         return true;
+    }
     case FP_OPF_FITOD:
         fp_clear_cexc(ctx);
         fp_put_d(ctx, rd,
             fp_f64_to_u64((double)(int32_t)fp_get_s(ctx, rs2)));
         return true;
-    case FP_OPF_FSTOI:
+    case FP_OPF_FSTOI: {
         /* The converted integer lands in the FP register file (the V8
          * FPop format names %f registers on both sides); V8 B.28 fixes
          * rounding toward zero (FP_RD_RZ), ignoring FSR.RD. */
-        fp_put_s(ctx, rd, fp_to_i32(ctx,
-            (double)fp_u32_to_f32(fp_get_s(ctx, rs2)), FP_RD_RZ));
+        uint32_t r = fp_to_i32(ctx,
+            (double)fp_u32_to_f32(fp_get_s(ctx, rs2)), FP_RD_RZ);
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_s(ctx, rd, r);
         return true;
-    case FP_OPF_FDTOI:
-        fp_put_s(ctx, rd, fp_to_i32(ctx,
-            fp_u64_to_f64(fp_get_d(ctx, rs2)), FP_RD_RZ));
+    }
+    case FP_OPF_FDTOI: {
+        uint32_t r = fp_to_i32(ctx,
+            fp_u64_to_f64(fp_get_d(ctx, rs2)), FP_RD_RZ);
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_s(ctx, rd, r);
         return true;
-    case FP_OPF_FSTOD:
-        fp_put_d(ctx, rd, fp_f32_to_f64(ctx, fp_get_s(ctx, rs2)));
+    }
+    case FP_OPF_FSTOD: {
+        uint64_t d = fp_f32_to_f64(ctx, fp_get_s(ctx, rs2));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_d(ctx, rd, d);
         return true;
-    case FP_OPF_FDTOS:
-        fp_put_s(ctx, rd, fp_to_f32(ctx,
-            fp_u64_to_f64(fp_get_d(ctx, rs2)), fp_rd(ctx)));
+    }
+    case FP_OPF_FDTOS: {
+        uint32_t r = fp_to_f32(ctx,
+            fp_u64_to_f64(fp_get_d(ctx, rs2)), fp_rd(ctx));
+        if (fp_take_trap(ctx, pc)) {
+            return false;
+        }
+        fp_put_s(ctx, rd, r);
         return true;
+    }
     default:
         break;
     }
@@ -225,48 +365,64 @@ bool sparc32_fp_mem(sparc32_ctx_t *ctx, uint32_t pc,
         if (!interp_ld_be(ctx, addr, 4U, &v)) {
             return false;
         }
-        ctx->fsr = v;
+        /* S32-R7-18: LDFSR writes only the architectural writable
+         * fields, preserving FTT/QNE/version/reserved state. */
+        ctx->fsr = (ctx->fsr & ~(uint32_t)FP_FSR_WRITABLE_MASK) |
+            (v & (uint32_t)FP_FSR_WRITABLE_MASK);
         return true;
-    case SPARC32_OP3_LDDF:
+    case SPARC32_OP3_LDDF: {
+        /* V8 LDDF needs 8-byte alignment (S32-R5-1); S32-R7-13 holds
+         * one VM gate across the 8-byte load (all-or-nothing). */
+        uint8_t b8[8];
         if ((d->rd & 1U) != 0U) {
             return fp_undef(ctx, pc);
         }
-        /* V8 LDDF needs 8-byte alignment (S32-R5-1): fault like the DBT
-         * helper instead of succeeding as two 4-byte halves. */
         if ((addr & 7U) != 0U) {
             ctx->exit_reason = SPARC32_EXIT_FAULT;
             ctx->fault_addr = addr;
             return false;
         }
-        if (!interp_ld_be(ctx, addr, 4U, &hi)) {
+        if (!interp_mem_rd(ctx, addr, b8, 8U)) {
             return false;
         }
-        if (!interp_ld_be(ctx, addr + 4U, 4U, &lo)) {
-            return false;
-        }
+        hi = ((uint32_t)b8[0] << 24) | ((uint32_t)b8[1] << 16) |
+            ((uint32_t)b8[2] << 8) | (uint32_t)b8[3];
+        lo = ((uint32_t)b8[4] << 24) | ((uint32_t)b8[5] << 16) |
+            ((uint32_t)b8[6] << 8) | (uint32_t)b8[7];
         fp_put_s(ctx, d->rd, hi);
         fp_put_s(ctx, d->rd + 1U, lo);
         return true;
+    }
     case SPARC32_OP3_STF:
         return interp_st_be(ctx, addr, 4U, fp_get_s(ctx, d->rd));
     case SPARC32_OP3_STFSR:
         return interp_st_be(ctx, addr, 4U, ctx->fsr);
-    case SPARC32_OP3_STDF:
+    case SPARC32_OP3_STDF: {
+        /* V8 STDF needs 8-byte alignment (S32-R5-1); S32-R7-13 holds
+         * one VM gate across the 8-byte store (all-or-nothing). */
+        uint8_t b8[8];
+        uint32_t s0;
+        uint32_t s1;
         if ((d->rd & 1U) != 0U) {
             return fp_undef(ctx, pc);
         }
-        /* V8 STDF needs 8-byte alignment (S32-R5-1): fault like the DBT
-         * helper instead of succeeding as two 4-byte halves. */
         if ((addr & 7U) != 0U) {
             ctx->exit_reason = SPARC32_EXIT_FAULT;
             ctx->fault_addr = addr;
             return false;
         }
-        if (!interp_st_be(ctx, addr, 4U, fp_get_s(ctx, d->rd))) {
-            return false;
-        }
-        return interp_st_be(ctx, addr + 4U, 4U,
-            fp_get_s(ctx, d->rd + 1U));
+        s0 = fp_get_s(ctx, d->rd);
+        s1 = fp_get_s(ctx, d->rd + 1U);
+        b8[0] = (uint8_t)(s0 >> 24);
+        b8[1] = (uint8_t)(s0 >> 16);
+        b8[2] = (uint8_t)(s0 >> 8);
+        b8[3] = (uint8_t)s0;
+        b8[4] = (uint8_t)(s1 >> 24);
+        b8[5] = (uint8_t)(s1 >> 16);
+        b8[6] = (uint8_t)(s1 >> 8);
+        b8[7] = (uint8_t)s1;
+        return interp_mem_wr(ctx, addr, b8, 8U);
+    }
     default:
         break;
     }

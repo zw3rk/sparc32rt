@@ -7,8 +7,9 @@
  * interp_step() + interp_run() for every SPEC section 2 base integer
  * instruction: dual-PC stepping, annulled-delay semantics (E02), 8-window
  * SAVE/RESTORE via interp_win.c (E01 WIM model),
- * Y threading through MUL/DIV (E03), icc N/Z/V/C (E03: MULcc V is the
- * SIGNED overflow, SDIV truncates toward zero), LDSTUB/SWAP/CASA per the
+ * Y threading through MUL/DIV (E03), icc N/Z/V/C (S32-R7-6/8: DIV
+ * saturates on overflow with N/Z from the result, MULcc clears V/C),
+ * MULSCC shift-then-add (S32-R7-7), LDSTUB/SWAP/CASA per the
  * LEON manual (match swaps, rd always gets old mem; ASI 0x0a ok, 0x0b
  * traps unless SPARC32RT_LEON_SUPERVISOR_ASI=1), ta 0x10 -> EXIT_SYSCALL
  * with the carry convention (E04), misaligned multi-byte accesses fault
@@ -24,7 +25,8 @@
  * (SPARC32_OP_STBAR) executes as a host-model nop; LDSW/LDSWA execute as
  * word loads (sign extension is the identity on words).
  * SAVE/RESTORE/CASA dispatch follows the L1a classes (SAVE is op == 2 /
- * op3 == 0x3c, RESTORE 0x3d, CASA op == 3 / op3 == 0x3c with i == 1).
+ * op3 == 0x3c, RESTORE 0x3d, CASA op == 3 / op3 == 0x3c with i == 0,
+ * S32-R7-10; STBAR is the RDASR special form, S32-R7-11).
  *
  * Guest memory uses only the [G, G + 4GiB) window via sparc32_guest_ptr()
  * after a ctx->regions coverage check; data gaps or missing R/W permission
@@ -179,16 +181,51 @@ static bool interp_undef(sparc32_ctx_t *ctx, uint32_t pc)
     return false;
 }
 
-/* MULcc shared tail: N/Z from lo, V = signed overflow (E03 #5), C = 0. */
+/* S32-R7-5: shared Ticc execution for ordinary and delay-slot paths.
+ * When update_pc is true (interp_step), a not-taken trap advances
+ * pc/npc and a ta-3 flush advances pc/npc after spilling windows.
+ * When false (delay slot via interp_single), pc/npc are owned by the
+ * outer CTI and left alone: not-taken is a nop, flush spills without
+ * advancing, and a taken trap reports via interp_trap_taken. */
+static bool interp_trap_insn(sparc32_ctx_t *ctx, uint32_t pc,
+    const sparc32_decoded_t *d, bool update_pc)
+{
+    uint32_t b = (d->is_imm != 0U) ? (uint32_t)d->simm
+                                   : ctx->r[d->rs2];
+    (void)pc;
+    if (!interp_eval_cond(d->cond, ctx->psr)) {
+        if (update_pc) {
+            ctx->pc = ctx->npc;
+            ctx->npc += 4U;
+        }
+        return true;
+    }
+    {
+        uint32_t num = (ctx->r[d->rs1] + b) & 0x7FU;
+        if (num == 3U) {
+            if (!interp_flush_windows(ctx)) {
+                return false;
+            }
+            if (update_pc) {
+                ctx->pc = ctx->npc;
+                ctx->npc += 4U;
+            }
+            return true;
+        }
+        return interp_trap_taken(ctx, num);
+    }
+}
+
+/* MULcc shared tail (S32-R7-8, V8 B.18): N/Z from lo, V = 0, C = 0.
+ * Both UMULcc and SMULcc clear V/C; the old signed-overflow rule was
+ * incorrect (e.g. 0x40000000 * 2 must not set V). */
 static bool interp_mulcc(sparc32_ctx_t *ctx, uint32_t rd, uint32_t lo,
     int64_t sprod, uint64_t umag)
 {
+    (void)sprod;
     ctx->y = (uint32_t)(umag >> 32);
     ctx->psr &= ~SPARC32_PSR_ICC_MASK;
     interp_icc_nz(ctx, lo);
-    if (sprod != (int64_t)(int32_t)lo) {
-        ctx->psr |= SPARC32_PSR_V;
-    }
     interp_wreg(ctx, rd, lo);
     return true;
 }
@@ -264,35 +301,46 @@ static bool interp_alu(sparc32_ctx_t *ctx, uint32_t pc,
         return interp_mulcc(ctx, rd, (uint32_t)(uint64_t)p, p,
             (uint64_t)p);
     }
-    case 0x0EU: { /* UDIV */
-        uint64_t dvd = ((uint64_t)ctx->y << 32) | (uint64_t)a;
-        if (b == 0U) {
-            return interp_trap_taken(ctx, SPARC32_TRAP_DIV_ZERO);
-        }
-        interp_wreg(ctx, rd, (uint32_t)(dvd / (uint64_t)b));
-        return true;
-    }
-    case 0x0FU: { /* SDIV */
-        int64_t dvd = (int64_t)(((uint64_t)ctx->y << 32) | (uint64_t)a);
-        int32_t dvs = (int32_t)b;
-        if (dvs == 0) {
-            return interp_trap_taken(ctx, SPARC32_TRAP_DIV_ZERO);
-        }
-        if (dvd == (int64_t)0x8000000000000000LL && dvs == -1) {
-            interp_wreg(ctx, rd, 0x80000000U);
-            return true;
-        }
-        interp_wreg(ctx, rd, (uint32_t)(uint64_t)(dvd / (int64_t)dvs));
-        return true;
-    }
-    case 0x1EU: { /* UDIVcc: V iff quotient exceeds 32 bits (E03 #10). */
+    case 0x0EU: { /* UDIV (S32-R7-6, V8 B.19): saturate on overflow. */
         uint64_t dvd = ((uint64_t)ctx->y << 32) | (uint64_t)a;
         uint64_t q;
         if (b == 0U) {
             return interp_trap_taken(ctx, SPARC32_TRAP_DIV_ZERO);
         }
         q = dvd / (uint64_t)b;
-        res = (uint32_t)q;
+        interp_wreg(ctx, rd,
+            q > (uint64_t)0xFFFFFFFFU ? 0xFFFFFFFFU : (uint32_t)q);
+        return true;
+    }
+    case 0x0FU: { /* SDIV (S32-R7-6, V8 B.19): saturate on overflow. */
+        int64_t dvd = (int64_t)(((uint64_t)ctx->y << 32) | (uint64_t)a);
+        int32_t dvs = (int32_t)b;
+        int64_t q;
+        if (dvs == 0) {
+            return interp_trap_taken(ctx, SPARC32_TRAP_DIV_ZERO);
+        }
+        if (dvd == (int64_t)0x8000000000000000LL && dvs == -1) {
+            interp_wreg(ctx, rd, 0x7FFFFFFFU);
+            return true;
+        }
+        q = dvd / (int64_t)dvs;
+        if (q > (int64_t)0x7FFFFFFFLL) {
+            interp_wreg(ctx, rd, 0x7FFFFFFFU);
+        } else if (q < (int64_t)0xFFFFFFFF80000000LL) {
+            interp_wreg(ctx, rd, 0x80000000U);
+        } else {
+            interp_wreg(ctx, rd, (uint32_t)(uint64_t)q);
+        }
+        return true;
+    }
+    case 0x1EU: { /* UDIVcc (S32-R7-6): saturate, N/Z from result. */
+        uint64_t dvd = ((uint64_t)ctx->y << 32) | (uint64_t)a;
+        uint64_t q;
+        if (b == 0U) {
+            return interp_trap_taken(ctx, SPARC32_TRAP_DIV_ZERO);
+        }
+        q = dvd / (uint64_t)b;
+        res = q > (uint64_t)0xFFFFFFFFU ? 0xFFFFFFFFU : (uint32_t)q;
         ctx->psr &= ~SPARC32_PSR_ICC_MASK;
         interp_icc_nz(ctx, res);
         if (q > (uint64_t)0xFFFFFFFFU) {
@@ -301,7 +349,7 @@ static bool interp_alu(sparc32_ctx_t *ctx, uint32_t pc,
         interp_wreg(ctx, rd, res);
         return true;
     }
-    case 0x1FU: { /* SDIVcc */
+    case 0x1FU: { /* SDIVcc (S32-R7-6): saturate, N/Z from result. */
         int64_t dvd = (int64_t)(((uint64_t)ctx->y << 32) | (uint64_t)a);
         int32_t dvs = (int32_t)b;
         int64_t q;
@@ -310,12 +358,18 @@ static bool interp_alu(sparc32_ctx_t *ctx, uint32_t pc,
         }
         ctx->psr &= ~SPARC32_PSR_ICC_MASK;
         if (dvd == (int64_t)0x8000000000000000LL && dvs == -1) {
-            ctx->psr |= SPARC32_PSR_V | SPARC32_PSR_N;
-            interp_wreg(ctx, rd, 0x80000000U);
+            ctx->psr |= SPARC32_PSR_V;
+            interp_wreg(ctx, rd, 0x7FFFFFFFU);
             return true;
         }
         q = dvd / (int64_t)dvs;
-        res = (uint32_t)(uint64_t)q;
+        if (q > (int64_t)0x7FFFFFFFLL) {
+            res = 0x7FFFFFFFU;
+        } else if (q < (int64_t)0xFFFFFFFF80000000LL) {
+            res = 0x80000000U;
+        } else {
+            res = (uint32_t)(uint64_t)q;
+        }
         interp_icc_nz(ctx, res);
         if (q != (int64_t)(int32_t)res) {
             ctx->psr |= SPARC32_PSR_V;
@@ -329,24 +383,37 @@ static bool interp_alu(sparc32_ctx_t *ctx, uint32_t pc,
     case 0x21U: res = a - b; interp_icc_sub(ctx, res, a, b, 0U);
         if (((a & 3U) | (b & 3U)) != 0U) ctx->psr |= SPARC32_PSR_V;
         interp_wreg(ctx, rd, res); return true;
-    case 0x22U: res = a + b; interp_icc_add(ctx, res, a, b, 0U);
-        if (((a & 3U) | (b & 3U)) != 0U) ctx->psr |= SPARC32_PSR_V;
-        if ((ctx->psr & SPARC32_PSR_V) != 0U)
+    case 0x22U: { /* TADDccTV (S32-R7-9): no ICC/rd commit on trap. */
+        int64_t s = (int64_t)(int32_t)a + (int64_t)(int32_t)b;
+        res = a + b;
+        if ((((a & 3U) | (b & 3U)) != 0U) ||
+            (s != (int64_t)(int32_t)res)) {
             return interp_trap_taken(ctx, SPARC32_TRAP_TAG_OVERFLOW);
-        interp_wreg(ctx, rd, res); return true;
-    case 0x23U: res = a - b; interp_icc_sub(ctx, res, a, b, 0U);
-        if (((a & 3U) | (b & 3U)) != 0U) ctx->psr |= SPARC32_PSR_V;
-        if ((ctx->psr & SPARC32_PSR_V) != 0U)
+        }
+        interp_icc_add(ctx, res, a, b, 0U);
+        interp_wreg(ctx, rd, res);
+        return true;
+    }
+    case 0x23U: { /* TSUBccTV (S32-R7-9): no ICC/rd commit on trap. */
+        int64_t s = (int64_t)(int32_t)a - (int64_t)(int32_t)b;
+        res = a - b;
+        if ((((a & 3U) | (b & 3U)) != 0U) ||
+            (s != (int64_t)(int32_t)res)) {
             return interp_trap_taken(ctx, SPARC32_TRAP_TAG_OVERFLOW);
-        interp_wreg(ctx, rd, res); return true;
-    case 0x24U: { /* MULSCC */
+        }
+        interp_icc_sub(ctx, res, a, b, 0U);
+        interp_wreg(ctx, rd, res);
+        return true;
+    }
+    case 0x24U: { /* MULSCC (S32-R7-7, V8): shift-then-add. */
         bool nv = ((ctx->psr & SPARC32_PSR_N) != 0U) !=
             ((ctx->psr & SPARC32_PSR_V) != 0U);
-        uint32_t opnd = nv ? b : 0U;
-        uint64_t full = (uint64_t)a + (uint64_t)opnd;
-        uint32_t sum = (uint32_t)full;
-        int64_t s = (int64_t)(int32_t)a + (int64_t)(int32_t)opnd;
         uint32_t yold = ctx->y;
+        uint32_t shifted = (nv ? 0x80000000U : 0U) | (a >> 1);
+        uint32_t opnd = ((yold & 1U) != 0U) ? b : 0U;
+        uint64_t full = (uint64_t)shifted + (uint64_t)opnd;
+        uint32_t sum = (uint32_t)full;
+        int64_t s = (int64_t)(int32_t)shifted + (int64_t)(int32_t)opnd;
         ctx->y = ((a & 1U) << 31) | (yold >> 1);
         ctx->psr &= ~SPARC32_PSR_ICC_MASK;
         interp_icc_nz(ctx, sum);
@@ -356,8 +423,7 @@ static bool interp_alu(sparc32_ctx_t *ctx, uint32_t pc,
         if ((full >> 32) != 0U) {
             ctx->psr |= SPARC32_PSR_C;
         }
-        interp_wreg(ctx, rd,
-            ((yold & 1U) != 0U ? 0x80000000U : 0U) | (sum >> 1));
+        interp_wreg(ctx, rd, sum);
         return true;
     }
     case 0x25U: interp_wreg(ctx, rd, a << (b & 31U)); return true;
@@ -448,19 +514,22 @@ static bool interp_mem(sparc32_ctx_t *ctx, uint32_t pc,
         interp_wreg(ctx, d->rd, v); return true;
     case 0x03U: {
         /* LDD needs 8-byte alignment (addr & 7 faults, oracle SIGBUS).
-         * Validate-then-commit (Rev 4 4.3.3): both words must be mapped
-         * and read before either rd commits, so a second-word fault
-         * leaves zero partial state (no sp_rollback unwind on SPARC). */
+         * S32-R7-13: one VM gate across the full 8-byte transfer, so
+         * the two words observe one mapping (all-or-nothing). */
+        uint8_t b8[8];
         uint32_t hi;
         uint32_t lo;
         if ((d->rd & 1U) != 0U) return interp_undef(ctx, pc);
-        if ((addr & 7U) != 0U || !interp_range_ok(ctx, addr, 8U, 1U)) {
+        if ((addr & 7U) != 0U) {
             ctx->exit_reason = SPARC32_EXIT_FAULT;
             ctx->fault_addr = addr;
             return false;
         }
-        if (!interp_ld_be(ctx, addr, 4U, &hi)) return false;
-        if (!interp_ld_be(ctx, addr + 4U, 4U, &lo)) return false;
+        if (!interp_mem_rd(ctx, addr, b8, 8U)) return false;
+        hi = ((uint32_t)b8[0] << 24) | ((uint32_t)b8[1] << 16) |
+            ((uint32_t)b8[2] << 8) | (uint32_t)b8[3];
+        lo = ((uint32_t)b8[4] << 24) | ((uint32_t)b8[5] << 16) |
+            ((uint32_t)b8[6] << 8) | (uint32_t)b8[7];
         interp_wreg(ctx, d->rd, hi);
         interp_wreg(ctx, d->rd + 1U, lo);
         return true;
@@ -468,22 +537,33 @@ static bool interp_mem(sparc32_ctx_t *ctx, uint32_t pc,
     case 0x04U: return interp_st_be(ctx, addr, 4U, ctx->r[d->rd]);
     case 0x05U: return interp_st_be(ctx, addr, 1U, ctx->r[d->rd]);
     case 0x06U: return interp_st_be(ctx, addr, 2U, ctx->r[d->rd]);
-    case 0x07U:
+    case 0x07U: {
+        /* STD needs 8-byte alignment (addr & 7 faults, oracle SIGBUS).
+         * S32-R7-13: one VM gate across the full 8-byte store
+         * (all-or-nothing, no partial commit). */
+        uint8_t b8[8];
+        uint32_t hi;
+        uint32_t lo;
         if ((d->rd & 1U) != 0U) {
             return interp_undef(ctx, pc);
         }
-        /* STD needs 8-byte alignment (addr & 7 faults, oracle SIGBUS).
-         * Validate-then-commit (Rev 4 4.3.3): both words must be mapped
-         * writable before any byte is stored (no partial STD). */
-        if ((addr & 7U) != 0U || !interp_range_ok(ctx, addr, 8U, 2U)) {
+        if ((addr & 7U) != 0U) {
             ctx->exit_reason = SPARC32_EXIT_FAULT;
             ctx->fault_addr = addr;
             return false;
         }
-        if (!interp_st_be(ctx, addr, 4U, ctx->r[d->rd])) {
-            return false;
-        }
-        return interp_st_be(ctx, addr + 4U, 4U, ctx->r[d->rd + 1U]);
+        hi = ctx->r[d->rd];
+        lo = ctx->r[d->rd + 1U];
+        b8[0] = (uint8_t)(hi >> 24);
+        b8[1] = (uint8_t)(hi >> 16);
+        b8[2] = (uint8_t)(hi >> 8);
+        b8[3] = (uint8_t)hi;
+        b8[4] = (uint8_t)(lo >> 24);
+        b8[5] = (uint8_t)(lo >> 16);
+        b8[6] = (uint8_t)(lo >> 8);
+        b8[7] = (uint8_t)lo;
+        return interp_mem_wr(ctx, addr, b8, 8U);
+    }
     case 0x09U:
         if (!interp_ld_be(ctx, addr, 1U, &v)) return false;
         v &= 0xFFU;
@@ -531,6 +611,8 @@ static bool interp_single(sparc32_ctx_t *ctx, uint32_t pc,
         return interp_swap(ctx, d);
     case SPARC32_OP_CASA:
         return interp_casa(ctx, d);
+    case SPARC32_OP_TRAP:
+        return interp_trap_insn(ctx, pc, d, false);
     case SPARC32_OP_FPU:
         return sparc32_fp_step(ctx, pc, d);
     case SPARC32_OP_FPMEM:
@@ -538,9 +620,10 @@ static bool interp_single(sparc32_ctx_t *ctx, uint32_t pc,
     default:
         break;
     }
-    /* CALL/BRANCH/FBRANCH/JMPL/TRAP never reach here: interp_step routes
-     * CTIs through interp_cti() and traps inline. Anything else illegal
-     * is UNDEF, except STBAR, which the host model executes as a nop. */
+    /* CALL/BRANCH/FBRANCH/JMPL never reach here: interp_step routes
+     * CTIs through interp_cti(). TRAP reaches here for delay slots
+     * (S32-R7-5). Anything else illegal is UNDEF, except STBAR, which
+     * the host model executes as a nop. */
     if (d->cls == (uint32_t)SPARC32_OP_STBAR) {
         return true;
     }
@@ -619,28 +702,31 @@ static void interp_cti(sparc32_ctx_t *ctx, uint32_t pc,
         fprintf(stderr, "T cti pc=%08x taken=%u target=%08x npc=%08x\n", pc,
                 taken ? 1U : 0U, target, npc);
     }
-    if (sparc32_fetch_decode(ctx, npc, &dd) != 0) {
-        if (d->cls == (uint32_t)SPARC32_OP_JMPL) {
+    /* S32-R7-3/R7-4: advance to the delay slot before fetching it, so a
+     * CTI delay sees its own successor (npc + 4) instead of re-fetching
+     * itself, and every delay fault reports PC = delay with the
+     * already-selected successor as nPC. */
+    {
+        uint32_t succ = taken ? target : npc + 4U;
+        ctx->pc = npc;
+        ctx->npc = npc + 4U;
+        if (sparc32_fetch_decode(ctx, npc, &dd) != 0) {
             ctx->pc = npc;
-            ctx->npc = target;
+            ctx->npc = succ;
+            return;
         }
-        return;
-    }
-    if (interp_is_cti(&dd)) {
-        /* CTI in a delay slot is implementation-defined; run the inner
-         * transfer and let it redirect pc/npc (outer is cancelled). */
-        interp_cti(ctx, npc, &dd);
-        return;
-    }
-    if (!interp_single(ctx, npc, &dd)) {
-        if (d->cls == (uint32_t)SPARC32_OP_JMPL) {
-            /* Faulting JMPL delay: resume at the delay insn with the
-             * recorded transfer target as npc (dbt recovers the same
-             * target via aot_delay_target_get). rd already holds pc. */
+        if (interp_is_cti(&dd)) {
+            /* CTI in a delay slot: the inner transfer redirects pc/npc
+             * (outer is cancelled). Context already advanced, so the
+             * inner fetch uses its own delay slot. */
+            interp_cti(ctx, npc, &dd);
+            return;
+        }
+        if (!interp_single(ctx, npc, &dd)) {
             ctx->pc = npc;
-            ctx->npc = target;
+            ctx->npc = succ;
+            return;
         }
-        return;
     }
     if (taken) {
         ctx->pc = target;
@@ -686,25 +772,8 @@ void interp_step(sparc32_ctx_t *ctx)
         /* Ticc has no delay slot; 0x10 with a true condition is the
          * syscall gate (E04), 0x03 flushes register windows to the
          * guest stack (C2-3: uClibc setjmp), any other true trap
-         * number -> EXIT_TRAP. */
-        uint32_t b = (d.is_imm != 0U) ? (uint32_t)d.simm
-                                      : ctx->r[d.rs2];
-        if (interp_eval_cond(d.cond, ctx->psr)) {
-            uint32_t num = (ctx->r[d.rs1] + b) & 0x7FU;
-            if (num == 3U) {
-                if (!interp_flush_windows(ctx)) {
-                    ctx->r[0] = 0U;
-                    return;
-                }
-                ctx->pc = ctx->npc;
-                ctx->npc += 4U;
-            } else {
-                interp_trap_taken(ctx, num);
-            }
-        } else {
-            ctx->pc = ctx->npc;
-            ctx->npc += 4U;
-        }
+         * number -> EXIT_TRAP (shared with delay slots, S32-R7-5). */
+        (void)interp_trap_insn(ctx, pc, &d, true);
         ctx->r[0] = 0U;
         return;
     }

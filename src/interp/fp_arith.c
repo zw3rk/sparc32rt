@@ -75,17 +75,29 @@ uint32_t fp_rd(const sparc32_ctx_t *ctx)
     return (ctx->fsr >> FP_FSR_RD_SHIFT) & 3U;
 }
 
-/* Every FPop clears cexc first (oracle: sticky aexc survives, cexc does
- * not — verified with DZ-then-op sequences). */
+/* Every FPop clears cexc/FTT first (S32-R7-18; aexc is sticky). */
 void fp_clear_cexc(sparc32_ctx_t *ctx)
 {
-    ctx->fsr &= ~(uint32_t)FP_FSR_CEXC_MASK;
+    ctx->fsr &= ~((uint32_t)FP_FSR_CEXC_MASK |
+        (uint32_t)FP_FSR_FTT_MASK);
 }
 
+/* S32-R7-16: TEM trap check. On trap set FTT + cexc without aexc accrual;
+ * the fp.c wrapper owns the PC/exit. */
 void fp_raise(sparc32_ctx_t *ctx, uint32_t cexc)
 {
-    ctx->fsr |= cexc & (uint32_t)FP_FSR_CEXC_MASK;
-    ctx->fsr |= (cexc & (uint32_t)FP_FSR_CEXC_MASK) << 5;
+    uint32_t masked = cexc & (uint32_t)FP_FSR_CEXC_MASK;
+    uint32_t tem = (ctx->fsr >> (uint32_t)FP_FSR_TEM_SHIFT) & 0x1FU;
+    if ((masked & tem) != 0U) {
+        ctx->fsr &= ~(uint32_t)FP_FSR_CEXC_MASK;
+        ctx->fsr |= masked;
+        ctx->fsr &= ~(uint32_t)FP_FSR_FTT_MASK;
+        ctx->fsr |= (uint32_t)FP_FSR_FTT_IEEE
+            << (uint32_t)FP_FSR_FTT_SHIFT;
+        return;
+    }
+    ctx->fsr |= masked;
+    ctx->fsr |= masked << 5;
 }
 
 void fp_set_fcc(sparc32_ctx_t *ctx, uint32_t fcc)
@@ -222,12 +234,16 @@ static int32_t fp_round_i32(double v, uint32_t rd, bool *inex, bool *ovf)
     if (r > 2147483647.0 || r < -2147483648.0) {
         *ovf = true;
         *inex = false;
+        return 0;
     }
     return (int32_t)r;
 }
 
 /* Float/double -> int32 with RD (FsTOi/FdTOi). NaN and out-of-range map
- * to INT32_MAX / INT32_MIN with invalid, per the oracle. */
+ * to INT32_MAX / INT32_MIN with invalid, per the oracle. S32-R7-21:
+ * representability is decided after rounding (e.g. -2147483648.5
+ * truncates to INT32_MIN with NX, not NV); the early guards only
+ * protect the int64 intermediate. */
 uint32_t fp_to_i32(sparc32_ctx_t *ctx, double v, uint32_t rd)
 {
     bool inex;
@@ -238,11 +254,11 @@ uint32_t fp_to_i32(sparc32_ctx_t *ctx, double v, uint32_t rd)
         fp_raise(ctx, FP_FSR_NVC_BIT);
         return 0x7FFFFFFFU;
     }
-    if (v >= 2147483648.0) {
+    if (v >= 9223372036854775808.0) {
         fp_raise(ctx, FP_FSR_NVC_BIT);
         return 0x7FFFFFFFU;
     }
-    if (v < -2147483648.0) {
+    if (v < -9223372036854775808.0) {
         fp_raise(ctx, FP_FSR_NVC_BIT);
         return 0x80000000U;
     }
@@ -325,11 +341,14 @@ uint32_t fp_to_f32(sparc32_ctx_t *ctx, double v, uint32_t rd)
         if (back < v) {
             frn = nextafterf(frn, (float)INFINITY);
         }
+        /* S32-R7-22: directed adjustment can overflow to infinity. */
+        if (!isfinite(frn)) fp_raise(ctx, FP_FSR_OFC_BIT | FP_FSR_NXC_BIT);
         return fp_f32_to_u32(frn);
     }
     if (back > v) {
         frn = nextafterf(frn, -(float)INFINITY);
     }
+    if (!isfinite(frn)) fp_raise(ctx, FP_FSR_OFC_BIT | FP_FSR_NXC_BIT);
     return fp_f32_to_u32(frn);
 }
 
@@ -825,37 +844,53 @@ uint64_t fp_sqrt_f64(sparc32_ctx_t *ctx, uint64_t a)
 void fp_cmp_f32(sparc32_ctx_t *ctx, uint32_t a, uint32_t b,
     bool signal)
 {
-    bool unordered;
+    bool u;
     fp_clear_cexc(ctx);
-    unordered = fp_f32_isnan(a) || fp_f32_isnan(b);
-    if (!unordered) {
+    u = fp_f32_isnan(a) || fp_f32_isnan(b);
+    if (!u) {
         float fa = fp_u32_to_f32(a);
         float fb = fp_u32_to_f32(b);
         fp_set_fcc(ctx, (fa < fb) ? 1U : ((fa > fb) ? 2U : 0U));
         return;
     }
+    /* S32-R7-19 quiet qNaN raises nothing; S32-R7-16 trap skips FCC/NVA. */
+    if (!signal && !fp_f32_issnan(a) && !fp_f32_issnan(b)) {
+        fp_set_fcc(ctx, 3U);
+        return;
+    }
+    if ((((ctx->fsr >> (uint32_t)FP_FSR_TEM_SHIFT) & 0x1FU) &
+            (uint32_t)FP_FSR_NVC_BIT) != 0U) {
+        fp_raise(ctx, FP_FSR_NVC_BIT);
+        return;
+    }
     fp_set_fcc(ctx, 3U);
     ctx->fsr |= FP_FSR_NVA_BIT;
-    if (signal || fp_f32_issnan(a) || fp_f32_issnan(b)) {
-        fp_raise(ctx, FP_FSR_NVC_BIT);
-    }
+    fp_raise(ctx, FP_FSR_NVC_BIT);
 }
 
 void fp_cmp_f64(sparc32_ctx_t *ctx, uint64_t a, uint64_t b,
     bool signal)
 {
-    bool unordered;
+    bool u;
     fp_clear_cexc(ctx);
-    unordered = fp_f64_isnan(a) || fp_f64_isnan(b);
-    if (!unordered) {
+    u = fp_f64_isnan(a) || fp_f64_isnan(b);
+    if (!u) {
         double fa = fp_u64_to_f64(a);
         double fb = fp_u64_to_f64(b);
         fp_set_fcc(ctx, (fa < fb) ? 1U : ((fa > fb) ? 2U : 0U));
         return;
     }
+    /* S32-R7-19 quiet qNaN raises nothing; S32-R7-16 trap skips FCC/NVA. */
+    if (!signal && !fp_f64_issnan(a) && !fp_f64_issnan(b)) {
+        fp_set_fcc(ctx, 3U);
+        return;
+    }
+    if ((((ctx->fsr >> (uint32_t)FP_FSR_TEM_SHIFT) & 0x1FU) &
+            (uint32_t)FP_FSR_NVC_BIT) != 0U) {
+        fp_raise(ctx, FP_FSR_NVC_BIT);
+        return;
+    }
     fp_set_fcc(ctx, 3U);
     ctx->fsr |= FP_FSR_NVA_BIT;
-    if (signal || fp_f64_issnan(a) || fp_f64_issnan(b)) {
-        fp_raise(ctx, FP_FSR_NVC_BIT);
-    }
+    fp_raise(ctx, FP_FSR_NVC_BIT);
 }

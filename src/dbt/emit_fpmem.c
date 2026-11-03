@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include "interp/decode.h"
+#include "interp/fp.h"
 #include "interp/interp_priv.h"
 #include "rt32/a64_emit.h"
 #include "sparc32rt.h"
@@ -114,11 +115,12 @@ static uint32_t sparc32_rt_fpmem(sparc32_ctx_t *ctx, uint32_t va,
             return ctx->exit_reason;
         }
         return SPARC32_EXIT_NONE;
-    case 0x21U: /* LDFSR: full 32-bit round-trip (frozen contract 1) */
+    case 0x21U: /* LDFSR: writable-field mask (S32-R7-18 parity) */
         if (!interp_ld_be(ctx, va, 4U, &v)) {
             return ctx->exit_reason;
         }
-        ctx->fsr = v;
+        ctx->fsr = (ctx->fsr & ~(uint32_t)FP_FSR_WRITABLE_MASK) |
+            (v & (uint32_t)FP_FSR_WRITABLE_MASK);
         return SPARC32_EXIT_NONE;
     case 0x25U: /* STFSR */
         if (!interp_st_be(ctx, va, 4U, ctx->fsr)) {

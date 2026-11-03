@@ -25,7 +25,7 @@
 typedef enum {
     SPARC32_OP_ILLEGAL = 0, /* Undecodable, V9-only, unassigned op3, UNIMP,
                              * odd-rd LDD/STD(+A), odd-rd double FP dest,
-                             * CASA with i == 0. L1b must never execute. */
+                             * CASA with i == 1. L1b must never execute. */
     SPARC32_OP_CALL,    /* Format 1 CALL: disp30, writes %o7, delay executes. */
     SPARC32_OP_SETHI,   /* SETHI imm22 -> rd (rd == 0 is the classic NOP). */
     SPARC32_OP_BRANCH,  /* Bicc (op2 == 2): cond, annul bit, disp22.
@@ -53,9 +53,10 @@ typedef enum {
     SPARC32_OP_TRAP,    /* Ticc (op3 0x3a): cond + rs1/src2. TA (cond == 8)
                          * with simm13 == 0x10 is the syscall trap (E04). */
     SPARC32_OP_FLUSH,   /* FLUSH (op3 0x3b): rs1/src2 address hint. */
-    SPARC32_OP_STBAR,   /* STBAR (op == 2, op3 0x2c): store barrier, host-model
-                         * nop (TSO). Explicit class so every engine agrees;
-                         * never ILLEGAL. */
+    SPARC32_OP_STBAR,   /* STBAR (RDASR special form, op == 2, op3 0x28
+                         * with rs1 == 15, rd == 0): store barrier,
+                         * host-model nop (TSO). Explicit class so every
+                         * engine agrees; never ILLEGAL. */
     SPARC32_OP_LOAD,    /* Loads incl. alternate-space (asi valid) and the
                          * LDSTUB atomic byte op (atomic flag set). */
     SPARC32_OP_STORE,   /* Stores incl. alternate-space (asi valid). */
@@ -104,7 +105,6 @@ typedef enum {
 #define SPARC32_OP3_RETT    0x39U
 #define SPARC32_OP3_TICC    0x3AU
 #define SPARC32_OP3_FLUSH   0x3BU
-#define SPARC32_OP3_STBAR   0x2CU
 #define SPARC32_OP3_SAVE    0x3CU
 #define SPARC32_OP3_RESTORE 0x3DU
 #define SPARC32_OP3_MULSCC  0x24U

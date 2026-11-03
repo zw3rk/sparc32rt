@@ -675,7 +675,8 @@ static void *thr_thread_entry(void *arg)
 {
     struct thr_start *st = (struct thr_start *)arg;
     sparc32_ctx_t *ctx = st->ctx;
-    interp_window_clone_restore(st->winfile, st->winsp, st->win_valid);
+    interp_window_clone_restore(st->winfile, st->winsp, st->win_valid,
+        st->wino);
     ctx->host_tid = thr_gettid();
     pthread_mutex_lock(&thr_live_lock);
     thr_live_set_pt_locked(ctx, pthread_self());
@@ -718,6 +719,18 @@ static void *thr_thread_entry(void *arg)
             }
             signo = sparc32_classify_fault(ctx);
             if (interp_try_deliver_sync(ctx, signo)) {
+                continue;
+            }
+            if (interp_poll_async(ctx)) {
+                continue;
+            }
+            thr_thread_finish(st, 128L + (long)signo);
+            return NULL;
+        }
+        if (ctx->exit_reason == SPARC32_EXIT_TRAP ||
+            ctx->exit_reason == SPARC32_EXIT_UNDEF) {
+            int signo = sparc32_trap_signo(ctx);
+            if (signo != 0 && interp_try_deliver_sync(ctx, signo)) {
                 continue;
             }
             if (interp_poll_async(ctx)) {
@@ -822,7 +835,8 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
     st->tid_ready = false;
     st->child_tid = -1L;
     st->refs = 2;
-    interp_window_clone_save(st->winfile, st->winsp, st->win_valid);
+    interp_window_clone_save(st->winfile, st->winsp, st->win_valid,
+        st->wino);
     thr_register(child);
     if (pthread_mutex_init(&st->lock, NULL) != 0 ||
         pthread_cond_init(&st->ready, NULL) != 0 ||

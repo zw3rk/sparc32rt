@@ -146,25 +146,62 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
     uint32_t code = 1U;
     size_t k;
     int i;
-    if (ctx == NULL || (signo != 10 && signo != 11)) {
+    if (ctx == NULL ||
+        (signo != 4 && signo != 8 && signo != 10 && signo != 11)) {
         return false;
     }
     if (sparc32_signal_get_action(signo, &handler, &restorer, &flags,
             &sa_mask) != 0) {
         return false;
     }
-    addr = ctx->fault_addr;
+    /* S32-R7-15: architectural traps report si_addr at the faulting PC
+     * (exit_dest), not a stale data fault address. */
+    if (ctx->exit_reason == (uint32_t)SPARC32_EXIT_TRAP ||
+        ctx->exit_reason == (uint32_t)SPARC32_EXIT_UNDEF) {
+        addr = ctx->exit_dest;
+    } else {
+        addr = ctx->fault_addr;
+    }
     if (signo == 10) {
         /* BUS_ADRALN: an alignment fault reports code 1 even when the
          * address is mapped; ADRERR (2) is a SIGSEGV-class code. */
         code = 1U;
-    } else {
+    } else if (signo == 11) {
+        code = 1U;
         for (k = 0; k < ctx->region_count; k++) {
             if (addr >= ctx->regions[k].start && addr < ctx->regions[k].end) {
                 code = 2U;
                 break;
             }
         }
+    } else if (signo == 8) {
+        /* SIGFPE: DIV_ZERO -> FPE_INTDIV(1), TAG_OVERFLOW -> FPE_INTOVF(2),
+         * FP (0x07) decodes the enabled cexc, default 1. */
+        uint32_t tn = ctx->exit_arg;
+        if (tn == 0x2AU) {
+            code = 1U;
+        } else if (tn == 0x01U) {
+            code = 2U;
+        } else if (tn == 0x07U) {
+            uint32_t cexc = ctx->fsr & 0x1FU;
+            if ((cexc & (1U << 4)) != 0U) {
+                code = 7U;
+            } else if ((cexc & (1U << 3)) != 0U) {
+                code = 4U;
+            } else if ((cexc & (1U << 2)) != 0U) {
+                code = 5U;
+            } else if ((cexc & (1U << 1)) != 0U) {
+                code = 3U;
+            } else {
+                code = 6U;
+            }
+        } else {
+            code = 1U;
+        }
+    } else {
+        /* SIGILL: PRIV (0x03) -> ILL_PRVOPC(4), else ILL_ILLOPC(1). */
+        code = (ctx->exit_arg == 0x03U &&
+            ctx->exit_reason == (uint32_t)SPARC32_EXIT_TRAP) ? 4U : 1U;
     }
     frame = (interp_delivery_sp(ctx, flags) -
         (SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE)) & ~15U;
@@ -726,17 +763,13 @@ static uint32_t sparc32_fault_req_align(uint32_t op, uint32_t op3)
 }
 
 /*
- * Fault -> signal classification (RC-U3-r2 #2, S32-11, S32-R5-1, S32-R5-2).
- * Both engines report alignment violations as EXIT_FAULT with
- * fault_addr = VA. Decode the faulting instruction FIRST (resolving one CTI
- * delay slot, since a faulting delay reports pc at the transfer for
- * JMPL but at the CTI for the other CTI classes) to learn its required
- * access width, then report SIGBUS (10, BUS_ADRALN) only when
- * (va & (width - 1)) != 0; otherwise the fault is a mapping fault and
- * delivers SIGSEGV (11). In particular a 4-byte-aligned, 8-byte-misaligned
- * LDD/STD/LDDA/STDA/LDDF/STDF fault delivers SIGBUS, while an unmapped
- * byte access (LDSB/LDUB/STB) at an odd address or an aligned halfword
- * fault delivers SIGSEGV. Undecodable PCs report SIGSEGV.
+ * Fault -> signal classification (RC-U3-r2 #2, S32-11, S32-R5-1, S32-R5-2,
+ * S32-R7-14). Both engines report alignment violations as EXIT_FAULT with
+ * fault_addr = VA. Since S32-R7-4 every delay fault reports PC at the
+ * delay instruction, decode PC directly: a JMPL PC means a target-align
+ * fault (width 4), any other CTI PC means a fetch fault. Memory widths
+ * come from the faulting op; SIGBUS (10, BUS_ADRALN) only when
+ * (va & (width - 1)) != 0, else SIGSEGV (11). Undecodable PCs are SIGSEGV.
  */
 int sparc32_classify_fault(const sparc32_ctx_t *ctx)
 {
@@ -744,23 +777,42 @@ int sparc32_classify_fault(const sparc32_ctx_t *ctx)
     uint32_t pc = ctx->pc;
     uint32_t word;
     sparc32_decoded_t d;
-    unsigned depth;
-    for (depth = 0U; depth < 2U; depth++) {
-        uint32_t width;
-        if (!sparc32_fault_insn_word(ctx, pc, &word)) {
-            return 11;
-        }
-        sparc32_decode_word(word, &d);
-        if (d.cls == (uint32_t)SPARC32_OP_CALL ||
-            d.cls == (uint32_t)SPARC32_OP_BRANCH ||
-            d.cls == (uint32_t)SPARC32_OP_FBRANCH ||
-            d.cls == (uint32_t)SPARC32_OP_JMPL ||
-            d.cls == (uint32_t)SPARC32_OP_TRAP) {
-            pc += 4U;
-            continue;
-        }
-        width = sparc32_fault_req_align(d.op, d.op3);
-        return ((va & (width - 1U)) != 0U) ? 10 : 11;
+    uint32_t width;
+    if (!sparc32_fault_insn_word(ctx, pc, &word)) {
+        return 11;
     }
-    return 11;
+    sparc32_decode_word(word, &d);
+    if (d.cls == (uint32_t)SPARC32_OP_JMPL) {
+        return ((va & 3U) != 0U) ? 10 : 11;
+    }
+    if (d.cls == (uint32_t)SPARC32_OP_CALL ||
+        d.cls == (uint32_t)SPARC32_OP_BRANCH ||
+        d.cls == (uint32_t)SPARC32_OP_FBRANCH ||
+        d.cls == (uint32_t)SPARC32_OP_TRAP) {
+        return ((va & 3U) != 0U) ? 10 : 11;
+    }
+    width = sparc32_fault_req_align(d.op, d.op3);
+    return ((va & (width - 1U)) != 0U) ? 10 : 11;
+}
+
+/* S32-R7-15: architectural traps -> guest signals. Integer traps
+ * (DIV_ZERO 0x2A, TAG_OVERFLOW 0x01, FP 0x07) become SIGFPE (8);
+ * privileged/illegal and all other trap numbers become SIGILL (4);
+ * undecodable instructions become SIGILL (4). */
+int sparc32_trap_signo(const sparc32_ctx_t *ctx)
+{
+    if (ctx == NULL) {
+        return 0;
+    }
+    if (ctx->exit_reason == (uint32_t)SPARC32_EXIT_UNDEF) {
+        return 4;
+    }
+    if (ctx->exit_reason != (uint32_t)SPARC32_EXIT_TRAP) {
+        return 0;
+    }
+    if (ctx->exit_arg == 0x2AU || ctx->exit_arg == 0x01U ||
+        ctx->exit_arg == 0x07U) {
+        return 8;
+    }
+    return 4;
 }

@@ -22,6 +22,10 @@ V8 window backing store + WIM + SAVE/RESTORE executor (E01 model).
  * traffic ONLY on WIM overflow/underflow traps (never on plain SAVE).
  * Single global file = one guest thread (Phase 4 needs a side table). */
 static _Thread_local uint32_t interp_winfile[SPARC32_NWINDOWS][16];
+/* Outgoing registers per window (S32-R7-1): %o of window N overlaps %i
+ * of window N-1, so plain l/i caching loses the popped window's %o.
+ * Each window's %o image survives here across rotations. */
+static _Thread_local uint32_t interp_win_o[SPARC32_NWINDOWS][8];
 /* Home stack address of each cached window (its %sp at cache time) and
  * liveness: only valid slots hold outstanding frames whose home is still
  * theirs. Dead slots' homes are live stack space by now (reused by
@@ -31,20 +35,24 @@ static _Thread_local uint32_t interp_winsp[SPARC32_NWINDOWS];
 static _Thread_local uint32_t interp_win_valid[SPARC32_NWINDOWS];
 
 void interp_window_clone_save(uint32_t wf[SPARC32_NWINDOWS][16],
-    uint32_t wsp[SPARC32_NWINDOWS], uint32_t wv[SPARC32_NWINDOWS])
+    uint32_t wsp[SPARC32_NWINDOWS], uint32_t wv[SPARC32_NWINDOWS],
+    uint32_t wo[SPARC32_NWINDOWS][8])
 {
     memcpy(wf, interp_winfile, sizeof(interp_winfile));
     memcpy(wsp, interp_winsp, sizeof(interp_winsp));
     memcpy(wv, interp_win_valid, sizeof(interp_win_valid));
+    memcpy(wo, interp_win_o, sizeof(interp_win_o));
 }
 
 void interp_window_clone_restore(const uint32_t wf[SPARC32_NWINDOWS][16],
     const uint32_t wsp[SPARC32_NWINDOWS],
-    const uint32_t wv[SPARC32_NWINDOWS])
+    const uint32_t wv[SPARC32_NWINDOWS],
+    const uint32_t wo[SPARC32_NWINDOWS][8])
 {
     memcpy(interp_winfile, wf, sizeof(interp_winfile));
     memcpy(interp_winsp, wsp, sizeof(interp_winsp));
     memcpy(interp_win_valid, wv, sizeof(interp_win_valid));
+    memcpy(interp_win_o, wo, sizeof(interp_win_o));
 }
 /* V8 window count tracker: ctx->canrestore counts valid caller windows
  * currently cached in interp_winfile[1..SPARC32_WIN_MAXSAVE]. SAVE spills
@@ -60,6 +68,9 @@ void interp_window_reset(void)
     for (w = 0; w < (uint32_t)SPARC32_NWINDOWS; w++) {
         for (i = 0; i < 16U; i++) {
             interp_winfile[w][i] = 0U;
+        }
+        for (i = 0; i < 8U; i++) {
+            interp_win_o[w][i] = 0U;
         }
         interp_winsp[w] = 0U;
         interp_win_valid[w] = 0U;
@@ -85,6 +96,12 @@ uint32_t *interp_winsp_base(void)
 uint32_t *interp_win_valid_base(void)
 {
     return &interp_win_valid[0];
+}
+
+/* JIT-visible base of the outgoing-register images (S32-R7-1). */
+uint32_t *interp_wino_base(void)
+{
+    return &interp_win_o[0][0];
 }
 
 /* Spill winfile[w] (16 l/i words) to guest [va, va + 64). */
@@ -146,12 +163,18 @@ bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
         for (i = 0; i < 8U; i++) {
             interp_winfile[ctx->cwp][i] = ctx->r[SPARC32_L0 + i];
             interp_winfile[ctx->cwp][8U + i] = ctx->r[SPARC32_I0 + i];
+            interp_win_o[ctx->cwp][i] = old_o[i];
         }
         interp_winsp[ctx->cwp] = ctx->r[SPARC32_SP];
         interp_win_valid[ctx->cwp] = 1U;
         for (i = 0; i < 8U; i++) {
             ctx->r[SPARC32_I0 + i] = old_o[i];
             ctx->r[SPARC32_L0 + i] = interp_winfile[tgt][i];
+        }
+        if (interp_win_valid[tgt] != 0U) {
+            for (i = 0; i < 8U; i++) {
+                ctx->r[SPARC32_O0 + i] = interp_win_o[tgt][i];
+            }
         }
         ctx->cwp = tgt;
         /* The reused slot keeps its recorded (valid, home) image: the
@@ -183,13 +206,14 @@ bool interp_window(sparc32_ctx_t *ctx, const sparc32_decoded_t *d,
         for (i = 0; i < 8U; i++) {
             interp_winfile[ctx->cwp][i] = ctx->r[SPARC32_L0 + i];
             interp_winfile[ctx->cwp][8U + i] = ctx->r[SPARC32_I0 + i];
+            interp_win_o[ctx->cwp][i] = ctx->r[SPARC32_O0 + i];
         }
         /* The switched-out frame dies with this pop: its cached copy
          * must not be mistaken for an outstanding image by a later
          * reuse or flush. */
         interp_winsp[ctx->cwp] = ctx->r[SPARC32_SP];
         interp_win_valid[ctx->cwp] = 0U;
-        if (interp_win_valid[tgt] == 0U || interp_winsp[tgt] != post_sp) {
+        if (interp_win_valid[tgt] == 0U) {
             /* The target holds nothing usable (fresh, evicted, or
              * longjmp-invalidated): refill it from its home slot
              * instead of rotating stale data into the live window. */

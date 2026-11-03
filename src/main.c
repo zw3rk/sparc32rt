@@ -262,6 +262,13 @@ static int run_engine(sparc32_ctx_t *ctx, engine_step_fn step, const char *tag)
                 continue;
             }
         }
+        if (ctx->exit_reason == SPARC32_EXIT_TRAP ||
+            ctx->exit_reason == SPARC32_EXIT_UNDEF) {
+            int signo = sparc32_trap_signo(ctx);
+            if (signo != 0 && interp_try_deliver_sync(ctx, signo)) {
+                continue;
+            }
+        }
         if (ctx->exit_reason != SPARC32_EXIT_SYSCALL) {
             fprintf(stderr,
                     "sparc32rt: %s stopped: reason=%u pc=0x%08x "

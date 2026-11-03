@@ -25,15 +25,21 @@ void interp_window_reset(void);
 /* Run guest instructions until ctx->exit_reason != SPARC32_EXIT_NONE. */
 void interp_run(sparc32_ctx_t *ctx);
 
-/* Try synchronous delivery of signo (10 SIGBUS / 11 SIGSEGV) for a fault
- * recorded in ctx->fault_addr. Builds the rt_signal_frame32 and redirects
- * to the installed old-style handler; returns true when delivered (exit
- * state cleared for continued interp_run). Returns false when no handler
- * is installed or the frame does not fit — caller keeps EXIT_FAULT. */
+/* Try synchronous delivery of signo (4 SIGILL / 8 SIGFPE / 10 SIGBUS /
+ * 11 SIGSEGV) for a fault recorded in ctx->fault_addr (or exit_dest for
+ * traps). Builds the rt_signal_frame32 and redirects to the installed
+ * old-style handler; returns true when delivered (exit state cleared for
+ * continued interp_run). Returns false when no handler is installed or
+ * the frame does not fit — caller keeps the stop reason. */
 bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo);
 
 /* Instruction-aware fault -> signal classification (10 SIGBUS vs 11 SIGSEGV).
  * Shared by src/main.c and clone-thread fault delivery in src/os/threads.c. */
 int sparc32_classify_fault(const sparc32_ctx_t *ctx);
+
+/* Map an architectural trap stop (EXIT_TRAP/EXIT_UNDEF) to its guest
+ * signal (4 SIGILL / 8 SIGFPE, 0 when not mappable). Shared by the
+ * main and clone-thread run loops (S32-R7-15). */
+int sparc32_trap_signo(const sparc32_ctx_t *ctx);
 
 #endif /* SPARC32RT_INTERP_INTERP_H */

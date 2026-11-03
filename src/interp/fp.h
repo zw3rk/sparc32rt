@@ -68,6 +68,14 @@
 
 /* FSR fields (frozen header provides FCC shift/mask). */
 #define FP_FSR_RD_SHIFT 30U
+#define FP_FSR_TEM_SHIFT 23U
+#define FP_FSR_TEM_MASK (0x1FU << 23)
+#define FP_FSR_FTT_SHIFT 14U
+#define FP_FSR_FTT_MASK (0x7U << 14)
+#define FP_FSR_QNE_BIT (1U << 13)
+#define FP_FSR_VER_MASK (0x7U << 17)
+#define FP_FSR_FTT_IEEE 1U
+#define FP_FSR_WRITABLE_MASK 0xCFC00FFFU
 #define FP_FSR_CEXC_MASK 0x1FU
 #define FP_FSR_NVA_BIT  (1U << 9)
 #define FP_FSR_NVC_BIT  (1U << 4)
@@ -75,6 +83,7 @@
 #define FP_FSR_UFC_BIT  (1U << 2)
 #define FP_FSR_DZC_BIT  (1U << 1)
 #define FP_FSR_NXC_BIT  (1U << 0)
+#define FP_TRAP_FP_EXCEPTION 0x07U
 
 /* Rounding directions (FSR.RD). */
 #define FP_RD_RN 0U

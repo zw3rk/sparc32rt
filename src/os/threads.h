@@ -181,13 +181,16 @@ struct thr_start {
     uint32_t winfile[SPARC32_NWINDOWS][16];
     uint32_t winsp[SPARC32_NWINDOWS];
     uint32_t win_valid[SPARC32_NWINDOWS];
+    uint32_t wino[SPARC32_NWINDOWS][8];
 };
 
 void interp_window_clone_save(uint32_t wf[SPARC32_NWINDOWS][16],
-    uint32_t wsp[SPARC32_NWINDOWS], uint32_t wv[SPARC32_NWINDOWS]);
+    uint32_t wsp[SPARC32_NWINDOWS], uint32_t wv[SPARC32_NWINDOWS],
+    uint32_t wo[SPARC32_NWINDOWS][8]);
 void interp_window_clone_restore(const uint32_t wf[SPARC32_NWINDOWS][16],
     const uint32_t wsp[SPARC32_NWINDOWS],
-    const uint32_t wv[SPARC32_NWINDOWS]);
+    const uint32_t wv[SPARC32_NWINDOWS],
+    const uint32_t wo[SPARC32_NWINDOWS][8]);
 long sparc32_thr_gettid(sparc32_ctx_t *ctx);
 
 /* Live-context registry + async host-signal install. Idempotent; called

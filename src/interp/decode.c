@@ -14,8 +14,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "sparc32rt.h"
+#include "interp/interp_priv.h"
 
 /* Sign-extend the low n bits of v (1 <= n <= 31). Branchless and fully
  * defined: the old ((v << shift) >> shift) form shifted right as UNSIGNED
@@ -30,7 +32,8 @@ static int32_t sign_extend(uint32_t v, uint32_t n)
 
 /* FPop1 opf values with a double-precision destination (V8 opf table):
  * even-pair rd required, odd rd decodes illegal (E06 oracle leniency
- * delta: qemu executes it, LEON hardware traps, translator is strict). */
+ * delta: qemu executes it, LEON hardware traps, translator is strict).
+ * S32-R7-17: 0x0c6 is FDTOS (single dest), FiTOd is 0x0c8. */
 static int fpu_double_dest(uint32_t op3, uint32_t opf)
 {
     if (op3 == SPARC32_OP3_FPOP1) {
@@ -42,7 +45,7 @@ static int fpu_double_dest(uint32_t op3, uint32_t opf)
         case 0x046U: /* FSUBd */
         case 0x04AU: /* FMULd */
         case 0x04EU: /* FDIVd */
-        case 0x0C6U: /* FiTOd */
+        case 0x0C8U: /* FiTOd */
         case 0x0C9U: /* FsTOd */
         case 0x0CBU: /* FqTOd */
             return 1;
@@ -54,6 +57,56 @@ static int fpu_double_dest(uint32_t op3, uint32_t opf)
         /* FsMULd (single x single -> double); FDMULq is quad-dest and
          * passes through for Phase 3 to trap on this LEON target. */
         return opf == 0x069U;
+    }
+    return 0;
+}
+
+/* S32-R7-23: validate the (op3, opf) pair. FPop1 carries moves,
+ * arithmetic, sqrt and conversions; FPop2 carries compares and
+ * FSMULD. Cross-group opcodes decode ILLEGAL. */
+static int fpop_valid(uint32_t op3, uint32_t opf)
+{
+    if (op3 == SPARC32_OP3_FPOP1) {
+        switch (opf) {
+        case 0x001U:
+        case 0x002U:
+        case 0x005U:
+        case 0x006U:
+        case 0x009U:
+        case 0x00AU:
+        case 0x029U:
+        case 0x02AU:
+        case 0x041U:
+        case 0x042U:
+        case 0x045U:
+        case 0x046U:
+        case 0x049U:
+        case 0x04AU:
+        case 0x04DU:
+        case 0x04EU:
+        case 0x0C4U:
+        case 0x0C6U:
+        case 0x0C8U:
+        case 0x0C9U:
+        case 0x0CBU:
+        case 0x0D1U:
+        case 0x0D2U:
+            return 1;
+        default:
+            return 0;
+        }
+    }
+    if (op3 == SPARC32_OP3_FPOP2) {
+        switch (opf) {
+        case 0x051U:
+        case 0x052U:
+        case 0x055U:
+        case 0x056U:
+        case 0x069U:
+            return 1;
+        default:
+            return 0;
+        }
     }
     return 0;
 }
@@ -182,6 +235,12 @@ static void decode_format2(uint32_t word, sparc32_decoded_t *out)
         out->cls = SPARC32_OP_SHIFT;
         return;
     case SPARC32_OP3_RDASR:
+        /* STBAR is the RDASR special form (S32-R7-11, V8 B.30):
+         * op3 0x28, rs1 == 15, rd == 0 (e.g. 0x8143c000). */
+        if (rs1 == 15U && rd == 0U) {
+            out->cls = SPARC32_OP_STBAR;
+            return;
+        }
         out->cls = SPARC32_OP_RDASR;
         out->asr = rs1;
         return;
@@ -204,6 +263,10 @@ static void decode_format2(uint32_t word, sparc32_decoded_t *out)
         out->opf = opf;
         out->rs2 = word & 0x1FU;
         out->asi = 0U;
+        if (!fpop_valid(op3, opf)) {
+            out->cls = SPARC32_OP_ILLEGAL;
+            return;
+        }
         if (fpu_double_dest(op3, opf) && ((rd & 0x1U) != 0U)) {
             out->cls = SPARC32_OP_ILLEGAL;
             return;
@@ -220,9 +283,6 @@ static void decode_format2(uint32_t word, sparc32_decoded_t *out)
         return;
     case SPARC32_OP3_FLUSH:
         out->cls = SPARC32_OP_FLUSH;
-        return;
-    case SPARC32_OP3_STBAR:
-        out->cls = SPARC32_OP_STBAR;
         return;
     case SPARC32_OP3_SAVE:
         out->cls = SPARC32_OP_SAVE;
@@ -256,9 +316,10 @@ static void decode_format3_mem(uint32_t word, sparc32_decoded_t *out)
     }
 
     if (op3 == SPARC32_OP3_CASA) {
-        /* CASA carries its ASI in bits 12:5 with i == 1 (E03: the
-         * 0xD5E22149 encoding has i set and asi 0x0a in that slot). */
-        if (i == 0U) {
+        /* CASA carries its immediate ASI in bits 12:5 with i == 0
+         * (S32-R7-10, LLVM LEON 0xd5e60156 has i clear and asi 0x0a);
+         * the i == 1 register-ASI form is unsupported. */
+        if (i != 0U) {
             out->cls = SPARC32_OP_ILLEGAL;
             return;
         }
@@ -390,8 +451,10 @@ int sparc32_fetch_decode(sparc32_ctx_t *ctx, uint32_t va, sparc32_decoded_t *out
 {
     sparc32_decoded_t tmp;
     const uint8_t *base;
-    size_t k;
+    uint8_t b[4];
     uint32_t word;
+    bool need_check;
+    bool covered;
 
     if (ctx == NULL || out == NULL) {
         return -1;
@@ -402,26 +465,25 @@ int sparc32_fetch_decode(sparc32_ctx_t *ctx, uint32_t va, sparc32_decoded_t *out
         ctx->fault_addr = va;
         return -1;
     }
-    if (ctx->region_count > 0U) {
-        int covered = 0;
-        for (k = 0; k < ctx->region_count; k++) {
-            uint32_t start = ctx->regions[k].start;
-            uint32_t end = ctx->regions[k].end;
-            /* The whole 4-byte word must sit inside one readable AND
-             * executable region; end > va guards against 32-bit wrap
-             * on small regions. */
-            if (va >= start && end > va && (end - va) >= 4U &&
-                ((ctx->regions[k].prot & SPARC32_DECODE_PROT_READ) != 0U) &&
-                ((ctx->regions[k].prot & SPARC32_DECODE_PROT_EXEC) != 0U)) {
-                covered = 1;
-                break;
-            }
+    /* S32-R7-12: hold the VM access gate across validation and the
+     * 4-byte copy, validating against authoritative shared page
+     * permissions (prot base) rather than context snapshots. */
+    need_check = (ctx->region_count > 0U) ||
+        (sparc32_vm_prot_base() != NULL);
+    if (need_check) {
+        size_t r;
+        sparc32_vm_access_enter();
+        covered = interp_range_ok(ctx, va, 4U,
+            SPARC32_DECODE_PROT_READ | SPARC32_DECODE_PROT_EXEC);
+        if (covered) {
+            base = (const uint8_t *)sparc32_guest_ptr(ctx, va);
+            memcpy(b, base, sizeof(b));
         }
-        if (covered == 0) {
+        sparc32_vm_access_leave();
+        if (!covered) {
             ctx->exit_reason = SPARC32_EXIT_FAULT;
             ctx->fault_addr = va;
             if (ctx->trace_enabled) {
-                size_t r;
                 fprintf(stderr, "T FETCHFAIL va=%08x nregions=%zu\n", va,
                         ctx->region_count);
                 for (r = 0; r < ctx->region_count; r++) {
@@ -432,13 +494,15 @@ int sparc32_fetch_decode(sparc32_ctx_t *ctx, uint32_t va, sparc32_decoded_t *out
             }
             return -1;
         }
+    } else {
+        base = (const uint8_t *)sparc32_guest_ptr(ctx, va);
+        memcpy(b, base, sizeof(b));
     }
     /* Big-endian fetch through the [G, G + 4 GiB) window (SPEC: guest
      * memory only via the x20/uxtw window; byte assembly keeps this unit
      * host-endian clean without <endian.h>). */
-    base = (const uint8_t *)sparc32_guest_ptr(ctx, va);
-    word = ((uint32_t)base[0] << 24) | ((uint32_t)base[1] << 16) |
-        ((uint32_t)base[2] << 8) | (uint32_t)base[3];
+    word = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+        ((uint32_t)b[2] << 8) | (uint32_t)b[3];
     sparc32_decode_word(word, &tmp);
     *out = tmp;
     return 0;
