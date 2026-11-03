@@ -128,6 +128,29 @@ static inline int l2a_store(sparc32_ctx_t *ctx, uint32_t va, const void *src,
     return 0;
 }
 
+static inline int l2a_ld_be32(const sparc32_ctx_t *ctx, uint32_t va,
+    uint32_t *out)
+{
+    uint8_t b[4];
+    int rc;
+    if (out == NULL) {
+        return -EFAULT;
+    }
+    rc = l2a_load(ctx, va, b, sizeof(b));
+    if (rc != 0) {
+        return rc;
+    }
+    *out = get_be32(b);
+    return 0;
+}
+
+static inline int l2a_st_be32(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
+{
+    uint8_t b[4];
+    put_be32(b, v);
+    return l2a_store(ctx, va, b, sizeof(b));
+}
+
 static inline long l2a_copy_cstring(sparc32_ctx_t *ctx, uint32_t va, char *out,
     uint32_t cap)
 {

@@ -31,10 +31,117 @@
 #define SPARC32RT_OS_THREADS_H
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "sparc32rt.h"
+
+/* SPARC <-> host signal number conversion (S32-R4-4). The guest tables
+ * (dispositions, pending bits, blocked masks) are keyed by SPARC signal
+ * numbers, which match Darwin 1:1 but differ on Linux hosts (e.g. SPARC
+ * SIGBUS is 10 while Linux SIGBUS is 7 and Linux SIGUSR1 is 10).
+ * Every host sigaction/kill/tgkill/pthread_kill argument goes through
+ * to_host; the async host handler maps back through from_host before
+ * touching guest state. Signals 1..9, 11, 13..15 (and 29/32..64) are
+ * identity on both hosts. */
+static inline int sparc32_sig_to_host(int sig)
+{
+    switch (sig) {
+    case 10:
+        return SIGBUS;
+    case 12:
+        return SIGSYS;
+    case 16:
+        return SIGURG;
+    case 17:
+        return SIGSTOP;
+    case 18:
+        return SIGTSTP;
+    case 19:
+        return SIGCONT;
+    case 20:
+        return SIGCHLD;
+    case 21:
+        return SIGTTIN;
+    case 22:
+        return SIGTTOU;
+    case 23:
+        return SIGIO;
+    case 24:
+        return SIGXCPU;
+    case 25:
+        return SIGXFSZ;
+    case 26:
+        return SIGVTALRM;
+    case 27:
+        return SIGPROF;
+    case 28:
+        return SIGWINCH;
+    case 30:
+        return SIGUSR1;
+    case 31:
+        return SIGUSR2;
+    default:
+        return sig;
+    }
+}
+
+static inline int sparc32_sig_from_host(int sig)
+{
+    if (sig == SIGBUS) {
+        return 10;
+    }
+    if (sig == SIGSYS) {
+        return 12;
+    }
+    if (sig == SIGURG) {
+        return 16;
+    }
+    if (sig == SIGSTOP) {
+        return 17;
+    }
+    if (sig == SIGTSTP) {
+        return 18;
+    }
+    if (sig == SIGCONT) {
+        return 19;
+    }
+    if (sig == SIGCHLD) {
+        return 20;
+    }
+    if (sig == SIGTTIN) {
+        return 21;
+    }
+    if (sig == SIGTTOU) {
+        return 22;
+    }
+    if (sig == SIGIO) {
+        return 23;
+    }
+    if (sig == SIGXCPU) {
+        return 24;
+    }
+    if (sig == SIGXFSZ) {
+        return 25;
+    }
+    if (sig == SIGVTALRM) {
+        return 26;
+    }
+    if (sig == SIGPROF) {
+        return 27;
+    }
+    if (sig == SIGWINCH) {
+        return 28;
+    }
+    if (sig == SIGUSR1) {
+        return 30;
+    }
+    if (sig == SIGUSR2) {
+        return 31;
+    }
+    return sig;
+}
 
 static inline uint64_t sparc32_thr_sigbit(int sig)
 {
@@ -58,7 +165,9 @@ static inline uint64_t sparc32_thr_sigbit(int sig)
 #define THR_CLONE_SYSVSEM 0x00040000U
 #define THR_CLONE_UNTRACED 0x00800000U
 
-/* Clone rendezvous between the returning parent and the started child. */
+/* Clone rendezvous between the returning parent and the started child.
+ * S32-R4-1: refcounted (parent + child); last to zero destroys
+ * lock/cond and frees the block. */
 struct thr_start {
     sparc32_ctx_t *ctx;
     uint32_t clear_tid_va;
@@ -68,6 +177,7 @@ struct thr_start {
     pthread_cond_t ready;
     bool tid_ready;
     long child_tid;
+    int refs;
     uint32_t winfile[SPARC32_NWINDOWS][16];
     uint32_t winsp[SPARC32_NWINDOWS];
     uint32_t win_valid[SPARC32_NWINDOWS];
@@ -97,6 +207,9 @@ void thr_live_enter(void);
 void thr_live_leave(void);
 sparc32_ctx_t *thr_live_find_locked(int32_t want_tid, int32_t self_tid,
     const sparc32_ctx_t *self);
+/* pthread handle for a live host TID (S32-R4-8): true + *out when the
+ * slot holds a valid pt (non-Linux wakeup uses pthread_kill). */
+bool thr_live_pt_for_tid(int32_t tid, pthread_t *out);
 
 /* Real kernel TID of the calling host thread (shared by the splits). */
 int thr_gettid(void);
@@ -147,6 +260,7 @@ void sparc32_thr_fork_child(sparc32_ctx_t *ctx);
 void sparc32_thr_exec_retire_begin(sparc32_ctx_t *survivor);
 void sparc32_thr_exec_retire_wait(sparc32_ctx_t *survivor);
 bool sparc32_thr_is_retired(const sparc32_ctx_t *ctx);
+void sparc32_thr_exec_retire_done(void);
 
 /* Retired-context self exit: deregister + free own context, leave the
  * process (interp_run/dbt_run retire polls; never returns). */
@@ -162,6 +276,8 @@ void sparc32_fd_note_close(int fd);
 void sparc32_fd_note_dup2(int oldfd, int newfd);
 void sparc32_fd_note_set_cloexec(int fd, bool cloexec);
 void sparc32_fd_cloexec_sweep(void);
+void sparc32_fd_close_cloexec(void);
+long sparc32_fd_close_tracked(int fd);
 
 /* One-time registration of inherited descriptors 0..2 as guest-owned
  * so F_SETFD on them is honoured at exec (S32-R3-9 follow-up #6). */

@@ -287,13 +287,11 @@ long sparc32_l2a_creat(sparc32_ctx_t *ctx, uint32_t path_va, uint32_t mode)
     return (long)fd;
 }
 
+long sparc32_fd_close_tracked(int fd);
+
 long sparc32_l2a_close(int fd)
 {
-    if (close(fd) != 0) {
-        return -(long)errno;
-    }
-    sparc32_fd_note_close(fd);
-    return 0;
+    return sparc32_fd_close_tracked(fd);
 }
 
 long sparc32_l2a_unlink(sparc32_ctx_t *ctx, uint32_t path_va)

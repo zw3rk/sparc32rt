@@ -219,7 +219,7 @@ static long sys_read(sparc32_ctx_t *ctx, uint32_t fd, uint32_t buf_va, uint32_t 
         }
     }
     n = read((int)fd, buf, (size_t)count);
-    if (n > 0) {
+    if (n > 0 && !sparc32_thr_is_retired(ctx)) {
         rc = l2a_store(ctx, buf_va, buf, (uint64_t)n);
         if (rc != 0) {
             if (buf != sbuf) {

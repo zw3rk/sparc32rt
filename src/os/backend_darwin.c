@@ -244,19 +244,26 @@ int rt_host_map_anon(void *hint_addr, size_t len, int linux_prot,
             uintptr_t in_start = (start + (uintptr_t)(hp - 1u)) &
                 ~(uintptr_t)(hp - 1u);
             uintptr_t in_end = (uintptr_t)(start + len) & ~(uintptr_t)(hp - 1u);
-            if (in_end <= in_start) {
-                *out_host_addr = hint_addr;
-                return 0;
+            /* S32-R4-11: even PROT_NONE replacements are zero-filled:
+             * widen to RW, memset, then narrow to NONE. */
+            if (mprotect((void *)hp_start, hp_end - hp_start,
+                    PROT_READ | PROT_WRITE) != 0) {
+                return -errno;
             }
-            hp_start = in_start;
-            hp_end = in_end;
+            memset(hint_addr, 0, len);
+            if (in_end > in_start) {
+                if (mprotect((void *)in_start, in_end - in_start,
+                        PROT_NONE) != 0) {
+                    return -errno;
+                }
+            }
+            *out_host_addr = hint_addr;
+            return 0;
         }
         if (mprotect((void *)hp_start, hp_end - hp_start, hprot) != 0) {
             return -errno;
         }
-        if (hprot != PROT_NONE) {
-            memset(hint_addr, 0, len);
-        }
+        memset(hint_addr, 0, len);
         *out_host_addr = hint_addr;
         return 0;
     }
@@ -384,6 +391,20 @@ int rt_host_map_file(void *hint_addr, size_t len, int linux_prot, int shared,
                 break;
             }
             done += (size_t)n;
+        }
+        if (done < len) {
+            uintptr_t tail_start =
+                (((uintptr_t)hint_addr + done + 4095u) & ~(uintptr_t)4095u);
+            uintptr_t tail_end = (uintptr_t)hint_addr + len;
+            if (tail_start < tail_end) {
+                uintptr_t t_in_start = (tail_start + (uintptr_t)(hp - 1u)) &
+                    ~(uintptr_t)(hp - 1u);
+                uintptr_t t_in_end = tail_end & ~(uintptr_t)(hp - 1u);
+                if (t_in_end > t_in_start) {
+                    (void)mprotect((void *)t_in_start,
+                        t_in_end - t_in_start, PROT_NONE);
+                }
+            }
         }
         *out_host_addr = hint_addr;
         return 0;

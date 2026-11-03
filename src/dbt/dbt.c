@@ -256,14 +256,19 @@ static const dbt_block_t *dbt_lookup_locked(sparc32_ctx_t *ctx, uint32_t pc)
     idx = dbt_cache_index(pc);
     b = &g_blocks[idx];
     if (b->valid && b->start_pc == pc) {
-        if (b->epoch != g_cache_epoch) {
-            b->epoch = g_cache_epoch;
-            memset(&g_chain[idx], 0, sizeof(g_chain[idx]));
-            g_chain[idx].key_epoch =
-                (uint64_t)b->start_pc | ((uint64_t)b->epoch << 32);
-            g_chain[idx].host_code = b->host_code;
+        if (b->epoch == g_cache_epoch) {
+            return b;
         }
-        return b;
+        /* Stale epoch (S32-R4-3): retire without reusing host_code;
+         * fall through to retranslate instead of refreshing the epoch. */
+        b->valid = false;
+        b->host_code = NULL;
+        b->needs_interp = true;
+        b->slot_count = 0U;
+        memset(&g_chain[idx], 0, sizeof(g_chain[idx]));
+        if (g_cached_count > 0U) {
+            g_cached_count -= 1U;
+        }
     }
     return dbt_translate_locked(ctx, pc, false);
 }

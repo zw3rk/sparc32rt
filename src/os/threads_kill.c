@@ -62,7 +62,21 @@ long sparc32_thr_kill(sparc32_ctx_t *ctx, uint32_t pid, uint32_t sig)
     if (sig > 64U) {
         return -EINVAL;
     }
-    if (sig != 0U && kill((pid_t)(int32_t)pid, (int)sig) != 0) {
+    if (sig != 0U && thr_is_self(pid)) {
+        int s = (int)sig;
+        if (s != 9 && s != 17 &&
+            sparc32_signal_disposition(s) == SPARC32_SIG_DISP_DFL &&
+            sparc32_thr_sig_blocked(ctx, s) != 0) {
+            /* Blocked + default (S32-R4-5): queue only and skip the
+             * host call, so kernel SIG_DFL cannot terminate while
+             * the guest holds the signal blocked. The safe-point
+             * poll applies default termination at unmask time. */
+            return thr_kill_self(ctx, s);
+        }
+    }
+    if (sig != 0U &&
+        kill((pid_t)(int32_t)pid,
+            sparc32_sig_to_host((int)sig)) != 0) {
         return -(long)errno;
     }
     if (sig != 0U && thr_is_self(pid)) {
@@ -80,19 +94,26 @@ long sparc32_thr_kill(sparc32_ctx_t *ctx, uint32_t pid, uint32_t sig)
  * the default action (fatal signals terminate; raise/abort work). */
 static long thr_host_tgkill(uint32_t tgid, int host_tid, uint32_t sig)
 {
+    /* Host numbering (S32-R4-4): the caller passes SPARC numbers. */
+    int hsig = sparc32_sig_to_host((int)sig);
 #if defined(__linux__) && defined(SYS_tgkill)
     long rc = syscall(SYS_tgkill, (pid_t)(int32_t)tgid, (pid_t)host_tid,
-        (int)sig);
+        hsig);
     return (rc == 0) ? 0 : -(long)errno;
 #elif defined(__linux__) && defined(SYS_tkill)
     long rc;
     (void)tgid;
-    rc = syscall(SYS_tkill, (pid_t)host_tid, (int)sig);
+    rc = syscall(SYS_tkill, (pid_t)host_tid, hsig);
     return (rc == 0) ? 0 : -(long)errno;
-#else
+#else /* #ifndef __linux__: pthread delivery (S32-R4-8) */
+    pthread_t pt;
     long rc;
     (void)tgid;
-    rc = kill((pid_t)host_tid, (int)sig);
+    if (thr_live_pt_for_tid(host_tid, &pt)) {
+        int prc = pthread_kill(pt, hsig);
+        return (prc == 0) ? 0 : -(long)prc;
+    }
+    rc = kill((pid_t)host_tid, hsig);
     return (rc == 0) ? 0 : -(long)errno;
 #endif
 }
@@ -103,6 +124,7 @@ static long thr_kill_tid(sparc32_ctx_t *ctx, uint32_t tgid,
     long rc = 0;
     bool found = false;
     bool is_self_target = false;
+    bool dfl_blocked_queued = false;
     int target_host_tid = 0;
     int disp = SPARC32_SIG_DISP_DFL;
     int self_tid = 0;
@@ -110,7 +132,32 @@ static long thr_kill_tid(sparc32_ctx_t *ctx, uint32_t tgid,
     if (sig > 64U) {
         return -EINVAL;
     }
+    if ((int32_t)tgid <= 0) {
+        return -EINVAL;
+    }
     self_tid = thr_gettid();
+    if ((int32_t)tgid != (int32_t)getpid()) {
+        /* Foreign thread group (S32-R4-7): never queue locally. A local
+         * TID under a mismatched TGID is ESRCH; otherwise delegate to
+         * the host. */
+        bool local = false;
+        thr_live_enter();
+        local = thr_live_find_locked((int32_t)tid, self_tid, ctx) != NULL;
+        thr_live_leave();
+        if (local) {
+            return -ESRCH;
+        }
+        if (sig == 0U) {
+#if defined(__linux__) && defined(SYS_tgkill)
+            rc = syscall(SYS_tgkill, (pid_t)(int32_t)tgid,
+                (pid_t)(int32_t)tid, 0);
+            return (rc == 0) ? 0 : -(long)errno;
+#else
+            return -ESRCH;
+#endif
+        }
+        return thr_host_tgkill(tgid, (int32_t)tid, sig);
+    }
     if (sig == 0U) {
         /* Existence check only. */
         thr_live_enter();
@@ -148,7 +195,17 @@ static long thr_kill_tid(sparc32_ctx_t *ctx, uint32_t tgid,
             thr_live_leave();
             return 0;
         }
-        if (disp == SPARC32_SIG_DISP_CAUGHT) {
+        if (disp == SPARC32_SIG_DISP_DFL && (int)sig != 9 &&
+            (int)sig != 17 &&
+            sparc32_thr_sig_blocked(target, (int)sig) != 0) {
+            /* Blocked + default (S32-R4-5): queue the thread bit and
+             * skip the host call below, so kernel SIG_DFL cannot fire
+             * while the guest holds the signal blocked. Default
+             * termination applies at unmask time in the poll. */
+            __atomic_fetch_or(&target->pending_signals,
+                sparc32_thr_sigbit((int)sig), __ATOMIC_RELEASE);
+            dfl_blocked_queued = true;
+        } else if (disp == SPARC32_SIG_DISP_CAUGHT) {
             __atomic_fetch_or(&target->pending_signals,
                 sparc32_thr_sigbit((int)sig), __ATOMIC_RELEASE);
         }
@@ -158,6 +215,15 @@ static long thr_kill_tid(sparc32_ctx_t *ctx, uint32_t tgid,
         rc = thr_host_tgkill(tgid, (int32_t)tid, sig);
         if (rc != 0) {
             return rc;
+        }
+        return 0;
+    }
+    if (disp == SPARC32_SIG_DISP_DFL && dfl_blocked_queued) {
+        /* Queued while blocked above: no host call. A self target
+         * also joins the process queue; the poll terminates at
+         * unmask time when the default action is fatal. */
+        if ((int32_t)tid == self_tid) {
+            return thr_kill_self(ctx, (int)sig);
         }
         return 0;
     }
@@ -221,6 +287,9 @@ long sparc32_thr_tgkill(sparc32_ctx_t *ctx, uint32_t tgid, uint32_t tid,
     sparc32_threads_ensure_init(ctx);
     if (ctx == NULL) {
         return -EFAULT;
+    }
+    if ((int32_t)tgid <= 0) {
+        return -EINVAL;
     }
     return thr_kill_tid(ctx, tgid, tid, sig);
 }

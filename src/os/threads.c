@@ -69,13 +69,19 @@ int thr_gettid(void)
 }
 
 /* Live contexts (normal thread context only; the async handler never
- * reads this table) + the stable process-pending word + exec retire. */
-static sparc32_ctx_t *thr_live[THR_MAX_LIVE];
+ * reads this table) + the stable process-pending word + exec retire.
+ * Each slot also stores the host pthread for non-Linux wakeup
+ * (S32-R4-8): pthread_kill(pt) instead of kill(host_tid). */
+typedef struct {
+    sparc32_ctx_t *ctx;
+    pthread_t pt;
+    int pt_valid;
+} thr_slot_t;
+static thr_slot_t thr_live[THR_MAX_LIVE];
 static pthread_mutex_t thr_live_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool thr_init_done = false;
 static _Atomic uint64_t g_process_pending = 0ULL;
 static _Atomic bool g_exec_retiring = false;
-static _Atomic uintptr_t g_exec_survivor = 0U;
 
 /* Sticky per-context retirement marks (S32-R3-4 follow-up #4): every
  * context ever marked retired stays marked until its own storage is
@@ -141,7 +147,8 @@ sparc32_ctx_t *thr_live_find_locked(int32_t want_tid, int32_t self_tid,
 {
     size_t i;
     for (i = 0U; i < THR_MAX_LIVE; i++) {
-        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i], __ATOMIC_ACQUIRE);
+        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i].ctx,
+            __ATOMIC_ACQUIRE);
         if (c != NULL && (c->host_tid == want_tid ||
                 (want_tid == self_tid && c == self))) {
             return c;
@@ -150,22 +157,63 @@ sparc32_ctx_t *thr_live_find_locked(int32_t want_tid, int32_t self_tid,
     return NULL;
 }
 
+/* Slot pthread lookup for non-Linux wakeup (S32-R4-8). Own locking. */
+bool thr_live_pt_for_tid(int32_t tid, pthread_t *out)
+{
+    size_t i;
+    bool ok = false;
+    pthread_mutex_lock(&thr_live_lock);
+    for (i = 0U; i < THR_MAX_LIVE; i++) {
+        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i].ctx,
+            __ATOMIC_ACQUIRE);
+        if (c != NULL && c->host_tid == tid && thr_live[i].pt_valid) {
+            if (out != NULL) {
+                *out = thr_live[i].pt;
+            }
+            ok = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&thr_live_lock);
+    return ok;
+}
+
+static void thr_live_set_pt_locked(sparc32_ctx_t *ctx, pthread_t pt)
+{
+    size_t i;
+    for (i = 0U; i < THR_MAX_LIVE; i++) {
+        if (__atomic_load_n(&thr_live[i].ctx, __ATOMIC_RELAXED) == ctx) {
+            thr_live[i].pt = pt;
+            thr_live[i].pt_valid = 1;
+            break;
+        }
+    }
+}
+
 static void thr_register(sparc32_ctx_t *ctx)
 {
     size_t i;
+    pthread_t self;
     if (ctx == NULL) {
         return;
     }
+    self = pthread_self();
     pthread_mutex_lock(&thr_live_lock);
     for (i = 0U; i < THR_MAX_LIVE; i++) {
-        if (__atomic_load_n(&thr_live[i], __ATOMIC_RELAXED) == ctx) {
+        if (__atomic_load_n(&thr_live[i].ctx, __ATOMIC_RELAXED) == ctx) {
+            if (!thr_live[i].pt_valid) {
+                thr_live[i].pt = self;
+                thr_live[i].pt_valid = 1;
+            }
             pthread_mutex_unlock(&thr_live_lock);
             return;
         }
     }
     for (i = 0U; i < THR_MAX_LIVE; i++) {
-        if (__atomic_load_n(&thr_live[i], __ATOMIC_RELAXED) == NULL) {
-            __atomic_store_n(&thr_live[i], ctx, __ATOMIC_RELEASE);
+        if (__atomic_load_n(&thr_live[i].ctx, __ATOMIC_RELAXED) == NULL) {
+            __atomic_store_n(&thr_live[i].ctx, ctx, __ATOMIC_RELEASE);
+            thr_live[i].pt = self;
+            thr_live[i].pt_valid = 1;
             break;
         }
     }
@@ -177,8 +225,9 @@ static void thr_deregister(sparc32_ctx_t *ctx)
     size_t i;
     pthread_mutex_lock(&thr_live_lock);
     for (i = 0U; i < THR_MAX_LIVE; i++) {
-        if (__atomic_load_n(&thr_live[i], __ATOMIC_RELAXED) == ctx) {
-            __atomic_store_n(&thr_live[i], NULL, __ATOMIC_RELEASE);
+        if (__atomic_load_n(&thr_live[i].ctx, __ATOMIC_RELAXED) == ctx) {
+            __atomic_store_n(&thr_live[i].ctx, NULL, __ATOMIC_RELEASE);
+            thr_live[i].pt_valid = 0;
         }
     }
     /* A context that frees its own storage drops its retirement mark
@@ -215,6 +264,8 @@ void sparc32_thr_note_signal(int sig)
 
 void sparc32_thr_host_handler(int sig)
 {
+    /* Host numbering (S32-R4-4): map back to SPARC before noting. */
+    sig = sparc32_sig_from_host(sig);
     if (sig < 1 || sig > 64) {
         return;
     }
@@ -269,7 +320,8 @@ bool sparc32_thr_thread_has_pending(int sig)
     bit = sparc32_thr_sigbit(sig);
     pthread_mutex_lock(&thr_live_lock);
     for (i = 0U; i < THR_MAX_LIVE; i++) {
-        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i], __ATOMIC_ACQUIRE);
+        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i].ctx,
+            __ATOMIC_ACQUIRE);
         if (c != NULL && (__atomic_load_n(&c->pending_signals,
                 __ATOMIC_ACQUIRE) & bit) != 0ULL) {
             pthread_mutex_unlock(&thr_live_lock);
@@ -401,12 +453,12 @@ void sparc32_thr_fork_child(sparc32_ctx_t *ctx)
     pthread_mutex_destroy(&thr_live_lock);
     pthread_mutex_init(&thr_live_lock, NULL);
     for (i = 0U; i < THR_MAX_LIVE; i++) {
-        __atomic_store_n(&thr_live[i], NULL, __ATOMIC_RELAXED);
+        __atomic_store_n(&thr_live[i].ctx, NULL, __ATOMIC_RELAXED);
+        thr_live[i].pt_valid = 0;
         __atomic_store_n(&thr_retired[i], NULL, __ATOMIC_RELAXED);
     }
     atomic_store_explicit(&g_process_pending, 0ULL, memory_order_relaxed);
     atomic_store_explicit(&g_exec_retiring, false, memory_order_relaxed);
-    atomic_store_explicit(&g_exec_survivor, 0U, memory_order_relaxed);
     if (ctx != NULL) {
         __atomic_store_n(&ctx->pending_signals, 0ULL, __ATOMIC_RELAXED);
         ctx->sig_last_frame_va = 0U;
@@ -457,8 +509,6 @@ long sparc32_thr_vfork(sparc32_ctx_t *ctx)
 void sparc32_thr_exec_retire_begin(sparc32_ctx_t *survivor)
 {
     size_t i;
-    atomic_store_explicit(&g_exec_survivor, (uintptr_t)survivor,
-        memory_order_release);
     atomic_store_explicit(&g_exec_retiring, true, memory_order_release);
     /* Mark every other live context retired under the lock. The marks
      * are sticky per context (see thr_retired): the wait below never
@@ -467,7 +517,8 @@ void sparc32_thr_exec_retire_begin(sparc32_ctx_t *survivor)
      * image. Contexts cloned after the exec are never marked. */
     pthread_mutex_lock(&thr_live_lock);
     for (i = 0U; i < THR_MAX_LIVE; i++) {
-        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i], __ATOMIC_ACQUIRE);
+        sparc32_ctx_t *c = __atomic_load_n(&thr_live[i].ctx,
+            __ATOMIC_ACQUIRE);
         if (c != NULL && c != survivor) {
             thr_retired_add_locked(c);
         }
@@ -480,10 +531,12 @@ bool sparc32_thr_is_retired(const sparc32_ctx_t *ctx)
     if (ctx == NULL) {
         return false;
     }
-    if (!atomic_load_explicit(&g_exec_retiring, memory_order_acquire)) {
-        return false;
-    }
     return thr_retired_contains(ctx);
+}
+
+void sparc32_thr_exec_retire_done(void)
+{
+    atomic_store_explicit(&g_exec_retiring, false, memory_order_release);
 }
 
 void sparc32_thr_exec_retire_wait(sparc32_ctx_t *survivor)
@@ -506,7 +559,8 @@ void sparc32_thr_exec_retire_wait(sparc32_ctx_t *survivor)
         size_t k;
         pthread_mutex_lock(&thr_live_lock);
         for (k = 0U; k < THR_MAX_LIVE; k++) {
-            if (__atomic_load_n(&thr_live[k], __ATOMIC_ACQUIRE) != NULL) {
+            if (__atomic_load_n(&thr_live[k].ctx, __ATOMIC_ACQUIRE) !=
+                NULL) {
                 live++;
             }
         }
@@ -518,9 +572,11 @@ void sparc32_thr_exec_retire_wait(sparc32_ctx_t *survivor)
     }
     pthread_mutex_lock(&thr_live_lock);
     for (n = 0U; n < THR_MAX_LIVE; n++) {
-        sparc32_ctx_t *c = __atomic_load_n(&thr_live[n], __ATOMIC_ACQUIRE);
+        sparc32_ctx_t *c = __atomic_load_n(&thr_live[n].ctx,
+            __ATOMIC_ACQUIRE);
         if (c != NULL && c != survivor) {
-            __atomic_store_n(&thr_live[n], NULL, __ATOMIC_RELEASE);
+            __atomic_store_n(&thr_live[n].ctx, NULL, __ATOMIC_RELEASE);
+            thr_live[n].pt_valid = 0;
         }
     }
     pthread_mutex_unlock(&thr_live_lock);
@@ -582,10 +638,26 @@ long sparc32_thr_waitpid(sparc32_ctx_t *ctx, uint32_t pid,
  * mandatory; PARENT_SETTID/CHILD_CLEARTID(+wake)/SETTLS(-> %g7)
  * implemented; FS/FILES/SIGHAND/THREAD/VFORK/UNTRACED accepted. */
 
+static void thr_start_release(struct thr_start *st)
+{
+    bool last = false;
+    pthread_mutex_lock(&st->lock);
+    if (--st->refs == 0) {
+        last = true;
+    }
+    pthread_mutex_unlock(&st->lock);
+    if (last) {
+        pthread_mutex_destroy(&st->lock);
+        pthread_cond_destroy(&st->ready);
+        free(st);
+    }
+}
+
 static void thr_thread_finish(struct thr_start *st, long status)
 {
     sparc32_ctx_t *ctx = st->ctx;
-    if (st->clear_tid_va != 0U &&
+    bool retired = thr_retired_contains(ctx);
+    if (!retired && st->clear_tid_va != 0U &&
         l2a_range_ok_prot(st->clear_tid_va, 4U, 2U) == 0) {
         (void)thr_st(ctx, st->clear_tid_va, 0U);
 #if defined(__linux__) && defined(SYS_futex)
@@ -601,7 +673,7 @@ static void thr_thread_finish(struct thr_start *st, long status)
 #endif
     }
     thr_drop_context(ctx);
-    free(st);
+    thr_start_release(st);
     pthread_exit((void *)(uintptr_t)(status & 0xFFL));
 }
 
@@ -613,6 +685,9 @@ static void *thr_thread_entry(void *arg)
     sparc32_ctx_t *ctx = st->ctx;
     interp_window_clone_restore(st->winfile, st->winsp, st->win_valid);
     ctx->host_tid = thr_gettid();
+    pthread_mutex_lock(&thr_live_lock);
+    thr_live_set_pt_locked(ctx, pthread_self());
+    pthread_mutex_unlock(&thr_live_lock);
     pthread_mutex_lock(&st->lock);
     st->child_tid = (long)ctx->host_tid;
     st->tid_ready = true;
@@ -699,6 +774,9 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
     if (ctx == NULL) {
         return -EFAULT;
     }
+    if (atomic_load_explicit(&g_exec_retiring, memory_order_acquire)) {
+        return -EAGAIN;
+    }
     if ((flags & THR_CLONE_VM) == 0U || (flags & ~known) != 0U) {
         return -EINVAL;
     }
@@ -751,6 +829,7 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
     st->flags_cleartid = (flags & THR_CLONE_CHILD_CLEARTID) != 0U;
     st->tid_ready = false;
     st->child_tid = -1L;
+    st->refs = 2;
     interp_window_clone_save(st->winfile, st->winsp, st->win_valid);
     thr_register(child);
     if (pthread_mutex_init(&st->lock, NULL) != 0 ||
@@ -771,17 +850,22 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
         return -(long)e;
     }
     pthread_attr_destroy(&attr);
+    /* Record the child's pthread for non-Linux wakeup (S32-R4-8); the
+     * child entry refreshes the same slot via pthread_self(). */
+    pthread_mutex_lock(&thr_live_lock);
+    thr_live_set_pt_locked(child, th);
+    pthread_mutex_unlock(&thr_live_lock);
     /* Rendezvous on the real kernel TID (reported as the clone return
-     * value and stored to parent_tidptr). The child frees st at exit;
-     * lock/cond die here (child never touches them after signalling). */
+     * value and stored to parent_tidptr). Refcounted (S32-R4-1): the
+     * parent drops one ref here, the child drops the other at finish;
+     * only the last to reach zero destroys lock/cond and frees st. */
     pthread_mutex_lock(&st->lock);
     while (!st->tid_ready) {
         pthread_cond_wait(&st->ready, &st->lock);
     }
     child_tid = st->child_tid;
     pthread_mutex_unlock(&st->lock);
-    pthread_mutex_destroy(&st->lock);
-    pthread_cond_destroy(&st->ready);
+    thr_start_release(st);
     if ((flags & THR_CLONE_PARENT_SETTID) != 0U && parent_tid_va != 0U) {
         (void)thr_st(ctx, parent_tid_va, (uint32_t)child_tid);
     }

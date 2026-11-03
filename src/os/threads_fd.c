@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -33,43 +34,104 @@
 #include "os/syscalls_min.h"
 #include "os/threads.h"
 
-/* Fixed tracking table: hosts cap guest fds far below this in practice;
- * an fd past the cap stays untracked (it leaks across exec rather than
- * risking a wrong close). */
+/* S32-R4-10: dynamically grown tracking table; any host fd is
+ * trackable so no guest fd leaks across exec. Growth happens under
+ * thr_fd_lock; OOM leaves the fd untracked (fail-open, never wrong
+ * close). */
 #define THR_FD_TRACK_MAX 8192
 
-static uint8_t thr_fd_used[THR_FD_TRACK_MAX];
-static uint8_t thr_fd_cloexec[THR_FD_TRACK_MAX];
+static uint8_t *thr_fd_used = NULL;
+static uint8_t *thr_fd_cloexec = NULL;
+static size_t thr_fd_cap = 0U;
 static pthread_mutex_t thr_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool thr_fd_ensure_locked(int fd)
+{
+    size_t need;
+    uint8_t *nu;
+    uint8_t *nc;
+    if (fd < 0) {
+        return false;
+    }
+    need = (size_t)fd + 1U;
+    if (need <= thr_fd_cap) {
+        return true;
+    }
+    if (need < THR_FD_TRACK_MAX) {
+        need = THR_FD_TRACK_MAX;
+    }
+    nu = (uint8_t *)realloc(thr_fd_used, need);
+    if (nu == NULL) {
+        return false;
+    }
+    nc = (uint8_t *)realloc(thr_fd_cloexec, need);
+    if (nc == NULL) {
+        free(nu);
+        return false;
+    }
+    memset(nu + thr_fd_cap, 0, need - thr_fd_cap);
+    memset(nc + thr_fd_cap, 0, need - thr_fd_cap);
+    thr_fd_used = nu;
+    thr_fd_cloexec = nc;
+    thr_fd_cap = need;
+    return true;
+}
 
 void sparc32_fd_note_open(int fd, bool cloexec)
 {
-    if (fd < 0 || fd >= THR_FD_TRACK_MAX) {
+    if (fd < 0) {
         return;
     }
     pthread_mutex_lock(&thr_fd_lock);
-    thr_fd_used[fd] = 1U;
-    thr_fd_cloexec[fd] = cloexec ? 1U : 0U;
+    if (thr_fd_ensure_locked(fd)) {
+        thr_fd_used[fd] = 1U;
+        thr_fd_cloexec[fd] = cloexec ? 1U : 0U;
+    }
     pthread_mutex_unlock(&thr_fd_lock);
 }
 
 void sparc32_fd_note_close(int fd)
 {
-    if (fd < 0 || fd >= THR_FD_TRACK_MAX) {
+    if (fd < 0) {
         return;
     }
     pthread_mutex_lock(&thr_fd_lock);
-    thr_fd_used[fd] = 0U;
-    thr_fd_cloexec[fd] = 0U;
+    if ((size_t)fd < thr_fd_cap) {
+        thr_fd_used[fd] = 0U;
+        thr_fd_cloexec[fd] = 0U;
+    }
     pthread_mutex_unlock(&thr_fd_lock);
+}
+
+/* S32-R4-14: tracked close holding thr_fd_lock across close+untrack
+ * so a concurrent open cannot reuse the fd between the two steps. */
+long sparc32_fd_close_tracked(int fd)
+{
+    int rc;
+    if (fd < 0) {
+        return -EBADF;
+    }
+    pthread_mutex_lock(&thr_fd_lock);
+    (void)thr_fd_ensure_locked(fd);
+    rc = close(fd);
+    if ((size_t)fd < thr_fd_cap) {
+        thr_fd_used[fd] = 0U;
+        thr_fd_cloexec[fd] = 0U;
+    }
+    pthread_mutex_unlock(&thr_fd_lock);
+    return (rc != 0) ? -(long)errno : 0;
 }
 
 void sparc32_fd_note_dup2(int oldfd, int newfd)
 {
-    if (newfd < 0 || newfd >= THR_FD_TRACK_MAX) {
+    if (newfd < 0) {
         return;
     }
     pthread_mutex_lock(&thr_fd_lock);
+    if (!thr_fd_ensure_locked(newfd)) {
+        pthread_mutex_unlock(&thr_fd_lock);
+        return;
+    }
     if (oldfd == newfd) {
         /* dup2(fd, fd) is a no-op that keeps CLOEXEC (Linux): leave a
          * tracked flag alone, and adopt the host flag when the
@@ -96,11 +158,11 @@ void sparc32_fd_note_set_cloexec(int fd, bool cloexec)
 {
     /* fcntl F_SETFD: update the flag of a tracked descriptor only;
      * untracked (translator-owned) descriptors are left alone. */
-    if (fd < 0 || fd >= THR_FD_TRACK_MAX) {
+    if (fd < 0) {
         return;
     }
     pthread_mutex_lock(&thr_fd_lock);
-    if (thr_fd_used[fd] != 0U) {
+    if ((size_t)fd < thr_fd_cap && thr_fd_used[fd] != 0U) {
         thr_fd_cloexec[fd] = cloexec ? 1U : 0U;
     }
     pthread_mutex_unlock(&thr_fd_lock);
@@ -119,8 +181,9 @@ void sparc32_fd_ensure_init(void)
         pthread_mutex_unlock(&thr_fd_lock);
         return;
     }
+    (void)thr_fd_ensure_locked(2);
     for (fd = 0; fd <= 2; fd++) {
-        if (thr_fd_used[fd] == 0U) {
+        if ((size_t)fd < thr_fd_cap && thr_fd_used[fd] == 0U) {
             int flags = fcntl(fd, F_GETFD);
             if (flags >= 0) {
                 thr_fd_used[fd] = 1U;
@@ -155,33 +218,27 @@ void sparc32_fd_fork_child(void)
 
 void sparc32_fd_cloexec_sweep(void)
 {
-    /* Close every tracked close-on-exec descriptor. Untracked fds
-     * (stdio, translator backing fds) and non-CLOEXEC guest fds
-     * survive, matching kernel exec semantics. A close failure
-     * (raced guest close) just untracks the entry. */
-    int fd;
-    for (fd = 0; fd < THR_FD_TRACK_MAX; fd++) {
-        bool sweep = false;
-        pthread_mutex_lock(&thr_fd_lock);
-        if (thr_fd_used[fd] != 0U && thr_fd_cloexec[fd] != 0U) {
-            thr_fd_used[fd] = 0U;
-            thr_fd_cloexec[fd] = 0U;
-            sweep = true;
-        }
-        pthread_mutex_unlock(&thr_fd_lock);
-        if (sweep) {
+    /* S32-R4-14: hold thr_fd_lock across each tracked close so a
+     * concurrent guest open cannot reuse the fd between untrack and
+     * close. Untracked and non-CLOEXEC fds survive, matching exec. */
+    size_t n;
+    size_t i;
+    pthread_mutex_lock(&thr_fd_lock);
+    n = thr_fd_cap;
+    for (i = 0U; i < n; i++) {
+        if (thr_fd_used[i] != 0U && thr_fd_cloexec[i] != 0U) {
+            int fd = (int)i;
+            thr_fd_used[i] = 0U;
+            thr_fd_cloexec[i] = 0U;
             (void)close(fd);
         }
     }
+    pthread_mutex_unlock(&thr_fd_lock);
 }
 
-/* Guest BE word store through the G window (local copy: threads.c keeps
- * its own for the clone/tid paths). */
-static int fd_st(sparc32_ctx_t *ctx, uint32_t va, uint32_t v)
+void sparc32_fd_close_cloexec(void)
 {
-    uint8_t b[4];
-    put_be32(b, v);
-    return l2a_store(ctx, va, b, sizeof(b));
+    sparc32_fd_cloexec_sweep();
 }
 
 /* pipe(42): SPARC dual-return (E04). The tail commits %o0 from the
@@ -247,8 +304,8 @@ long sparc32_thr_pipe2(sparc32_ctx_t *ctx, uint32_t fds_va, uint32_t flags)
         }
     }
 #endif
-    if (fd_st(ctx, fds_va, (uint32_t)fds[0]) != 0 ||
-        fd_st(ctx, fds_va + 4U, (uint32_t)fds[1]) != 0) {
+    if (l2a_st_be32(ctx, fds_va, (uint32_t)fds[0]) != 0 ||
+        l2a_st_be32(ctx, fds_va + 4U, (uint32_t)fds[1]) != 0) {
         close(fds[0]);
         close(fds[1]);
         return -EFAULT;

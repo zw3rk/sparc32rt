@@ -23,6 +23,7 @@
 #include "os/syscalls_min.h"
 #include "os/threads.h"
 #include "rt32/rt32.h"
+extern void sparc32_thr_exec_retire_done(void);
 
 /* execve staging caps (moved with the block from threads.c). */
 #define THR_EXEC_ARGS_MAX 256U
@@ -162,7 +163,6 @@ long sparc32_thr_execve(sparc32_ctx_t *ctx, uint32_t path_va,
         sparc32_thr_exec_retire_begin(ctx);
         sparc32_thr_exec_retire_wait(ctx);
         sparc32_signal_reset_for_exec();
-        sparc32_thr_clear_process_pending();
         sparc32_fd_cloexec_sweep();
         rt32_vm_reset_for_exec(ctx);
         rc = rt32_elf_commit_plan(ctx, &plan, &info);
@@ -193,10 +193,11 @@ long sparc32_thr_execve(sparc32_ctx_t *ctx, uint32_t path_va,
     ctx->cleanwin = 0U;
     ctx->r[SPARC32_SP] = sp;
     interp_window_reset();
-    ctx->pending_signals = 0U;
-    ctx->sig_mask = 0U;
+    /* S32-R4-9: sig_mask, pending_signals and process-pending survive
+     * exec; only caught handlers reset to SIG_DFL (above) and the
+     * altstack is disabled. */
     /* Exec-reset rule (S32-R3-5): the new image starts with the
-     * alternate stack disabled, like the blocked mask above. */
+     * alternate stack disabled. */
     ctx->altstack_flags = 0U;
     ctx->altstack_sp = 0U;
     ctx->altstack_size = 0U;
@@ -213,5 +214,6 @@ long sparc32_thr_execve(sparc32_ctx_t *ctx, uint32_t path_va,
     /* Pre-compensate for the dispatch tail (pc = npc; npc += 4). */
     ctx->pc = info.entry - 4U;
     ctx->npc = info.entry;
+    sparc32_thr_exec_retire_done();
     return 0;
 }

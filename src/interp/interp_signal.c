@@ -18,6 +18,8 @@ RC1 subset of Phase-4 signals: rt_signal_frame32 construction for
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 /* Synchronous fault delivery. Builds the frozen kernel-order
  * rt_signal_frame32 (344 B) + inline sigfpu32 tail (136 B) on the guest
@@ -501,15 +503,38 @@ bool interp_deliver_async_for_syscall(sparc32_ctx_t *ctx, int signo,
     return true;
 }
 
+/* Default-terminate set (S32-R4-5): SPARC signals whose Linux default
+ * action terminates the process, i.e. every default-disposition signal
+ * except the ignore-default (16/URG, 20/CHLD, 28/WINCH), stop-default
+ * (17/STOP, 18/TSTP, 21/TTIN, 22/TTOU), and continue-default (19/CONT)
+ * ones. */
+static bool interp_dfl_terminates(int sig)
+{
+    switch (sig) {
+    case 16:
+    case 17:
+    case 18:
+    case 19:
+    case 20:
+    case 21:
+    case 22:
+    case 28:
+        return false;
+    default:
+        return true;
+    }
+}
+
 /* Safe-point poll (S32-R3-7): thread-directed bits first, then one
- * process-directed claim per signal. Each host signal invokes the guest
- * handler exactly once: a thread delivery consumes a possible host-
- * wakeup echo from the process word, and a claimed process bit whose
- * echo belongs to another context's thread bit is dropped (the owner's
- * thread bit still delivers it). Same-number signals merge, matching
- * kernel semantics. Handler-less signals (default or ignored, S32-R3-6)
- * are discarded; default actions were already applied by the host
- * through the mirrored dispositions. Blocked signals stay queued. */
+ * process-directed claim per signal. Each queue delivers independently:
+ * a thread delivery leaves the process word alone, and a claimed
+ * process bit delivers even when another context holds the same thread
+ * bit (no cross-queue consume or discard). Same-number signals in the
+ * same queue merge, matching kernel semantics. Ignored signals (S32-R3-6)
+ * are discarded. A default-disposition signal queued while blocked
+ * (S32-R4-5) terminates here at unmask time when its default action is
+ * fatal: the host disposition mirrors DFL, so the kernel applies it.
+ * Blocked signals stay queued. */
 bool interp_poll_async(sparc32_ctx_t *ctx)
 {
     uint64_t blocked;
@@ -541,12 +566,20 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
             if (sparc32_signal_get(s, &handler, &restorer) != 0) {
                 __atomic_fetch_and(&ctx->pending_signals, ~bit,
                     __ATOMIC_ACQ_REL);
+                if (sparc32_signal_disposition(s) ==
+                        SPARC32_SIG_DISP_DFL &&
+                    interp_dfl_terminates(s)) {
+                    /* Default termination at delivery time: the
+                     * signal was queued while blocked and is now
+                     * unblocked with no handler installed. */
+                    (void)kill(getpid(),
+                        sparc32_sig_to_host(s));
+                }
                 continue;
             }
         }
-        /* Consume a possible host-wakeup echo so this thread-directed
-         * signal delivers exactly once. */
-        (void)sparc32_thr_claim_global(s);
+        /* Thread-directed delivery leaves the process queue alone
+         * (S32-R4-6): no consume of the process-pending bit here. */
         return interp_try_deliver_async(ctx, s);
     }
     for (s = 1; s <= 64; s++) {
@@ -564,13 +597,18 @@ bool interp_poll_async(sparc32_ctx_t *ctx)
             continue;
         }
         if (sparc32_signal_get(s, &handler, &restorer) != 0) {
+            if (sparc32_signal_disposition(s) ==
+                    SPARC32_SIG_DISP_DFL &&
+                interp_dfl_terminates(s)) {
+                /* Process-directed default termination at unmask
+                 * time (S32-R4-5), mirroring the thread queue above. */
+                (void)kill(getpid(), sparc32_sig_to_host(s));
+            }
             continue;
         }
-        /* A surviving thread bit elsewhere owns this echo; the owner
-         * delivers it through the thread path above. */
-        if (sparc32_thr_thread_has_pending(s)) {
-            continue;
-        }
+        /* Process-directed delivery is independent of thread queues
+         * (S32-R4-6): never discard a claimed bit just because another
+         * thread holds the same signal pending. */
         return interp_try_deliver_async(ctx, s);
     }
     return false;

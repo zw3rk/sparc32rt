@@ -38,6 +38,18 @@ static void vm_mmap_ensure_regime(sparc32_ctx_t *ctx)
     }
 }
 
+/* Lock-held DBT invalidation (S32-R4-3): runs while vm_lock quiescence
+ * is still held, before vm_lock_release(), so no runner executes a
+ * stale translation between the table commit and the retire. */
+static void vm_invalidate_jit_locked(sparc32_ctx_t *ctx, uint32_t start,
+    uint32_t end)
+{
+    if (ctx == NULL || end <= start) {
+        return;
+    }
+    vm_invalidate_jit(ctx, start, end);
+}
+
 /* Publish one mapping commit to the Regime VM (RC-U3-r2 #4): per-page
  * guest protection for the Soft-TLB miss helper. MAP_PRIVATE
  * file pages publish PAGE_COW_CLEAN so the write-miss promotion branch
@@ -193,12 +205,49 @@ static uint32_t vm_mmap2_locked(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len,
                 (uint64_t)host_off);
         }
 
+        {
+            int rec_rc = vm_record_region_ext_locked(
+                target_va, (uint32_t)((uint64_t)target_va + aligned_len),
+                prot & 0x7U, flags, "[mmap]", rec_fd, rec_pgoff);
+            if (rec_rc != 0) {
+                (void)vm_reserve_prot_none(ctx, target_va,
+                    (uint32_t)aligned_len);
+                vm_mmap_publish(ctx, target_va,
+                    (uint32_t)((uint64_t)target_va + aligned_len), 0U, 0U);
+                if (anon_shm_fd >= 0) {
+                    (void)close(anon_shm_fd);
+                }
+                return (uint32_t)(-ENOMEM);
+            }
+        }
+        if ((host_flags & MAP_ANONYMOUS) == 0) {
+            struct stat eof_st;
+            if (fstat(fd, &eof_st) == 0) {
+                uint64_t avail = 0ULL;
+                if ((uint64_t)eof_st.st_size > (uint64_t)host_off) {
+                    avail = (uint64_t)eof_st.st_size - (uint64_t)host_off;
+                }
+                if (avail < aligned_len) {
+                    uint64_t first_tail = (avail +
+                        (uint64_t)(SPARC32_PAGE_SIZE - 1U)) &
+                        ~((uint64_t)(SPARC32_PAGE_SIZE - 1U));
+                    if (first_tail < aligned_len) {
+                        uint32_t tail_start =
+                            target_va + (uint32_t)first_tail;
+                        uint32_t tail_end = (uint32_t)(
+                            (uint64_t)target_va + aligned_len);
+                        vm_mmap_publish(ctx, tail_start, tail_end, 0U, 0U);
+                        vm_mprotect_regions_locked(tail_start, tail_end, 0U);
+                        (void)rt_host_protect(
+                            sparc32_guest_ptr(ctx, tail_start),
+                            (size_t)(tail_end - tail_start), PROT_NONE);
+                    }
+                }
+            }
+        }
         if (update_cursor) {
             g_vm_mmap_cursor = (uint32_t)((uint64_t)target_va + aligned_len);
         }
-        (void)vm_record_region_ext_locked(
-            target_va, (uint32_t)((uint64_t)target_va + aligned_len),
-            prot & 0x7U, flags, "[mmap]", rec_fd, rec_pgoff);
         if (anon_shm_fd >= 0) {
             (void)close(anon_shm_fd);
         }
@@ -218,14 +267,14 @@ uint32_t rt32_vm_mmap2(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t
     vm_lock_acquire();
     vm_sync_from_ctx(ctx);
     res = vm_mmap2_locked(ctx, addr, len, prot, flags, fd, pgoffset);
-    vm_sync_to_ctx(ctx);
-    vm_lock_release();
-
     if (res <= 0xFFFFF000U &&
         ((flags & (RT32_MAP_FIXED | RT32_MAP_FIXED_NOREPLACE)) != 0U ||
          (prot & (uint32_t)PROT_EXEC) != 0U)) {
-        vm_invalidate_jit(ctx, res, (uint32_t)((uint64_t)res + vm_page_align_up((uint64_t)len)));
+        vm_invalidate_jit_locked(ctx, res,
+            (uint32_t)((uint64_t)res + vm_page_align_up((uint64_t)len)));
     }
+    vm_sync_to_ctx(ctx);
+    vm_lock_release();
     return res;
 }
 
@@ -294,12 +343,12 @@ int rt32_vm_mprotect(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len, uint32_t p
     vm_lock_acquire();
     vm_sync_from_ctx(ctx);
     rc = vm_mprotect_locked(ctx, addr, len, prot);
+    if (rc == 0 && len > 0U) {
+        vm_invalidate_jit_locked(ctx, addr,
+            (uint32_t)((uint64_t)addr + vm_page_align_up((uint64_t)len)));
+    }
     vm_sync_to_ctx(ctx);
     vm_lock_release();
-
-    if (rc == 0 && len > 0U) {
-        vm_invalidate_jit(ctx, addr, (uint32_t)((uint64_t)addr + vm_page_align_up((uint64_t)len)));
-    }
     return rc;
 }
 
@@ -352,12 +401,12 @@ int rt32_vm_munmap(sparc32_ctx_t *ctx, uint32_t addr, uint32_t len)
     vm_lock_acquire();
     vm_sync_from_ctx(ctx);
     rc = vm_munmap_locked(ctx, addr, len);
+    if (rc == 0) {
+        vm_invalidate_jit_locked(ctx, addr,
+            (uint32_t)((uint64_t)addr + vm_page_align_up((uint64_t)len)));
+    }
     vm_sync_to_ctx(ctx);
     vm_lock_release();
-
-    if (rc == 0) {
-        vm_invalidate_jit(ctx, addr, (uint32_t)((uint64_t)addr + vm_page_align_up((uint64_t)len)));
-    }
     return rc;
 }
 
@@ -438,13 +487,16 @@ uint32_t rt32_vm_mremap(sparc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                 uint32_t unmap_addr = old_addr + (uint32_t)new_aligned;
                 uint32_t unmap_len  = (uint32_t)(old_aligned - new_aligned);
                 int rc = vm_munmap_locked(ctx, unmap_addr, unmap_len);
+                if (rc == 0) {
+                    vm_invalidate_jit_locked(ctx, unmap_addr,
+                        unmap_addr + unmap_len);
+                }
                 vm_close_backing_fd(hold_fd);
                 vm_sync_to_ctx(ctx);
                 vm_lock_release();
                 if (rc != 0) {
                     return (uint32_t)rc;
                 }
-                vm_invalidate_jit(ctx, unmap_addr, unmap_addr + unmap_len);
                 return old_addr;
             }
 
@@ -473,9 +525,17 @@ uint32_t rt32_vm_mremap(sparc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                             eff_flags | RT32_MAP_FIXED, eff_fd, ext_pgoff);
                     }
                     if (ext <= 0xFFFFF000U) {
-                        (void)vm_record_region_ext_locked(
+                        int ext_rec = vm_record_region_ext_locked(
                             old_end, (uint32_t)new_end, prot, keep_flags,
                             region_name, eff_fd, ext_pgoff);
+                        if (ext_rec != 0) {
+                            (void)vm_munmap_locked(ctx, old_end,
+                                (uint32_t)(new_aligned - old_aligned));
+                            vm_close_backing_fd(hold_fd);
+                            vm_sync_to_ctx(ctx);
+                            vm_lock_release();
+                            return (uint32_t)(-ENOMEM);
+                        }
                         {
                             uint32_t ext_end = (uint32_t)new_end;
                             if (g_vm_mmap_cursor >= old_addr && g_vm_mmap_cursor < ext_end &&
@@ -483,12 +543,13 @@ uint32_t rt32_vm_mremap(sparc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                                 g_vm_mmap_cursor = ext_end;
                             }
                         }
+                        if ((prot & (uint32_t)PROT_EXEC) != 0U) {
+                            vm_invalidate_jit_locked(ctx, old_end,
+                                (uint32_t)new_end);
+                        }
                         vm_close_backing_fd(hold_fd);
                         vm_sync_to_ctx(ctx);
                         vm_lock_release();
-                        if ((prot & (uint32_t)PROT_EXEC) != 0U) {
-                            vm_invalidate_jit(ctx, old_end, (uint32_t)new_end);
-                        }
                         return old_addr;
                     }
                 }
@@ -554,18 +615,29 @@ uint32_t rt32_vm_mremap(sparc32_ctx_t *ctx, uint32_t old_addr, uint32_t old_len,
                     (void)vm_mprotect_locked(ctx, new_va, (uint32_t)new_aligned, prot);
                 }
             }
-            (void)vm_record_region_ext_locked(
-                new_va, (uint32_t)((uint64_t)new_va + new_aligned),
-                prot, keep_flags, region_name, eff_fd, eff_pgoff);
+            {
+                int move_rec = vm_record_region_ext_locked(
+                    new_va, (uint32_t)((uint64_t)new_va + new_aligned),
+                    prot, keep_flags, region_name, eff_fd, eff_pgoff);
+                if (move_rec != 0) {
+                    (void)vm_munmap_locked(ctx, new_va,
+                        (uint32_t)new_aligned);
+                    vm_close_backing_fd(hold_fd);
+                    vm_sync_to_ctx(ctx);
+                    vm_lock_release();
+                    return (uint32_t)(-ENOMEM);
+                }
+            }
             (void)vm_munmap_locked(ctx, old_addr, (uint32_t)old_aligned);
+            vm_invalidate_jit_locked(ctx, old_addr,
+                (uint32_t)((uint64_t)old_addr + old_aligned));
+            if (is_fixed || (prot & (uint32_t)PROT_EXEC) != 0U) {
+                vm_invalidate_jit_locked(ctx, new_va,
+                    (uint32_t)((uint64_t)new_va + new_aligned));
+            }
             vm_close_backing_fd(hold_fd);
             vm_sync_to_ctx(ctx);
             vm_lock_release();
-
-            vm_invalidate_jit(ctx, old_addr, (uint32_t)((uint64_t)old_addr + old_aligned));
-            if (is_fixed || (prot & (uint32_t)PROT_EXEC) != 0U) {
-                vm_invalidate_jit(ctx, new_va, (uint32_t)((uint64_t)new_va + new_aligned));
-            }
             return new_va;
         }
     }
@@ -615,9 +687,8 @@ void rt32_vm_reset_for_exec(sparc32_ctx_t *ctx)
                (size_t)(RT32_WINDOW_SIZE - (uint64_t)SPARC32_LOW_GUARD_SIZE),
                PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     vm32_reset();
+    vm_invalidate_jit_locked(ctx, SPARC32_LOW_GUARD_SIZE, 0xFFFFFFFFU);
     vm_lock_release();
-
-    vm_invalidate_jit(ctx, SPARC32_LOW_GUARD_SIZE, 0xFFFFFFFFU);
 
     ctx->brk_base    = 0U;
     ctx->brk_curr    = 0U;

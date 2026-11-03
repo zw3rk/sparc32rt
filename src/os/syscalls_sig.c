@@ -94,28 +94,30 @@ static void sig_host_sync(int sig, int kind)
 {
 #if defined(__linux__) || defined(__APPLE__)
     struct sigaction sa;
+    int hsig;
     if (sig < 1 || sig > 64 || sig == 9 || sig == 17) {
         return;
     }
-    if (sig == 7 || sig == 11) {
+    if (sig == 10 || sig == 11) {
         return;
     }
+    hsig = sparc32_sig_to_host(sig);
     memset(&sa, 0, sizeof(sa));
     if (kind == SIG_DISP_CAUGHT) {
         sa.sa_handler = sparc32_thr_host_handler;
         sigemptyset(&sa.sa_mask);
         sa.sa_flags = SA_RESTART;
-        (void)sigaction(sig, &sa, NULL);
+        (void)sigaction(hsig, &sa, NULL);
     } else if (kind == SIG_DISP_IGN) {
         sa.sa_handler = SIG_IGN;
         sigemptyset(&sa.sa_mask);
         sa.sa_flags = SA_RESTART;
-        (void)sigaction(sig, &sa, NULL);
+        (void)sigaction(hsig, &sa, NULL);
     } else {
         sa.sa_handler = SIG_DFL;
         sigemptyset(&sa.sa_mask);
         sa.sa_flags = SA_RESTART;
-        (void)sigaction(sig, &sa, NULL);
+        (void)sigaction(hsig, &sa, NULL);
     }
 #else
     (void)sig;
