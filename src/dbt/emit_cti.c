@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "dbt/emit_cc.h"
 #include "dbt/emit_fp.h"
@@ -136,6 +137,39 @@ static int e_delay_runs(uint32_t cls, uint32_t cond, int taken, int annul)
     return annul != 0 ? 0 : 1;
 }
 
+static int e_delay_needs_jmpl_record(const sparc32_decoded_t *dl)
+{
+    if (dl == NULL) {
+        return 1;
+    }
+    switch (dl->cls) {
+    case SPARC32_OP_SETHI:
+    case SPARC32_OP_SHIFT:
+    case SPARC32_OP_FLUSH:
+    case SPARC32_OP_STBAR:
+        return 0;
+    case SPARC32_OP_ALU:
+        return ((dl->op3 & 0x3Fu) < 0x0Eu) ? 0 : 1;
+    default:
+        break;
+    }
+    return 1;
+}
+
+static void e_jmpl_disarm(a64_buf_t *b)
+{
+    uint32_t off_a = (uint32_t)offsetof(sparc32_ctx_t, jmpl_delay_armed);
+    uint32_t hi_a = off_a & ~0xFFFu;
+    uint32_t lo_a = off_a & 0xFFFu;
+    if (hi_a == 0u) {
+        a64_emit_strb_imm_w(b, A64_ZR, A64_XCTX, off_a);
+    } else {
+        a64_emit(b, 0x91400000u | ((hi_a >> 12) << 10) |
+            ((A64_XCTX & 31u) << 5) | (ES2 & 31u));
+        a64_emit_strb_imm_w(b, A64_ZR, ES2, lo_a);
+    }
+}
+
 static int e_page_final(sparc32_emit_ctx_t *ec, uint32_t npc,
     uint32_t post_pc)
 {
@@ -143,6 +177,9 @@ static int e_page_final(sparc32_emit_ctx_t *ec, uint32_t npc,
 
     if (rc != 0) {
         return rc;
+    }
+    if (e_delay_needs_jmpl_record(ec->delay) != 0) {
+        e_jmpl_disarm(ec->buf);
     }
     return sparc32_emit_exit_singlestep(ec, post_pc);
 }
@@ -156,6 +193,7 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     uint32_t cond = d->cond;
     int annul = d->annul != 0u;
     int page_final = ((pc & 0xFFFu) == 0xFFCu);
+    int need_rec = e_delay_needs_jmpl_record(ec->delay);
     size_t p_taken;
     size_t p_end;
     int rc;
@@ -178,8 +216,10 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     if (cond == 0x8u) {
         if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
             /* S32-R8-4: taken delay faults commit npc = target. */
-            a64_emit_mov_pc32(b, ES0, target);
-            a64_jmpl_record(b, ES0, ES2, ES1);
+            if (need_rec != 0) {
+                a64_emit_mov_pc32(b, ES0, target);
+                a64_jmpl_record(b, ES0, ES2, ES1);
+            }
             if (page_final) {
                 return e_page_final(ec, npc, target);
             }
@@ -187,14 +227,23 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
             if (rc != 0) {
                 return rc;
             }
+            if (need_rec != 0) {
+                e_jmpl_disarm(b);
+            }
         }
         a64_emit_exit_branch(b, target);
         return b->overflow ? -1 : 0;
     }
     if (page_final) {
+        uint8_t sg_valid = b->gpr_cache_valid;
+        uint8_t sg_reg[8];
+        uint8_t sf_valid = b->fpr_valid;
+        uint8_t sf_tag[8];
+        bool s_fp_chk = b->fp_fast_checked;
+        bool s_fp_dirty = b->fpsr_dirty;
+        memcpy(sg_reg, b->gpr_cache_reg, sizeof(sg_reg));
+        memcpy(sf_tag, b->fpr_tag, sizeof(sf_tag));
         p_taken = a64_emit_b_cond_placeholder(b, cti_branch_cond(b, cond));
-        b->gpr_cache_valid = 0;
-        b->fpr_valid = 0;
         if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
             rc = e_emit_delay(ec, npc);
             if (rc != 0) {
@@ -209,39 +258,65 @@ int sparc32_emit_branch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
             return rc;
         }
         a64_patch_b_cond(b, p_taken, b->count);
-        b->gpr_cache_valid = 0;
-        b->fpr_valid = 0;
+        b->gpr_cache_valid = sg_valid;
+        memcpy(b->gpr_cache_reg, sg_reg, sizeof(sg_reg));
+        b->fpr_valid = sf_valid;
+        memcpy(b->fpr_tag, sf_tag, sizeof(sf_tag));
+        b->fp_fast_checked = s_fp_chk;
+        b->fpsr_dirty = s_fp_dirty;
         if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
             /* S32-R8-4: taken delay faults commit npc = target. */
-            a64_emit_mov_pc32(b, ES0, target);
-            a64_jmpl_record(b, ES0, ES2, ES1);
+            if (need_rec != 0) {
+                a64_emit_mov_pc32(b, ES0, target);
+                a64_jmpl_record(b, ES0, ES2, ES1);
+            }
+            rc = e_emit_delay(ec, npc);
+            if (rc != 0) {
+                return rc;
+            }
+            if (need_rec != 0) {
+                e_jmpl_disarm(b);
+            }
+        }
+        return sparc32_emit_exit_singlestep(ec, target);
+    }
+    {
+        uint8_t sg_valid = b->gpr_cache_valid;
+        uint8_t sg_reg[8];
+        uint8_t sf_valid = b->fpr_valid;
+        uint8_t sf_tag[8];
+        bool s_fp_chk = b->fp_fast_checked;
+        bool s_fp_dirty = b->fpsr_dirty;
+        memcpy(sg_reg, b->gpr_cache_reg, sizeof(sg_reg));
+        memcpy(sf_tag, b->fpr_tag, sizeof(sf_tag));
+        p_taken = a64_emit_b_cond_placeholder(b, cti_branch_cond(b, cond));
+        if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
             rc = e_emit_delay(ec, npc);
             if (rc != 0) {
                 return rc;
             }
         }
-        return sparc32_emit_exit_singlestep(ec, target);
+        p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_b_cond(b, p_taken, b->count);
+        b->gpr_cache_valid = sg_valid;
+        memcpy(b->gpr_cache_reg, sg_reg, sizeof(sg_reg));
+        b->fpr_valid = sf_valid;
+        memcpy(b->fpr_tag, sf_tag, sizeof(sf_tag));
+        b->fp_fast_checked = s_fp_chk;
+        b->fpsr_dirty = s_fp_dirty;
     }
-    p_taken = a64_emit_b_cond_placeholder(b, cti_branch_cond(b, cond));
-    b->gpr_cache_valid = 0;
-    b->fpr_valid = 0;
-    if (e_delay_runs(d->cls, cond, 0, annul) != 0) {
+    if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
+        /* S32-R8-4: taken delay faults commit npc = target. */
+        if (need_rec != 0) {
+            a64_emit_mov_pc32(b, ES0, target);
+            a64_jmpl_record(b, ES0, ES2, ES1);
+        }
         rc = e_emit_delay(ec, npc);
         if (rc != 0) {
             return rc;
         }
-    }
-    p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    a64_patch_b_cond(b, p_taken, b->count);
-    b->gpr_cache_valid = 0;
-    b->fpr_valid = 0;
-    if (e_delay_runs(d->cls, cond, 1, annul) != 0) {
-        /* S32-R8-4: taken delay faults commit npc = target. */
-        a64_emit_mov_pc32(b, ES0, target);
-        a64_jmpl_record(b, ES0, ES2, ES1);
-        rc = e_emit_delay(ec, npc);
-        if (rc != 0) {
-            return rc;
+        if (need_rec != 0) {
+            e_jmpl_disarm(b);
         }
     }
     a64_emit_exit_branch(b, target);
@@ -259,6 +334,7 @@ int sparc32_emit_call(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     uint32_t pc = ec->pc;
     uint32_t npc = pc + 4u;
     uint32_t target = pc + (uint32_t)d->disp;
+    int need_rec = e_delay_needs_jmpl_record(ec->delay);
     int rc;
 
     /* S32-R8-3: the delay slot runs at npc, so helper fault exits must
@@ -269,8 +345,10 @@ int sparc32_emit_call(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         cti_stgreg(b, SPARC32_O7, ES0);
         b->is_call = true;
         /* S32-R8-4: taken delay faults commit npc = target. */
-        a64_emit_mov_pc32(b, ES0, target);
-        a64_jmpl_record(b, ES0, ES2, ES1);
+        if (need_rec != 0) {
+            a64_emit_mov_pc32(b, ES0, target);
+            a64_jmpl_record(b, ES0, ES2, ES1);
+        }
         return e_page_final(ec, npc, target);
     }
     if (ec->delay == NULL || ec->delay->cls == (uint32_t)SPARC32_OP_CALL ||
@@ -288,33 +366,19 @@ int sparc32_emit_call(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     b->nzcv_valid = 0;
     b->is_call = true;
     /* S32-R8-4: taken delay faults commit npc = target. */
-    a64_emit_mov_pc32(b, ES0, target);
-    a64_jmpl_record(b, ES0, ES2, ES1);
+    if (need_rec != 0) {
+        a64_emit_mov_pc32(b, ES0, target);
+        a64_jmpl_record(b, ES0, ES2, ES1);
+    }
     rc = e_emit_delay(ec, npc);
     if (rc != 0) {
         return rc;
     }
+    if (need_rec != 0) {
+        e_jmpl_disarm(b);
+    }
     a64_emit_exit_branch(b, target);
     return b->overflow ? -1 : 0;
-}
-
-static int e_delay_needs_jmpl_record(const sparc32_decoded_t *dl)
-{
-    if (dl == NULL) {
-        return 1;
-    }
-    switch (dl->cls) {
-    case SPARC32_OP_SETHI:
-    case SPARC32_OP_SHIFT:
-    case SPARC32_OP_FLUSH:
-    case SPARC32_OP_STBAR:
-        return 0;
-    case SPARC32_OP_ALU:
-        return ((dl->op3 & 0x3Fu) < 0x0Eu) ? 0 : 1;
-    default:
-        break;
-    }
-    return 1;
 }
 
 int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
@@ -322,6 +386,7 @@ int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     a64_buf_t *b = ec->buf;
     uint32_t pc = ec->pc;
     uint32_t npc = pc + 4u;
+    int need_rec = e_delay_needs_jmpl_record(ec->delay);
     size_t p_aligned;
     int rc;
 
@@ -354,7 +419,7 @@ int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         a64_emit_mov_pc32(b, ES0, pc);
         cti_stgreg(b, d->rd, ES0);
     }
-    if (e_delay_needs_jmpl_record(ec->delay) != 0) {
+    if (need_rec != 0) {
         a64_jmpl_record(b, EKEEP, ES2, ES0);
     }
     if (d->rd == SPARC32_O7) {
@@ -364,6 +429,9 @@ int sparc32_emit_jmpl(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     rc = e_emit_delay(ec, npc);
     if (rc != 0) {
         return rc;
+    }
+    if (need_rec != 0) {
+        e_jmpl_disarm(b);
     }
     a64_emit_exit_branch_reg(b, EKEEP);
     return b->overflow ? -1 : 0;

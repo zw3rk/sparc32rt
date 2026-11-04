@@ -25,9 +25,6 @@
 const uint8_t *sparc32_vm_prot_base(void);
 extern uint32_t sparc32_rt_window(sparc32_ctx_t *ctx, uint32_t rs1,
     uint32_t src2, uint32_t rd, uint32_t ctl, uint32_t pc);
-uint32_t *interp_winfile_base(void);
-uint32_t *interp_winsp_base(void);
-uint32_t *interp_win_valid_base(void);
 extern void vm_invalidate_jit(sparc32_ctx_t *ctx, uint32_t start,
     uint32_t end);
 
@@ -128,17 +125,24 @@ static void f_emit_slowcall(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
     }
     p_fault = a64_emit_cbz_w_placeholder(b, true, 0u);
     if (is_store && ec->delay == NULL) {
+        bool was_dirty = b->fpsr_dirty;
         sparc32_emit_fp_flush(b);
+        b->fpsr_dirty = was_dirty;
         a64_emit_movz_w(b, F_ES1, (uint16_t)SPARC32_EXIT_BRANCH, 0u);
         a64_emit_mov_pc32(b, F_ES0, ec->pc + 4u);
         a64_emit_ret(b);
         a64_patch_cbz_w(b, p_fault, b->count);
+        sparc32_emit_fp_flush(b);
+        b->fpsr_dirty = was_dirty;
         a64_emit_mov_w(b, F_ES1, 0u);
         a64_emit_mov_pc32(b, F_ES0, ec->fault_pc);
         a64_emit_ret(b);
     } else {
+        bool was_dirty = b->fpsr_dirty;
         p_cont = a64_emit_b_cond_placeholder(b, A64_COND_AL);
         a64_patch_cbz_w(b, p_fault, b->count);
+        sparc32_emit_fp_flush(b);
+        b->fpsr_dirty = was_dirty;
         a64_emit_mov_w(b, F_ES1, 0u);
         a64_emit_mov_pc32(b, F_ES0, ec->fault_pc);
         a64_emit_ret(b);
@@ -354,6 +358,14 @@ static inline void sparc32_flush_gpr_cache(a64_buf_t *b)
     (void)b;
 }
 
+static void f_ctx_ptr(a64_buf_t *b, unsigned rd, uint32_t off)
+{
+    uint32_t hi = (off >> 12) & 0xFFFu;
+    uint32_t lo = off & 0xFFFu;
+    a64_emit(b, 0x91400000u | (hi << 10) | (A64_XCTX << 5) | (rd & 31u));
+    a64_emit(b, 0x91000000u | (lo << 10) | ((rd & 31u) << 5) | (rd & 31u));
+}
+
 /* Cold spill/fill funnel: the window-helper call shape from emit_int.c
  * (w0 = ctx, w1 = rs1 idx, w2 = src2, w3 = rd, w4 = ctl, w5 = pc). */
 static void f_win_slowcall(a64_buf_t *b, const sparc32_decoded_t *d,
@@ -361,9 +373,8 @@ static void f_win_slowcall(a64_buf_t *b, const sparc32_decoded_t *d,
 {
     size_t p_fault;
     size_t p_cont;
-    sparc32_emit_fp_flush(b);
-    b->fp_fast_checked = false;
-    b->gpr_cache_valid = 0;
+    uint32_t rd = d->rd & 31u;
+    bool was_dirty = b->fpsr_dirty;
     b->nzcv_valid = 0;
     a64_emit_add_uxtw_x(b, 0u, A64_XCTX, A64_ZR);
     a64_emit_mov_imm32(b, 1u, d->rs1);
@@ -388,9 +399,14 @@ static void f_win_slowcall(a64_buf_t *b, const sparc32_decoded_t *d,
     a64_emit(b, 0xA8C12FEAu);
     a64_emit(b, 0xA8C127E8u);
     a64_emit(b, 0xA8C11FE6u);
+    if (rd != 0u) {
+        a64_emit_ldr_imm_w(b, 6u + (rd & 7u), A64_XCTX, rd * 4u);
+    }
     p_fault = a64_emit_cbz_w_placeholder(b, true, 0u);
     p_cont = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     a64_patch_cbz_w(b, p_fault, b->count);
+    sparc32_emit_fp_flush(b);
+    b->fpsr_dirty = was_dirty;
     a64_emit_mov_w(b, F_ES1, 0u);
     a64_emit_mov_pc32(b, F_ES0, fault_pc);
     a64_emit_ret(b);
@@ -407,9 +423,9 @@ int sparc32_emit_win_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
     uint32_t canrestore_off =
         (uint32_t)offsetof(sparc32_ctx_t, canrestore);
     uint32_t psr_off = (uint32_t)offsetof(sparc32_ctx_t, psr);
+    uint32_t wbase_off = (uint32_t)offsetof(sparc32_ctx_t, win_o);
     size_t p_slow;
     size_t p_slow2;
-    size_t p_slow3 = (size_t)-1;
     size_t p_skip;
     size_t p_end;
     uint8_t keep = 0u;
@@ -417,7 +433,6 @@ int sparc32_emit_win_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
     if (ec == NULL || ec->buf == NULL || d == NULL) {
         return -1;
     }
-    return 0;
     if (sparc32_vm_prot_base() == NULL) {
         return 0;
     }
@@ -442,95 +457,90 @@ int sparc32_emit_win_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
     } else {
         p_slow = a64_emit_cbz_w_placeholder(b, false, F_ES1);
     }
-    /* 3. x1 = winfile + cwp*64, x2 = winfile + tgt*64. */
-    f_mov64(b, 0u, (uint64_t)(uintptr_t)interp_winfile_base());
+    /* 3. x0 = &ctx->win_o[0][0], w16 (F_ES1) = cwp, w5 = tgt.
+     * Layout off x0: win_o +0, winsp +256, win_valid +288, winfile +320. */
+    f_ctx_ptr(b, 0u, wbase_off);
     a64_emit_ldr_imm_w(b, F_ES1, A64_XCTX, cwp_off);
     if (is_save != 0) {
-        a64_emit_sub_imm_w(b, false, F_ES2, F_ES1, 1u, 0u);
+        a64_emit_sub_imm_w(b, false, 5u, F_ES1, 1u, 0u);
     } else {
-        a64_emit_add_imm_w(b, false, F_ES2, F_ES1, 1u, 0u);
+        a64_emit_add_imm_w(b, false, 5u, F_ES1, 1u, 0u);
     }
-    a64_emit_ubfm_w(b, F_ES2, F_ES2, 0u, 2u);
-    a64_emit_lsl_x(b, 16u, F_ES1, 6u);
-    a64_emit_add_reg_x(b, 1u, 0u, 16u);
-    a64_emit_lsl_x(b, 16u, F_ES2, 6u);
-    a64_emit_add_reg_x(b, 2u, 0u, 16u);
-    /* TGT outlives the rotation in w5 (x17 joins the old-value set). */
-    a64_emit_mov_w(b, 5u, F_ES2);
+    a64_emit_ubfm_w(b, 5u, 5u, 0u, 2u);
     /* 3b. Validity gates (mirror interp_window): SAVE may reuse tgt
-     * only while it holds no outstanding image (else the slow path
-     * spills it home first); RESTORE may rotate tgt only while it
-     * holds one (else the slow path underfills from the stack).
-     * Effects record the same cache transitions interp_window makes:
-     * SAVE homes the cached current and validates it, RESTORE kills
-     * the popped window. */
-    f_mov64(b, 3u, (uint64_t)(uintptr_t)interp_win_valid_base());
+     * only while ctx->win_valid[tgt] == 0; RESTORE may rotate tgt
+     * only while ctx->win_valid[tgt] != 0. */
     a64_emit_lsl_x(b, 4u, 5u, 2u);
-    a64_emit_add_reg_x(b, 3u, 3u, 4u);
-    a64_emit_ldr_imm_w(b, 4u, 3u, 0u);
+    a64_emit_add_reg_x(b, 3u, 0u, 4u);
+    a64_emit_ldr_imm_w(b, 4u, 3u, 288u);
     if (is_save != 0) {
         p_slow2 = a64_emit_cbz_w_placeholder(b, true, 4u);
-        f_mov64(b, 3u, (uint64_t)(uintptr_t)interp_winsp_base());
-        a64_emit_ldr_imm_w(b, 4u, A64_XCTX, cwp_off);
-        a64_emit_lsl_x(b, 4u, 4u, 2u);
-        a64_emit_add_reg_x(b, 3u, 3u, 4u);
-        a64_emit_ldr_imm_w(b, 4u, A64_XCTX, 56u);
-        a64_emit_str_imm_w(b, 4u, 3u, 0u);
-        f_mov64(b, 3u, (uint64_t)(uintptr_t)interp_win_valid_base());
-        a64_emit_ldr_imm_w(b, 4u, A64_XCTX, cwp_off);
-        a64_emit_lsl_x(b, 4u, 4u, 2u);
-        a64_emit_add_reg_x(b, 3u, 3u, 4u);
-        a64_emit_mov_imm32(b, 4u, 1u);
-        a64_emit_str_imm_w(b, 4u, 3u, 0u);
     } else {
         p_slow2 = a64_emit_cbz_w_placeholder(b, false, 4u);
-        f_mov64(b, 3u, (uint64_t)(uintptr_t)interp_winsp_base());
-        a64_emit_lsl_x(b, 4u, 5u, 2u);
-        a64_emit_add_reg_x(b, 3u, 3u, 4u);
-        a64_emit_ldr_imm_w(b, 4u, 3u, 0u);
-        a64_emit_ldr_imm_w(b, 3u, A64_XCTX, 120u);
-        a64_emit_sub_reg_w(b, true, A64_ZR, 4u, 3u, A64_SHIFT_LSL, 0u);
-        p_slow3 = a64_emit_b_cond_placeholder(b, A64_COND_NE);
-        f_mov64(b, 3u, (uint64_t)(uintptr_t)interp_win_valid_base());
-        a64_emit_ldr_imm_w(b, 4u, A64_XCTX, cwp_off);
-        a64_emit_lsl_x(b, 4u, 4u, 2u);
-        a64_emit_add_reg_x(b, 3u, 3u, 4u);
-        a64_emit_mov_imm32(b, 4u, 0u);
-        a64_emit_str_imm_w(b, 4u, 3u, 0u);
     }
-    /* 4. Rotate: stash the outgoing half, spill l/i to winfile[cwp],
-     * fill l/i from winfile[tgt], publish the outgoing half. */
+    /* 3c. Record ctx->winsp[cwp] = %sp and ctx->win_valid[cwp] = is_save. */
+    a64_emit_lsl_x(b, 4u, F_ES1, 2u);
+    a64_emit_add_reg_x(b, 3u, 0u, 4u);
+    a64_emit_ldr_imm_w(b, 4u, A64_XCTX, 56u);
+    a64_emit_str_imm_w(b, 4u, 3u, 256u);
+    a64_emit_mov_imm32(b, 4u, (is_save != 0) ? 1u : 0u);
+    a64_emit_str_imm_w(b, 4u, 3u, 288u);
+    /* 4. Rotate registers against ctx->winfile (+320) and ctx->win_o (+0).
+     * x1 = x0 + cwp*64, x2 = x0 + tgt*64, x21 = x0 + cwp*32. */
+    a64_emit_lsl_x(b, 1u, F_ES1, 6u);
+    a64_emit_add_reg_x(b, 1u, 0u, 1u);
+    a64_emit_lsl_x(b, 2u, 5u, 6u);
+    a64_emit_add_reg_x(b, 2u, 0u, 2u);
+    a64_emit_lsl_x(b, 21u, F_ES1, 5u);
+    a64_emit_add_reg_x(b, 21u, 0u, 21u);
     if (is_save != 0) {
+        a64_emit_ldp_x(b, 3u, 4u, A64_XCTX, 64u);
+        a64_emit_stp_x(b, 3u, 4u, 1u, 320u);
+        a64_emit_ldp_x(b, 3u, 4u, A64_XCTX, 80u);
+        a64_emit_stp_x(b, 3u, 4u, 1u, 336u);
+        a64_emit_ldp_x(b, 3u, 4u, A64_XCTX, 96u);
+        a64_emit_stp_x(b, 3u, 4u, 1u, 352u);
+        a64_emit_ldp_x(b, 3u, 4u, A64_XCTX, 112u);
+        a64_emit_stp_x(b, 3u, 4u, 1u, 368u);
         a64_emit_ldp_x(b, 3u, 4u, A64_XCTX, 32u);
         a64_emit_ldp_x(b, 16u, 17u, A64_XCTX, 48u);
-    } else {
-        a64_emit_ldp_x(b, 3u, 4u, A64_XCTX, 96u);
-        a64_emit_ldp_x(b, 16u, 17u, A64_XCTX, 112u);
-    }
-    a64_emit_ldp_x(b, 0u, 21u, A64_XCTX, 64u);
-    a64_emit_stp_x(b, 0u, 21u, 1u, 0u);
-    a64_emit_ldp_x(b, 0u, 21u, A64_XCTX, 80u);
-    a64_emit_stp_x(b, 0u, 21u, 1u, 16u);
-    a64_emit_ldp_x(b, 0u, 21u, A64_XCTX, 96u);
-    a64_emit_stp_x(b, 0u, 21u, 1u, 32u);
-    a64_emit_ldp_x(b, 0u, 21u, A64_XCTX, 112u);
-    a64_emit_stp_x(b, 0u, 21u, 1u, 48u);
-    a64_emit_ldp_x(b, 0u, 21u, 2u, 0u);
-    a64_emit_stp_x(b, 0u, 21u, A64_XCTX, 64u);
-    a64_emit_ldp_x(b, 0u, 21u, 2u, 16u);
-    a64_emit_stp_x(b, 0u, 21u, A64_XCTX, 80u);
-    a64_emit_ldp_x(b, 0u, 21u, 2u, 32u);
-    a64_emit_stp_x(b, 0u, 21u, A64_XCTX, 96u);
-    a64_emit_ldp_x(b, 0u, 21u, 2u, 48u);
-    a64_emit_stp_x(b, 0u, 21u, A64_XCTX, 112u);
-    if (is_save != 0) {
-        /* X-reg pairs advance 16 bytes: r24..r27 then r28..r31. */
+        a64_emit_stp_x(b, 3u, 4u, 21u, 0u);
+        a64_emit_stp_x(b, 16u, 17u, 21u, 16u);
         a64_emit_stp_x(b, 3u, 4u, A64_XCTX, 96u);
         a64_emit_stp_x(b, 16u, 17u, A64_XCTX, 112u);
-    } else {
-        /* X-reg pairs advance 16 bytes: r8..r11 then r12..r15. */
+        a64_emit_ldp_x(b, 3u, 4u, 2u, 320u);
+        a64_emit_stp_x(b, 3u, 4u, A64_XCTX, 64u);
+        a64_emit_ldp_x(b, 3u, 4u, 2u, 336u);
+        a64_emit_stp_x(b, 3u, 4u, A64_XCTX, 80u);
+        a64_emit_lsl_x(b, 21u, 5u, 5u);
+        a64_emit_add_reg_x(b, 21u, 0u, 21u);
+        a64_emit_ldp_x(b, 3u, 4u, 21u, 0u);
+        a64_emit_ldp_x(b, 16u, 17u, 21u, 16u);
         a64_emit_stp_x(b, 3u, 4u, A64_XCTX, 32u);
         a64_emit_stp_x(b, 16u, 17u, A64_XCTX, 48u);
+    } else {
+        a64_emit_ldp_x(b, 3u, 4u, A64_XCTX, 32u);
+        a64_emit_ldp_x(b, 16u, 17u, A64_XCTX, 48u);
+        a64_emit_stp_x(b, 3u, 4u, 21u, 0u);
+        a64_emit_stp_x(b, 16u, 17u, 21u, 16u);
+        a64_emit_ldp_x(b, 3u, 4u, A64_XCTX, 64u);
+        a64_emit_stp_x(b, 3u, 4u, 1u, 320u);
+        a64_emit_ldp_x(b, 3u, 4u, A64_XCTX, 80u);
+        a64_emit_stp_x(b, 3u, 4u, 1u, 336u);
+        a64_emit_ldp_x(b, 3u, 4u, A64_XCTX, 96u);
+        a64_emit_stp_x(b, 3u, 4u, 1u, 352u);
+        a64_emit_stp_x(b, 3u, 4u, A64_XCTX, 32u);
+        a64_emit_ldp_x(b, 3u, 4u, A64_XCTX, 112u);
+        a64_emit_stp_x(b, 3u, 4u, 1u, 368u);
+        a64_emit_stp_x(b, 3u, 4u, A64_XCTX, 48u);
+        a64_emit_ldp_x(b, 3u, 4u, 2u, 320u);
+        a64_emit_stp_x(b, 3u, 4u, A64_XCTX, 64u);
+        a64_emit_ldp_x(b, 3u, 4u, 2u, 336u);
+        a64_emit_stp_x(b, 3u, 4u, A64_XCTX, 80u);
+        a64_emit_ldp_x(b, 3u, 4u, 2u, 352u);
+        a64_emit_stp_x(b, 3u, 4u, A64_XCTX, 96u);
+        a64_emit_ldp_x(b, 3u, 4u, 2u, 368u);
+        a64_emit_stp_x(b, 3u, 4u, A64_XCTX, 112u);
     }
     /* 5. Commit cwp/tgt, cansave/canrestore, and psr CWP bits. */
     a64_emit_str_imm_w(b, 5u, A64_XCTX, cwp_off);
@@ -579,9 +589,6 @@ int sparc32_emit_win_fast(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d,
             a64_patch_cbz_w(b, p_slow, slow);
         }
         a64_patch_cbz_w(b, p_slow2, slow);
-        if (p_slow3 != (size_t)-1) {
-            a64_patch_b_cond(b, p_slow3, slow);
-        }
         f_win_slowcall(b, d, is_save, ec->fault_pc);
         a64_patch_b_cond(b, p_end, b->count);
     }

@@ -56,21 +56,17 @@ static int fp_guard_fast(sparc32_emit_ctx_t *ec)
     a64_buf_t *b = ec->buf;
     size_t p_rd;
     size_t p_tem;
-    if (!b->fp_fast_checked) {
-        a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
-        a64_emit_ubfm_w(b, FS1, FS0, 30U, 31U);
-        p_rd = a64_emit_cbz_w_placeholder(b, false, FS1);
-        a64_emit_exit_undef(b, ec->fault_pc);
-        if (b->overflow) {
-            return -1;
-        }
-        a64_patch_cbz_w(b, p_rd, b->count);
-        if (!b->overflow) {
-            b->fp_fast_checked = true;
-        }
-    } else {
-        a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
+    if (b->fp_fast_checked) {
+        return 0;
     }
+    a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
+    a64_emit_ubfm_w(b, FS1, FS0, 30U, 31U);
+    p_rd = a64_emit_cbz_w_placeholder(b, false, FS1);
+    a64_emit_exit_undef(b, ec->fault_pc);
+    if (b->overflow) {
+        return -1;
+    }
+    a64_patch_cbz_w(b, p_rd, b->count);
     a64_emit_ubfm_w(b, FS1, FS0, 23U, 27U);
     p_tem = a64_emit_cbz_w_placeholder(b, false, FS1);
     a64_emit_exit_undef(b, ec->fault_pc);
@@ -78,6 +74,9 @@ static int fp_guard_fast(sparc32_emit_ctx_t *ec)
         return -1;
     }
     a64_patch_cbz_w(b, p_tem, b->count);
+    if (!b->overflow) {
+        b->fp_fast_checked = true;
+    }
     return b->overflow ? -1 : 0;
 }
 
@@ -87,7 +86,9 @@ static int fp_guard_tem(sparc32_emit_ctx_t *ec)
 {
     a64_buf_t *b = ec->buf;
     size_t p_tem;
-
+    if (b->fp_fast_checked) {
+        return 0;
+    }
     a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
     a64_emit_ubfm_w(b, FS1, FS0, 23U, 27U);
     p_tem = a64_emit_cbz_w_placeholder(b, false, FS1);
@@ -255,22 +256,37 @@ static void fp_rd_to_rmode(a64_buf_t *b, unsigned w_rd, unsigned w_rm)
     b->nzcv_valid = 0;
 }
 
-/* Load RD into FPCR.RMode; the previous FPCR is kept in xFS2. */
+/* Load RD into FPCR.RMode; the previous FPCR is kept in xFS2.
+ * When RD == 0 (RN, matching the host FPCR default), skip the
+ * context-synchronizing MSR FPCR writes completely. */
 static void fp_fpcr_set_rmode(a64_buf_t *b, unsigned w_rd, unsigned w_rm)
 {
+    size_t p_rn;
+    if (b->fp_fast_checked) {
+        return;
+    }
+    a64_emit_movz_w(b, FS2, 0U, 0U);
+    p_rn = a64_emit_cbz_w_placeholder(b, false, w_rd);
     /* Save to xFS2 (xFS1 holds the rmode; w_rd is dead by now). */
     fp_rd_to_rmode(b, w_rd, w_rm);
     fp_mrs_fpcr(b, FS2);
     fp_mrs_fpcr(b, FS3);
+    a64_emit_bfi_x(b, FS2, w_rm, 0U, 2U);
     a64_emit_bfi_x(b, FS3, A64_ZR, 22U, 2U);
     a64_emit_mov_w(b, FS0, w_rm);
     a64_emit_bfi_x(b, FS3, FS0, 22U, 2U);
     fp_msr_fpcr(b, FS3);
+    a64_patch_cbz_w(b, p_rn, b->count);
 }
 
 static void fp_fpcr_restore(a64_buf_t *b)
 {
-    fp_msr_fpcr(b, FS2);
+    if (!b->fp_fast_checked) {
+        size_t p_rn = a64_emit_cbz_w_placeholder(b, false, FS2);
+        a64_emit_bfi_x(b, FS2, A64_ZR, 0U, 2U);
+        fp_msr_fpcr(b, FS2);
+        a64_patch_cbz_w(b, p_rn, b->count);
+    }
     /* Converts are the only FPCR clients; commit their FPSR flags
      * here (the GPR store that follows cannot disturb FPSR). */
     fp_flags_commit(b);
@@ -327,7 +343,7 @@ static void fp_fpsr_clear(a64_buf_t *b)
 static void fp_cexc_clear(a64_buf_t *b)
 {
     a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
-    a64_emit_mov_imm32(b, FS1, 0xFFFFFFE0U);
+    a64_emit_mov_imm32(b, FS1, 0xFFFE3FE0U);
     a64_emit_and_reg_w(b, false, FS0, FS0, FS1, A64_SHIFT_LSL, 0U);
     a64_emit_str_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
 }
@@ -338,18 +354,27 @@ static void fp_cexc_clear(a64_buf_t *b)
  * the convert result in FS0 stays live and EKEEP (w22, the JMPL
  * delay-slot keeper in emit_int.c) is never touched: FP lowering in
  * a JMPL delay slot must preserve the jump target. */
-static void fp_flags_commit(a64_buf_t *b)
+static void fp_permute_fpsr(a64_buf_t *b, unsigned w_dst, unsigned w_fpsr,
+    unsigned w_tmp)
 {
-    a64_emit(b, 0xD53B4420U | FS3); /* MRS w21, FPSR */
-    a64_emit_ubfm_w(b, FS1, FS3, 4U, 4U);
-    a64_emit_ubfm_w(b, FS2, FS3, 1U, 1U);
-    a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 1U);
-    a64_emit_ubfm_w(b, FS2, FS3, 3U, 3U);
-    a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 2U);
-    a64_emit_ubfm_w(b, FS2, FS3, 2U, 2U);
-    a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 3U);
-    a64_emit_ubfm_w(b, FS2, FS3, 0U, 0U);
-    a64_emit_orr_reg_w(b, FS1, FS1, FS2, A64_SHIFT_LSL, 4U);
+    size_t p_fast;
+    a64_emit_ubfm_w(b, w_dst, w_fpsr, 4U, 4U);
+    a64_emit_ubfm_w(b, w_tmp, w_fpsr, 0U, 3U);
+    p_fast = a64_emit_cbz_w_placeholder(b, false, w_tmp);
+    a64_emit_ubfm_w(b, w_tmp, w_fpsr, 1U, 1U);
+    a64_emit_orr_reg_w(b, w_dst, w_dst, w_tmp, A64_SHIFT_LSL, 1U);
+    a64_emit_ubfm_w(b, w_tmp, w_fpsr, 3U, 3U);
+    a64_emit_orr_reg_w(b, w_dst, w_dst, w_tmp, A64_SHIFT_LSL, 2U);
+    a64_emit_ubfm_w(b, w_tmp, w_fpsr, 2U, 2U);
+    a64_emit_orr_reg_w(b, w_dst, w_dst, w_tmp, A64_SHIFT_LSL, 3U);
+    a64_emit_ubfm_w(b, w_tmp, w_fpsr, 0U, 0U);
+    a64_emit_orr_reg_w(b, w_dst, w_dst, w_tmp, A64_SHIFT_LSL, 4U);
+    a64_patch_cbz_w(b, p_fast, b->count);
+}
+
+static void fp_flags_commit_from_fs3(a64_buf_t *b)
+{
+    fp_permute_fpsr(b, FS1, FS3, FS2);
     /* fsr = (fsr & ~0x1F) | cexc | (cexc << 5). */
     a64_emit_ldr_imm_w(b, FS2, A64_XCTX, FP_FSR_OFF);
     /* S32-R8-6: clear cexc (bits 4:0) and stale FTT (bits 16:14). */
@@ -358,6 +383,12 @@ static void fp_flags_commit(a64_buf_t *b)
     a64_emit_orr_reg_w(b, FS2, FS2, FS1, A64_SHIFT_LSL, 0U);
     a64_emit_orr_reg_w(b, FS2, FS2, FS1, A64_SHIFT_LSL, 5U);
     a64_emit_str_imm_w(b, FS2, A64_XCTX, FP_FSR_OFF);
+}
+
+static void fp_flags_commit(a64_buf_t *b)
+{
+    a64_emit(b, 0xD53B4420U | FS3); /* MRS w21, FPSR */
+    fp_flags_commit_from_fs3(b);
 }
 
 /* fcc commit (FCMP/FCMPE): map NZCV to fcc (V->3, Z->0, N^V->1,
@@ -434,7 +465,9 @@ static int fp_emit_bitwise(sparc32_emit_ctx_t *ec, uint32_t opf,
 {
     a64_buf_t *b = ec->buf;
     uint32_t off;
-    sparc32_emit_fp_flush(b);
+    if (!ec->fp_arith_more) {
+        sparc32_emit_fp_flush(b);
+    }
 
     /* V8 FPop parity: odd opf = single, even opf = double. */
     if ((opf & 1U) != 0U) {
@@ -458,8 +491,11 @@ static int fp_emit_bitwise(sparc32_emit_ctx_t *ec, uint32_t opf,
     /* The word store may alias a cached double pair (the double
      * bitwise forms only rewrite the high word): drop the slot. */
     a64_fpr_invalidate(b, rd);
-    /* Moves never raise (matching fp.c); clear stale cexc. */
-    fp_cexc_clear(b);
+    /* Moves never raise (matching fp.c); clear stale cexc unless a
+     * subsequent FP arith op in the same block will overwrite cexc. */
+    if (!ec->fp_arith_more) {
+        fp_cexc_clear(b);
+    }
     return b->overflow ? -1 : 0;
 }
 
@@ -471,12 +507,20 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
     int is_d = (opf == 0x042U || opf == 0x046U || opf == 0x04AU ||
         opf == 0x04EU || opf == 0x02AU || opf == 0x069U) ? 1 : 0;
     uint32_t base = 0U;
+    bool had_prev = b->fpsr_dirty;
     if (fp_guard_fast(ec) != 0) {
         return -1;
     }
-    sparc32_emit_fp_flush(b);
-    fp_fpsr_clear(b);
-    b->fpsr_dirty = true;
+    if (!ec->fp_arith_more) {
+        if (had_prev) {
+            a64_emit(b, 0xD53B4420U | FS3); /* MRS w21, FPSR (H_prev) */
+        }
+        fp_fpsr_clear(b);
+        b->fpsr_dirty = false;
+    } else if (!b->fpsr_dirty) {
+        fp_fpsr_clear(b);
+        b->fpsr_dirty = true;
+    }
 
     switch (opf) {
     case 0x041U: case 0x042U: base = 0x1E202800U; break;
@@ -495,10 +539,8 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
         fp3(b, 0x1E200800U, 1, FVD, FVA, FVB);
         fp_canon(b, 1, FVD, FVA, 1, FVB);
         fp_st_d(b, rd, FVD);
-        return b->overflow ? -1 : 0;
-    }
-    /* FSQRT is unary (source in rs2); the rest are binary. */
-    if (opf == 0x029U || opf == 0x02AU) {
+    } else if (opf == 0x029U || opf == 0x02AU) {
+        /* FSQRT is unary (source in rs2); the rest are binary. */
         if (is_d != 0) {
             fp_ld_d(b, FVA, rs2);
         } else {
@@ -506,6 +548,11 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
         }
         fp2(b, base, is_d, FVD, FVA);
         fp_canon(b, is_d, FVD, FVA, 0, 0U);
+        if (is_d != 0) {
+            fp_st_d(b, rd, FVD);
+        } else {
+            fp_st_s(b, rd, FVD);
+        }
     } else {
         if (is_d != 0) {
             fp_ld_d(b, FVA, rs1);
@@ -516,11 +563,29 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
         }
         fp3(b, base, is_d, FVD, FVA, FVB);
         fp_canon(b, is_d, FVD, FVA, 1, FVB);
+        if (is_d != 0) {
+            fp_st_d(b, rd, FVD);
+        } else {
+            fp_st_s(b, rd, FVD);
+        }
     }
-    if (is_d != 0) {
-        fp_st_d(b, rd, FVD);
-    } else {
-        fp_st_s(b, rd, FVD);
+    if (!ec->fp_arith_more) {
+        if (had_prev) {
+            size_t p_same;
+            a64_emit(b, 0xD53B4420U | FS2); /* MRS w17, FPSR (H_last) */
+            a64_emit_ubfm_w(b, FS3, FS3, 0U, 4U);
+            a64_emit_bic_reg_w(b, false, FS0, FS3, FS2, A64_SHIFT_LSL, 0U);
+            p_same = a64_emit_cbz_w_placeholder(b, false, FS0);
+            fp_permute_fpsr(b, FS1, FS3, FS0);
+            a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
+            a64_emit_orr_reg_w(b, FS0, FS0, FS1, A64_SHIFT_LSL, 5U);
+            a64_emit_str_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
+            a64_patch_cbz_w(b, p_same, b->count);
+            a64_emit_mov_w(b, FS3, FS2);
+            fp_flags_commit_from_fs3(b);
+        } else {
+            fp_flags_commit(b);
+        }
     }
     return b->overflow ? -1 : 0;
 }
@@ -542,6 +607,17 @@ static int fp_emit_convert(sparc32_emit_ctx_t *ec, uint32_t opf,
     if (fp_guard_tem(ec) != 0) {
         return -1;
     }
+    if (opf == 0x0C8U) {
+        /* FiTOd: int bits -> double (always exact; never traps or rounds). */
+        if (!ec->fp_arith_more) {
+            sparc32_emit_fp_flush(b);
+            fp_cexc_clear(b);
+        }
+        a64_emit_ldr_imm_w(b, FS0, A64_XCTX, fp_s_off(rs2));
+        a64_emit_scvtf_w_to_d(b, FVD, FS0);
+        fp_st_d(b, rd, FVD);
+        return b->overflow ? -1 : 0;
+    }
     sparc32_emit_fp_flush(b);
     fp_fpsr_clear(b);
     /* FP operands first (double loads use xFS1), then RD/FPCR. */
@@ -553,14 +629,6 @@ static int fp_emit_convert(sparc32_emit_ctx_t *ec, uint32_t opf,
         a64_emit_scvtf_w_to_s(b, FVD, FS0);
         fp_fpcr_restore(b);
         fp_st_s(b, rd, FVD);
-        return b->overflow ? -1 : 0;
-    case 0x0C8U: /* FiTOd: int bits -> double */
-        fp_rd_load(b);
-        fp_fpcr_set_rmode(b, FS0, FS1);
-        a64_emit_ldr_imm_w(b, FS0, A64_XCTX, fp_s_off(rs2));
-        a64_emit_scvtf_w_to_d(b, FVD, FS0);
-        fp_fpcr_restore(b);
-        fp_st_d(b, rd, FVD);
         return b->overflow ? -1 : 0;
     case 0x0D1U: /* FsTOi: single -> int bits (always RZ per V8 B.28) */
         fp_ld_s(b, FVA, rs2);

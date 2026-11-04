@@ -197,7 +197,7 @@ static int load_guest(sparc32_ctx_t *ctx)
      * first SAVE 0->7 rotates free and the first RESTORE 7->0 underfills
      * l/i from [post-restore sp]. */
     ctx->cwp = 0U;
-    interp_window_reset();
+    interp_window_reset(ctx);
     ctx->pc  = info.entry;
     ctx->npc = info.entry + 4U;
     if (ctx->trace_enabled) {

@@ -685,8 +685,6 @@ static void *thr_thread_entry(void *arg)
 {
     struct thr_start *st = (struct thr_start *)arg;
     sparc32_ctx_t *ctx = st->ctx;
-    interp_window_clone_restore((const uint32_t (*)[16])st->winfile,
-        st->winsp, st->win_valid, (const uint32_t (*)[8])st->wino);
     ctx->host_tid = thr_gettid();
     pthread_mutex_lock(&thr_live_lock);
     thr_live_set_pt_locked(ctx, pthread_self());
@@ -850,11 +848,9 @@ long sparc32_thr_clone(sparc32_ctx_t *ctx, uint32_t flags, uint32_t stack,
     st->tid_ready = false;
     st->child_tid = -1L;
     st->refs = 2;
-    interp_window_clone_save(st->winfile, st->winsp, st->win_valid,
-        st->wino);
     if (stack != 0U) {
-        memset(st->win_valid, 0, sizeof(st->win_valid));
-        memset(st->winsp, 0, sizeof(st->winsp));
+        memset(child->win_valid, 0, sizeof(child->win_valid));
+        memset(child->winsp, 0, sizeof(child->winsp));
         child->canrestore = 0U;
         child->cansave = 7U;
     }

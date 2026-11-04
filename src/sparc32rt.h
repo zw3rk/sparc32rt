@@ -224,7 +224,25 @@ typedef struct sparc32_ctx {
     uint32_t jmpl_target;
     uint8_t jmpl_delay_armed;
     uint8_t jmpl_pad[3];
+
+    /* Per-context register-window backing store (E01 + S32-R7-1).
+     * Placed at the C-only tail so ABI-locked offsets 0..0x8990 remain
+     * untouched while both interp_win.c and the inline SAVE/RESTORE
+     * fast path address each thread's window state off x19 (A64_XCTX). */
+    uint32_t win_o[SPARC32_NWINDOWS][8];
+    uint32_t winsp[SPARC32_NWINDOWS];
+    uint32_t win_valid[SPARC32_NWINDOWS];
+    uint32_t winfile[SPARC32_NWINDOWS][16];
 } sparc32_ctx_t;
+
+_Static_assert(offsetof(sparc32_ctx_t, win_o) < (1U << 24),
+               "win_o must fit in 24-bit ADD immediate range");
+_Static_assert(offsetof(sparc32_ctx_t, winsp) - offsetof(sparc32_ctx_t, win_o) == 256,
+               "winsp must be at win_o + 256");
+_Static_assert(offsetof(sparc32_ctx_t, win_valid) - offsetof(sparc32_ctx_t, win_o) == 288,
+               "win_valid must be at win_o + 288");
+_Static_assert(offsetof(sparc32_ctx_t, winfile) - offsetof(sparc32_ctx_t, win_o) == 320,
+               "winfile must be at win_o + 320");
 
 /* ABI-locked offsets (Phase 2 trampoline + a64 emitter must agree). */
 #define SPARC32_CTX_R_OFFSET       0x000U

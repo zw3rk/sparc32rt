@@ -49,6 +49,8 @@ typedef struct sparc32_emit_ctx {
     uint32_t pc;                 /* Guest address of the insn being emitted. */
     uint32_t fault_pc;           /* Guest PC reported in w15 on fault exits. */
     const sparc32_decoded_t *delay; /* CTI delay-slot insn, or NULL. */
+    bool fp_arith_more;          /* Another inline FP arith op follows in
+                                  * this block before any FSR observer. */
 } sparc32_emit_ctx_t;
 
 /* Emit one decoded instruction. Returns 0 on success, -1 when the buffer

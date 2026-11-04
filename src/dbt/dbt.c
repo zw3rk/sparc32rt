@@ -70,6 +70,136 @@ static bool dbt_block_ends(const sparc32_decoded_t *d)
     }
 }
 
+static bool dbt_is_fp_arith(const sparc32_decoded_t *d)
+{
+    uint32_t opf = d->opf;
+    if (d->cls != (uint32_t)SPARC32_OP_FPU) {
+        return false;
+    }
+    if (d->op3 == (uint32_t)SPARC32_OP3_FPOP2) {
+        return opf == 0x069U && (d->rd & 1U) == 0U;
+    }
+    if (d->op3 != (uint32_t)SPARC32_OP3_FPOP1) {
+        return false;
+    }
+    switch (opf) {
+    case 0x041U: case 0x045U: case 0x049U: case 0x04DU:
+    case 0x029U:
+        return true;
+    case 0x042U: case 0x046U: case 0x04AU: case 0x04EU:
+        return ((d->rd | d->rs1 | d->rs2) & 1U) == 0U;
+    case 0x02AU:
+        return ((d->rd | d->rs2) & 1U) == 0U;
+    case 0x069U:
+        return (d->rd & 1U) == 0U;
+    default:
+        return false;
+    }
+}
+
+static bool dbt_is_fp_bitwise(const sparc32_decoded_t *d)
+{
+    uint32_t opf = d->opf;
+    if (d->cls != (uint32_t)SPARC32_OP_FPU ||
+        d->op3 != (uint32_t)SPARC32_OP3_FPOP1) {
+        return false;
+    }
+    if (opf == 0x001U || opf == 0x005U || opf == 0x009U) {
+        return true;
+    }
+    if (opf == 0x002U || opf == 0x006U || opf == 0x00AU) {
+        return ((d->rd | d->rs2) & 1U) == 0U;
+    }
+    if (opf == 0x0C8U) {
+        return (d->rd & 1U) == 0U;
+    }
+    return false;
+}
+
+static bool dbt_fp_arith_transparent(const sparc32_decoded_t *d,
+    bool *can_cross_fpmem)
+{
+    switch (d->cls) {
+    case SPARC32_OP_SETHI:
+    case SPARC32_OP_SHIFT:
+    case SPARC32_OP_FLUSH:
+    case SPARC32_OP_STBAR:
+        return true;
+    case SPARC32_OP_ALU:
+        return (d->op3 & 0x2FU) <= 0x0CU;
+    case SPARC32_OP_FPU:
+        if (dbt_is_fp_bitwise(d)) {
+            *can_cross_fpmem = false;
+            return true;
+        }
+        return false;
+    case SPARC32_OP_FPMEM:
+        if (!*can_cross_fpmem) {
+            return false;
+        }
+        if (d->op3 == 0x20U || d->op3 == 0x24U) {
+            return true;
+        }
+        if ((d->op3 == 0x23U || d->op3 == 0x27U) && (d->rd & 1U) == 0U) {
+            return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+static bool dbt_cti_inlines_fp_delay(const sparc32_decoded_t *d,
+    uint32_t cti_pc, const sparc32_decoded_t *delay)
+{
+    if (delay == NULL || (cti_pc & 0xFFFU) == 0xFFCU ||
+        !dbt_is_fp_arith(delay)) {
+        return false;
+    }
+    if (d->cls == (uint32_t)SPARC32_OP_BRANCH) {
+        return d->cond != 0U && d->annul == 0U;
+    }
+    return false;
+}
+
+static bool dbt_fp_arith_more(sparc32_ctx_t *ctx, uint32_t next_pc,
+    uint32_t rem_insns, bool can_cross_fpmem)
+{
+    uint32_t saved_reason = ctx->exit_reason;
+    uint32_t saved_fault = ctx->fault_addr;
+    uint32_t va = next_pc;
+    uint32_t k;
+    bool more = false;
+    for (k = 0U; k < rem_insns; k++) {
+        sparc32_decoded_t nd;
+        if ((va & (SPARC32_PAGE_SIZE - 1U)) == 0U) {
+            break;
+        }
+        if (sparc32_fetch_decode(ctx, va, &nd) != 0) {
+            break;
+        }
+        if (dbt_is_fp_arith(&nd)) {
+            more = true;
+            break;
+        }
+        if (dbt_is_cti(&nd)) {
+            sparc32_decoded_t dd;
+            if (sparc32_fetch_decode(ctx, va + 4U, &dd) == 0 &&
+                dbt_cti_inlines_fp_delay(&nd, va, &dd)) {
+                more = true;
+            }
+            break;
+        }
+        if (!dbt_fp_arith_transparent(&nd, &can_cross_fpmem)) {
+            break;
+        }
+        va += 4U;
+    }
+    ctx->exit_reason = saved_reason;
+    ctx->fault_addr = saved_fault;
+    return more;
+}
+
 /* ---- Translation: decode, emit, install (caller holds g_dbt_lock) ---- */
 
 static const dbt_block_t *dbt_translate_locked(sparc32_ctx_t *ctx, uint32_t pc,
@@ -130,7 +260,12 @@ static const dbt_block_t *dbt_translate_locked(sparc32_ctx_t *ctx, uint32_t pc,
         ec.pc = cur;
         ec.fault_pc = cur;
         ec.delay = delayp;
-        if (cti || dbt_block_ends(&d)) {
+        ec.fp_arith_more = (dbt_is_fp_arith(&d) ||
+                (buf.fp_fast_checked && dbt_is_fp_bitwise(&d))) &&
+            dbt_fp_arith_more(ctx, cur + 4U, limit - n - 1U,
+                dbt_is_fp_arith(&d) && !buf.fpsr_dirty);
+        if ((cti || dbt_block_ends(&d)) &&
+            !(cti && dbt_cti_inlines_fp_delay(&d, cur, delayp))) {
             sparc32_emit_fp_flush(&buf);
         }
         if (cti && (cur & 0xFFFU) == 0xFFCU) {

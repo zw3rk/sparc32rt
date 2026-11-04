@@ -12,6 +12,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "interp/decode.h"
 #include "rt32/a64_emit.h"
@@ -57,6 +58,20 @@ static int fp_delay_runs(uint32_t cond, int taken, int annul)
     return annul != 0 ? 0 : 1;
 }
 
+static void fp_jmpl_disarm(a64_buf_t *b)
+{
+    uint32_t off_a = (uint32_t)offsetof(sparc32_ctx_t, jmpl_delay_armed);
+    uint32_t hi_a = off_a & ~0xFFFu;
+    uint32_t lo_a = off_a & 0xFFFu;
+    if (hi_a == 0U) {
+        a64_emit_strb_imm_w(b, A64_ZR, A64_XCTX, off_a);
+    } else {
+        a64_emit(b, 0x91400000U | ((hi_a >> 12) << 10) |
+            ((A64_XCTX & 31U) << 5) | (FS2 & 31U));
+        a64_emit_strb_imm_w(b, A64_ZR, FS2, lo_a);
+    }
+}
+
 /* Emit the delay slot when it runs, then leave the fragment. A
  * page-final delay that ran exits via SINGLE_STEP (interp_cti tail);
  * every other path exits plainly to post. */
@@ -70,6 +85,7 @@ static int fp_delay_tail(sparc32_emit_ctx_t *ec, uint32_t npc,
         if (rc != 0) {
             return rc;
         }
+        fp_jmpl_disarm(ec->buf);
         if (page_final != 0) {
             return sparc32_emit_exit_singlestep(ec, post);
         }
@@ -179,25 +195,37 @@ int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
             fp_delay_runs(cond, 0, annul), page_final);
     }
     if (cond == 0x8U) { /* FBA: always branches. */
-        /* S32-R8-4: taken delay faults commit npc = target. */
-        a64_emit_mov_pc32(b, FS0, target);
-        a64_jmpl_record(b, FS0, FS2, FS1);
-        return fp_delay_tail(ec, npc, target,
-            fp_delay_runs(cond, 1, annul), page_final);
+        int runs = fp_delay_runs(cond, 1, annul);
+        if (runs != 0) {
+            /* S32-R8-4: taken delay faults commit npc = target. */
+            a64_emit_mov_pc32(b, FS0, target);
+            a64_jmpl_record(b, FS0, FS2, FS1);
+        }
+        return fp_delay_tail(ec, npc, target, runs, page_final);
     }
     if (page_final != 0) {
+        uint8_t sg_valid = b->gpr_cache_valid;
+        uint8_t sg_reg[8];
+        uint8_t sf_valid = b->fpr_valid;
+        uint8_t sf_tag[8];
+        bool s_fp_chk = b->fp_fast_checked;
+        bool s_fp_dirty = b->fpsr_dirty;
+        memcpy(sg_reg, b->gpr_cache_reg, sizeof(sg_reg));
+        memcpy(sf_tag, b->fpr_tag, sizeof(sf_tag));
         fp_taken_compute(b, cond);
         p_taken = a64_emit_cbz_w_placeholder(b, true, FS1);
-        b->gpr_cache_valid = 0;
-        b->fpr_valid = 0;
         rc = fp_delay_tail(ec, npc, npc + 4U,
             fp_delay_runs(cond, 0, annul), page_final);
         if (rc != 0) {
             return rc;
         }
         a64_patch_cbz_w(b, p_taken, b->count);
-        b->gpr_cache_valid = 0;
-        b->fpr_valid = 0;
+        b->gpr_cache_valid = sg_valid;
+        memcpy(b->gpr_cache_reg, sg_reg, sizeof(sg_reg));
+        b->fpr_valid = sf_valid;
+        memcpy(b->fpr_tag, sf_tag, sizeof(sf_tag));
+        b->fp_fast_checked = s_fp_chk;
+        b->fpsr_dirty = s_fp_dirty;
         /* Taken page-final always SINGLE_STEPs (emit_branch shape),
          * even when the delay was annulled away. */
         if (fp_delay_runs(cond, 1, annul) != 0) {
@@ -208,23 +236,36 @@ int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
             if (rc != 0) {
                 return rc;
             }
+            fp_jmpl_disarm(b);
         }
         return sparc32_emit_exit_singlestep(ec, target);
     }
-    fp_taken_compute(b, cond);
-    p_taken = a64_emit_cbz_w_placeholder(b, true, FS1);
-    b->gpr_cache_valid = 0;
-    b->fpr_valid = 0;
-    if (fp_delay_runs(cond, 0, annul) != 0) {
-        rc = fp_emit_delay(ec, npc);
-        if (rc != 0) {
-            return rc;
+    {
+        uint8_t sg_valid = b->gpr_cache_valid;
+        uint8_t sg_reg[8];
+        uint8_t sf_valid = b->fpr_valid;
+        uint8_t sf_tag[8];
+        bool s_fp_chk = b->fp_fast_checked;
+        bool s_fp_dirty = b->fpsr_dirty;
+        memcpy(sg_reg, b->gpr_cache_reg, sizeof(sg_reg));
+        memcpy(sf_tag, b->fpr_tag, sizeof(sf_tag));
+        fp_taken_compute(b, cond);
+        p_taken = a64_emit_cbz_w_placeholder(b, true, FS1);
+        if (fp_delay_runs(cond, 0, annul) != 0) {
+            rc = fp_emit_delay(ec, npc);
+            if (rc != 0) {
+                return rc;
+            }
         }
+        p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_cbz_w(b, p_taken, b->count);
+        b->gpr_cache_valid = sg_valid;
+        memcpy(b->gpr_cache_reg, sg_reg, sizeof(sg_reg));
+        b->fpr_valid = sf_valid;
+        memcpy(b->fpr_tag, sf_tag, sizeof(sf_tag));
+        b->fp_fast_checked = s_fp_chk;
+        b->fpsr_dirty = s_fp_dirty;
     }
-    p_end = a64_emit_b_cond_placeholder(b, A64_COND_AL);
-    a64_patch_cbz_w(b, p_taken, b->count);
-    b->gpr_cache_valid = 0;
-    b->fpr_valid = 0;
     if (fp_delay_runs(cond, 1, annul) != 0) {
         /* S32-R8-4: taken delay faults commit npc = target. */
         a64_emit_mov_pc32(b, FS0, target);
@@ -233,6 +274,7 @@ int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         if (rc != 0) {
             return rc;
         }
+        fp_jmpl_disarm(b);
     }
     a64_emit_exit_branch(b, target);
     if (b->overflow) {

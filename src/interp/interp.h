@@ -20,7 +20,7 @@ void interp_step(sparc32_ctx_t *ctx);
 
 /* Reset the window file + WIM to fresh-process state (CWP=0, WIM=0x01).
  * main calls this once per guest run, before the first interp_run. */
-void interp_window_reset(void);
+void interp_window_reset(sparc32_ctx_t *ctx);
 
 /* Run guest instructions until ctx->exit_reason != SPARC32_EXIT_NONE. */
 void interp_run(sparc32_ctx_t *ctx);

@@ -184,7 +184,7 @@ long sparc32_thr_execve(sparc32_ctx_t *ctx, uint32_t path_va,
     ctx->otherwin = 0U;
     ctx->cleanwin = 0U;
     ctx->r[SPARC32_SP] = sp;
-    interp_window_reset();
+    interp_window_reset(ctx);
     /* S32-R4-9: sig_mask, pending_signals and process-pending survive
      * exec; only caught handlers reset to SIG_DFL (above) and the
      * altstack is disabled. */

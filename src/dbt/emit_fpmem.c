@@ -155,24 +155,38 @@ static void fp_slowcall(a64_buf_t *b, uint32_t op3, uint32_t rd,
 {
     size_t p_fault;
     size_t p_cont;
-    sparc32_emit_fp_flush(b);
-    b->fp_fast_checked = false;
-    b->gpr_cache_valid = 0;
-    /* The helper call clobbers host NZCV. The f[] cache stays valid:
-     * slow loads always exit the fragment, slow stores never touch
-     * ctx->f[] (LDFSR writes only fsr). */
+    bool was_dirty = b->fpsr_dirty;
+    /* The helper call clobbers host NZCV; preserve x6..x13 (GPR cache)
+     * and host FPSR across BLR so cold slow-path misses do not disturb
+     * hot-path compile-time tracking or pending batched FP flags. */
     b->nzcv_valid = 0;
+    if (was_dirty) {
+        a64_emit(b, 0xD53B4420U | 21U); /* MRS x21, FPSR */
+    }
     a64_emit_add_uxtw_x(b, 0U, A64_XCTX, A64_ZR);
     a64_emit_mov_w(b, 1U, FPMS0);
     a64_emit_mov_imm32(b, 2U, op3);
     a64_emit_mov_imm32(b, 3U, rd);
-    a64_emit(b, 0xF81F0FFEU);
+    a64_emit(b, 0xA9BF1FE6U);
+    a64_emit(b, 0xA9BF27E8U);
+    a64_emit(b, 0xA9BF2FEAU);
+    a64_emit(b, 0xA9BF37ECU);
+    a64_emit(b, 0xA9BF57FEU);
     fp_mov64x(b, FPMS2, (uint64_t)(uintptr_t)&sparc32_rt_fpmem);
     a64_emit(b, 0xD63F0000U | ((FPMS2 & 31U) << 5));
-    a64_emit(b, 0xF84107FEU);
+    a64_emit(b, 0xA8C157FEU);
+    a64_emit(b, 0xA8C137ECU);
+    a64_emit(b, 0xA8C12FEAU);
+    a64_emit(b, 0xA8C127E8U);
+    a64_emit(b, 0xA8C11FE6U);
+    if (was_dirty) {
+        a64_emit(b, 0xD51B4420U | 21U); /* MSR FPSR, x21 */
+    }
     p_fault = a64_emit_cbz_w_placeholder(b, true, 0U);
     p_cont = a64_emit_b_cond_placeholder(b, A64_COND_AL);
     a64_patch_cbz_w(b, p_fault, b->count);
+    sparc32_emit_fp_flush(b);
+    b->fpsr_dirty = was_dirty;
     a64_emit_mov_w(b, FPMS1, 0U);
     a64_emit_mov_pc32(b, FPMS0, fault_pc);
     a64_emit_ret(b);
@@ -294,6 +308,7 @@ int sparc32_emit_fpmem(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         d->op3 == 0x27U) {
         return fp_emit_fast(b, d, ec->fault_pc, d->op3);
     }
+    sparc32_emit_fp_flush(b);
     if (d->op3 == 0x21U) {
         b->fp_fast_checked = false;
     }
