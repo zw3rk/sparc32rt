@@ -133,12 +133,14 @@ int rt32_open_guest_ro(const sparc32_ctx_t *ctx, const char *guest_path)
         ctx->sysroot != NULL && ctx->sysroot[0] != '\0') {
         char resolved[PATH_MAX];
         int n = snprintf(resolved, sizeof(resolved), "%s%s", ctx->sysroot, guest_path);
-        if (n > 0 && (size_t)n < sizeof(resolved)) {
-            int fd = open(resolved, O_RDONLY | O_CLOEXEC);
-            if (fd >= 0) {
-                return fd;
-            }
+        if (n < 0 || (size_t)n >= sizeof(resolved)) {
+            errno = ENAMETOOLONG;
+            return -1;
         }
+        /* Sysroot configured: stay inside it, never fall through to the
+         * host filesystem (S32-R13-3). A missing file under the sysroot
+         * reports ENOENT from this open, not a host-path probe. */
+        return open(resolved, O_RDONLY | O_CLOEXEC);
     }
     return open(guest_path, O_RDONLY | O_CLOEXEC);
 }

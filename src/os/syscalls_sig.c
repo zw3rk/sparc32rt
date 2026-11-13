@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "sparc32rt.h"
+#include "interp/interp.h"
 #include "interp/interp_priv.h"
 #include "os/l2a_access.h"
 #include "os/sigframe_sparc32rt.h"
@@ -491,6 +492,8 @@ static long sigreturn_restore_common(sparc32_ctx_t *ctx, uint32_t base,
     uint32_t pc, uint32_t npc)
 {
     uint32_t u[16];
+    uint32_t lw[8];
+    uint32_t iw[8];
     uint32_t fpu_regs[32];
     uint32_t fpu_fsr = 0U;
     uint32_t y;
@@ -523,12 +526,32 @@ static long sigreturn_restore_common(sparc32_ctx_t *ctx, uint32_t base,
             return -EFAULT;
         }
     }
+    /* Load the interrupted live window first: any fault aborts before
+     * ctx is mutated (S32-R13-2). */
+    for (i = 0; i < 8; i++) {
+        if (sig_ld_be32(ctx, base + (uint32_t)i * 4U, &lw[i]) != 0 ||
+            sig_ld_be32(ctx, base + 32U + (uint32_t)i * 4U,
+                &iw[i]) != 0) {
+            return -EFAULT;
+        }
+    }
     for (i = 0; i < 16; i++) {
         if (sig_ld_be32(ctx, base + 0xF0U + (uint32_t)i * 4U, &u[i]) != 0) {
             return -EFAULT;
         }
     }
-    ctx->psr = psr;
+    /* Restore the interrupted window cursor. Delivery flushed every
+     * caller window above the interrupted frame (win_valid[] = 0) and
+     * the handler ran its own SAVE/RESTORE chain, so the handler's
+     * cached winfile/cwp/cansave/canrestore no longer describe the
+     * resumed frame: reset to the saved psr cursor and let later
+     * RESTOREs refill caller windows from their authoritative guest
+     * stack frames. */
+    ctx->cwp = psr & (SPARC32_NWINDOWS - 1U);
+    ctx->psr = (psr & ~0x1FU) | ctx->cwp;
+    interp_window_reset(ctx);
+    ctx->canrestore = 0U;
+    ctx->cansave = SPARC32_NWINDOWS - 1U;
     ctx->y = y;
     for (i = 1; i < 8; i++) {
         ctx->r[(uint32_t)i] = u[i];
@@ -537,10 +560,8 @@ static long sigreturn_restore_common(sparc32_ctx_t *ctx, uint32_t base,
         ctx->r[SPARC32_O0 + (uint32_t)(i - 8)] = u[i];
     }
     for (i = 0; i < 8; i++) {
-        (void)sig_ld_be32(ctx, base + (uint32_t)i * 4U,
-            &ctx->r[SPARC32_L0 + (uint32_t)i]);
-        (void)sig_ld_be32(ctx, base + 32U + (uint32_t)i * 4U,
-            &ctx->r[SPARC32_I0 + (uint32_t)i]);
+        ctx->r[SPARC32_L0 + (uint32_t)i] = lw[i];
+        ctx->r[SPARC32_I0 + (uint32_t)i] = iw[i];
     }
     if (fs != 0U) {
         for (i = 0; i < 32; i++) {

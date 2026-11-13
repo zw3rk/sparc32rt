@@ -56,6 +56,83 @@
 #define SPARC32_TRAP_PRIV_INSN 0x03U
 #define SPARC32_TRAP_DIV_ZERO 0x2AU
 #define SPARC32_TRAP_SYSCALL 0x10U
+
+/* Direct-mapped decoded-instruction cache (S32-R13-5): 4096 entries
+ * indexed by (pc >> 2) & 4095, thread-local so cloned threads never
+ * share entries. A hit requires the pc tag, the VM/SMC code epoch
+ * (g_cache_epoch, bumped by every vm_invalidate_jit range retirement),
+ * live READ|EXEC coverage, and the identical raw word: the epoch drops
+ * invalidated translations bulk-style, while the live range + word
+ * checks keep SMC (guest code writes) and NX (mprotect/munmap) faults
+ * exact. Decode is a pure function of the word, so a validated hit is
+ * indistinguishable from a fresh sparc32_fetch_decode. */
+/* Guest PROT bits for fetch (must match decode.c: fetch requires both
+ * READ and EXEC; the oracle faults execution from RW-only pages). */
+#define INTERP_DEC_PROT_NEED (0x1U | 0x4U)
+#define INTERP_DEC_CACHE_SIZE 4096U
+
+struct interp_dec_slot {
+    uint32_t pc;
+    uint32_t raw;
+    sparc32_decoded_t dec;
+};
+
+static _Thread_local struct interp_dec_slot t_dec_cache[INTERP_DEC_CACHE_SIZE];
+static _Thread_local uint32_t t_dec_epoch = 0U;
+
+/* Bulk-invalidation epoch owned by the DBT cache (dbt_cache.c); read
+ * only here, written only by dbt_bump_epoch_locked. */
+extern uint32_t g_cache_epoch;
+
+static bool interp_dec_lookup(sparc32_ctx_t *ctx, uint32_t pc,
+    sparc32_decoded_t *out)
+{
+    uint32_t idx = (pc >> 2U) & (INTERP_DEC_CACHE_SIZE - 1U);
+    struct interp_dec_slot *s = &t_dec_cache[idx];
+    const uint8_t *base;
+    uint32_t raw;
+    uint32_t cur_epoch;
+    if ((pc & 3U) != 0U) {
+        return false;
+    }
+    if (s->pc != pc) {
+        return false;
+    }
+    cur_epoch = __atomic_load_n(&g_cache_epoch, __ATOMIC_ACQUIRE);
+    if (t_dec_epoch != cur_epoch) {
+        return false;
+    }
+    if (!interp_range_ok(ctx, pc, 4U, INTERP_DEC_PROT_NEED)) {
+        return false;
+    }
+    base = (const uint8_t *)sparc32_guest_ptr(ctx, pc);
+    raw = ((uint32_t)base[0] << 24) | ((uint32_t)base[1] << 16) |
+        ((uint32_t)base[2] << 8) | (uint32_t)base[3];
+    if (raw != s->raw) {
+        return false;
+    }
+    *out = s->dec;
+    return true;
+}
+
+static void interp_dec_fill(sparc32_ctx_t *ctx, uint32_t pc,
+    const sparc32_decoded_t *d)
+{
+    uint32_t idx = (pc >> 2U) & (INTERP_DEC_CACHE_SIZE - 1U);
+    struct interp_dec_slot *s = &t_dec_cache[idx];
+    const uint8_t *base = (const uint8_t *)sparc32_guest_ptr(ctx, pc);
+    s->raw = ((uint32_t)base[0] << 24) | ((uint32_t)base[1] << 16) |
+        ((uint32_t)base[2] << 8) | (uint32_t)base[3];
+    s->dec = *d;
+    s->pc = pc;
+    t_dec_epoch = __atomic_load_n(&g_cache_epoch, __ATOMIC_ACQUIRE);
+}
+
+static void interp_dec_invalidate(uint32_t va)
+{
+    uint32_t idx = (va >> 2U) & (INTERP_DEC_CACHE_SIZE - 1U);
+    t_dec_cache[idx].pc = ~0U;
+}
 /* S32-N-4: software Ticc traps carry bit 8 so they never collide with
  * the internal hardware trap codes 0x01/0x07/0x2a. */
 #define SPARC32_TRAP_SW_BIT 0x100U
@@ -608,8 +685,15 @@ static bool interp_single(sparc32_ctx_t *ctx, uint32_t pc,
         return interp_window(ctx, d, true);
     case SPARC32_OP_RESTORE:
         return interp_window(ctx, d, false);
-    case SPARC32_OP_FLUSH:
+    case SPARC32_OP_FLUSH: {
+        /* FLUSH drops the decode-cache line for its address (S32-R13-5):
+         * the translator has no icache, but a flushed line must be
+         * re-fetched afterwards. */
+        uint32_t ea = ctx->r[d->rs1] +
+            ((d->is_imm != 0U) ? (uint32_t)d->simm : ctx->r[d->rs2]);
+        interp_dec_invalidate(ea);
         return true; /* Host memory model needs no barrier. */
+    }
     case SPARC32_OP_LOAD:
     case SPARC32_OP_STORE:
         return interp_mem(ctx, pc, d);
@@ -762,8 +846,11 @@ void interp_step(sparc32_ctx_t *ctx)
     }
     ctx->r[0] = 0U;
     pc = ctx->pc;
-    if (sparc32_fetch_decode(ctx, pc, &d) != 0) {
-        return;
+    if (!interp_dec_lookup(ctx, pc, &d)) {
+        if (sparc32_fetch_decode(ctx, pc, &d) != 0) {
+            return;
+        }
+        interp_dec_fill(ctx, pc, &d);
     }
     if (ctx->trace_enabled) {
         fprintf(stderr, "T pc=%08x npc=%08x raw=%08x cls=%u\n", pc, ctx->npc,

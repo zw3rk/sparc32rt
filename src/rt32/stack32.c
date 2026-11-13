@@ -10,7 +10,8 @@
  * 64-byte rwindow save area stays reserved below argc (SPEC section 2.1:
  * argc sits at %sp + 64), and the auxv carries the SPARC Linux entries
  * (AT_PHDR/PHENT/PHNUM/PAGESZ/ENTRY/UID/EUID/GID/EGID/CLKTCK/RANDOM/
- * EXECFN); AT_HWCAP is 0 until Phase 2 HWCAP discovery.
+ * EXECFN); AT_HWCAP carries FLUSH | STBAR | SWAP | MULDIV (0x0F) and
+ * only AT_HWCAP2 stays 0.
  */
 
 #define _GNU_SOURCE

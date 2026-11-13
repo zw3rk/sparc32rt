@@ -213,6 +213,11 @@ typedef struct {
  * Always fills *out (illegal words yield SPARC32_OP_ILLEGAL). */
 void sparc32_decode_word(uint32_t word, sparc32_decoded_t *out);
 
+/* FPop1 opf values with a double-precision destination (V8 opf table):
+ * even-pair rd required, odd rd decodes illegal. Shared by the decoder
+ * and the DBT emitter so the two never disagree (S32-R13-7). */
+int sparc32_fpu_double_dest(uint32_t op3, uint32_t opf);
+
 /* Big-endian fetch + decode at guest VA. Returns 0 on success. On fault
  * (misaligned VA or no readable tracked region covering [va, va + 4))
  * sets ctx->exit_reason = SPARC32_EXIT_FAULT with ctx->fault_addr = va,

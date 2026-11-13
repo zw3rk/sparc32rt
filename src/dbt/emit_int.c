@@ -375,8 +375,11 @@ int sparc32_emit_trap(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     }
     if (d->cond != 0x8u) {
         sparc32_emit_cond_setup(b, d->cond);
-        p_taken =
-            a64_emit_b_cond_placeholder(b, sparc32_emit_icc_cond(d->cond));
+        /* Inverted sense (S32-R14-1): p_taken branches OVER the trap
+         * body to the npc fallthrough, so it must fire when the
+         * condition is FALSE; a TRUE condition falls into the trap. */
+        p_taken = a64_emit_b_cond_placeholder(b,
+            sparc32_emit_icc_cond(d->cond) ^ 1U);
     } else {
         p_taken = (size_t)-1;
     }

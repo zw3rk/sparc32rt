@@ -34,13 +34,14 @@ static int32_t sign_extend(uint32_t v, uint32_t n)
  * even-pair rd required, odd rd decodes illegal (E06 oracle leniency
  * delta: qemu executes it, LEON hardware traps, translator is strict).
  * S32-R7-17: 0x0c6 is FDTOS (single dest), FiTOd is 0x0c8. */
-static int fpu_double_dest(uint32_t op3, uint32_t opf)
+int sparc32_fpu_double_dest(uint32_t op3, uint32_t opf)
 {
     if (op3 == SPARC32_OP3_FPOP1) {
         switch (opf) {
         case 0x002U: /* FMOVd */
         case 0x006U: /* FNEGd */
         case 0x00AU: /* FABSd */
+        case 0x02AU: /* FSQRTd */
         case 0x042U: /* FADDd */
         case 0x046U: /* FSUBd */
         case 0x04AU: /* FMULd */
@@ -268,7 +269,7 @@ static void decode_format2(uint32_t word, sparc32_decoded_t *out)
             out->cls = SPARC32_OP_ILLEGAL;
             return;
         }
-        if (fpu_double_dest(op3, opf) && ((rd & 0x1U) != 0U)) {
+        if (sparc32_fpu_double_dest(op3, opf) && ((rd & 0x1U) != 0U)) {
             out->cls = SPARC32_OP_ILLEGAL;
             return;
         }

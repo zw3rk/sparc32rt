@@ -12,7 +12,7 @@
  * SPARC32 syscall convention (SPEC section 2.2, E04 oracle):
  *   number in %g1 (r[1]), args 1..6 in %o0..%o5 (r[8..13]).
  *   Success: PSR.icc.C = 0, %o0 = (uint32_t)ret.
- *   Error:   PSR.icc.C = 1, %o0 = sparc_errno_from_host(-ret)
+ *   Error:   PSR.icc.C = 1, %o0 = sparc32_errno_from_host(-ret)
  *            (positive SPARC errno). Always advances pc = npc; npc += 4.
  * Guest pointers are translated through the G window via
  * sparc32_guest_ptr; no host pointer ever leaks to the guest.
@@ -110,7 +110,7 @@ long sparc32_l2a_ioctl(sparc32_ctx_t *ctx, uint32_t fd, uint32_t request,
  * convention holds on any build host — e.g. macOS reports ENOSYS as 78,
  * SPARC as 90. Only errnos this layer can produce are listed; anything
  * else falls back to the raw value, which is correct on the Linux host. */
-static uint32_t sparc_errno_from_host(long host_errno)
+uint32_t sparc32_errno_from_host(long host_errno)
 {
     switch (host_errno) {
     case EPERM: return 1U;
@@ -142,6 +142,7 @@ static uint32_t sparc_errno_from_host(long host_errno)
     case EROFS: return 30U;
     case EPIPE: return 32U;
     case ENOSYS: return 90U;
+    case ETIMEDOUT: return 60U;
     case ENAMETOOLONG: return 63U;
     case ELOOP: return 62U;
     case ERANGE: return 34U;
@@ -879,14 +880,14 @@ long sparc32_handle_syscall(sparc32_ctx_t *ctx)
         uint32_t u = (uint32_t)ret;
 
         if (u > 0xFFFFF000U) {
-            ctx->r[SPARC32_O0] = sparc_errno_from_host((long)(0U - u));
+            ctx->r[SPARC32_O0] = sparc32_errno_from_host((long)(0U - u));
             ctx->psr |= SPARC32_PSR_C;
         } else {
             ctx->r[SPARC32_O0] = u;
             ctx->psr &= ~SPARC32_PSR_C;
         }
     } else if (ret < 0L) {
-        ctx->r[SPARC32_O0] = sparc_errno_from_host(-ret);
+        ctx->r[SPARC32_O0] = sparc32_errno_from_host(-ret);
         ctx->psr |= SPARC32_PSR_C;
     } else {
         ctx->r[SPARC32_O0] = (uint32_t)ret;

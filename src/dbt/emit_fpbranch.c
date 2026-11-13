@@ -190,6 +190,17 @@ int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     /* S32-R8-3: the delay slot runs at npc, so helper fault exits must
      * carry npc (matching interp_cti, like JMPL). */
     ec->fault_pc = npc;
+    /* S32-R14-2: a missing, CALL/BRANCH/JMPL, or TRAP delay cannot be
+     * inlined (the outer transfer is cancelled); exit SINGLE_STEP at
+     * the branch pc so interp_step replays the pair atomically instead
+     * of losing the outer pc at npc. */
+    if (ec->delay == NULL ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_CALL ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_BRANCH ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_JMPL ||
+        ec->delay->cls == (uint32_t)SPARC32_OP_TRAP) {
+        return sparc32_emit_exit_singlestep(ec, pc);
+    }
     if (cond == 0x0U) { /* FBN: never branches. */
         return fp_delay_tail(ec, npc, npc + 4U,
             fp_delay_runs(cond, 0, annul), page_final);
@@ -204,41 +215,14 @@ int sparc32_emit_fbranch(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
         return fp_delay_tail(ec, npc, target, runs, page_final);
     }
     if (page_final != 0) {
-        uint8_t sg_valid = b->gpr_cache_valid;
-        uint8_t sg_reg[8];
-        uint8_t sf_valid = b->fpr_valid;
-        uint8_t sf_tag[8];
-        bool s_fp_chk = b->fp_fast_checked;
-        bool s_fp_dirty = b->fpsr_dirty;
-        memcpy(sg_reg, b->gpr_cache_reg, sizeof(sg_reg));
-        memcpy(sf_tag, b->fpr_tag, sizeof(sf_tag));
-        fp_taken_compute(b, cond);
-        p_taken = a64_emit_cbz_w_placeholder(b, true, FS1);
-        rc = fp_delay_tail(ec, npc, npc + 4U,
-            fp_delay_runs(cond, 0, annul), page_final);
-        if (rc != 0) {
-            return rc;
-        }
-        a64_patch_cbz_w(b, p_taken, b->count);
-        b->gpr_cache_valid = sg_valid;
-        memcpy(b->gpr_cache_reg, sg_reg, sizeof(sg_reg));
-        b->fpr_valid = sf_valid;
-        memcpy(b->fpr_tag, sf_tag, sizeof(sf_tag));
-        b->fp_fast_checked = s_fp_chk;
-        b->fpsr_dirty = s_fp_dirty;
         /* Taken page-final always SINGLE_STEPs (emit_branch shape),
          * even when the delay was annulled away. */
-        if (fp_delay_runs(cond, 1, annul) != 0) {
-            /* S32-R8-4: taken delay faults commit npc = target. */
-            a64_emit_mov_pc32(b, FS0, target);
-            a64_jmpl_record(b, FS0, FS2, FS1);
-            rc = fp_emit_delay(ec, npc);
-            if (rc != 0) {
-                return rc;
-            }
-            fp_jmpl_disarm(b);
-        }
-        return sparc32_emit_exit_singlestep(ec, target);
+        fp_taken_compute(b, cond);
+        p_taken = a64_emit_cbz_w_placeholder(b, true, FS1);
+        return sparc32_emit_branch_page_final(ec, npc, target,
+            fp_delay_runs(cond, 0, annul),
+            fp_delay_runs(cond, 1, annul),
+            p_taken, 1, fp_emit_delay);
     }
     {
         uint8_t sg_valid = b->gpr_cache_valid;

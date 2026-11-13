@@ -9,9 +9,10 @@
  * to the host futex (BE/LE conversion as in sparc32_l2a_futex). Where
  * the host has no futex (Darwin) a small pthread condvar emulation
  * serves WAIT/WAKE with relative or CLOCK_REALTIME-absolute timeouts;
- * every other op is -ENOSYS (SPARC 38). Returned errnos are SPARC
- * numbers (EAGAIN 11, ETIMEDOUT 110, EINTR 4, EINVAL 22, EFAULT 14),
- * never host values.
+ * every other op is -ENOSYS (host; SPARC 90 after the central
+ * mapping). Returned errnos are negative host values, never SPARC
+ * numbers: the carry commit maps them (ENOSYS 90, ETIMEDOUT 60,
+ * EAGAIN 11, EINTR 4, EINVAL 22, EFAULT 14).
  */
 
 #ifndef _DEFAULT_SOURCE
@@ -27,6 +28,7 @@
 #include <unistd.h>
 
 #include "sparc32rt.h"
+#include "os/syscalls_min.h"
 
 #include "os/l2a_access.h"
 
@@ -36,13 +38,11 @@
 #define FUTEX_SP_PRIVATE_FLAG 128U
 #define FUTEX_SP_CLOCK_REALTIME 256U
 
-/* SPARC (asm-generic) errnos, independent of the build host. */
-#define SP_EAGAIN 11L
-#define SP_EINTR 4L
-#define SP_EINVAL 22L
-#define SP_EFAULT 14L
-#define SP_ENOSYS 38L
-#define SP_ETIMEDOUT 110L
+/* Errno contract (S32-R13-8): this unit returns negative *host* errnos
+ * (<errno.h> values). The single guest mapping sparc32_errno_from_host
+ * (src/os/syscalls_min.c, applied at the syscall carry commit) converts
+ * them to SPARC Linux numbers (ENOSYS 90, ETIMEDOUT 60). No SP_*
+ * shadow constants: they disagreed with the SunOS numbering. */
 
 /* Emulation: one global mutex guards a small table mapping guest futex
  * addresses to condvars. WAIT checks the BE word under the lock, sleeps
@@ -132,7 +132,7 @@ long sparc32_futex_wait_emu(sparc32_ctx_t *ctx, uint32_t uaddr,
     int ok;
     if (has_timeout) {
         if (sec < 0 || nsec < 0 || nsec >= 1000000000LL) {
-            return -SP_EINVAL;
+            return -EINVAL;
         }
         if (absolute) {
             deadline = (sec > 9000000000LL) ? 9000000000LL * 1000000000LL :
@@ -154,20 +154,20 @@ long sparc32_futex_wait_emu(sparc32_ctx_t *ctx, uint32_t uaddr,
         struct timespec ts;
         if (!ok) {
             pthread_mutex_unlock(&futex_emu_lock);
-            return -SP_EFAULT;
+            return -EFAULT;
         }
         if (cur != val) {
             pthread_mutex_unlock(&futex_emu_lock);
-            return -SP_EAGAIN;
+            return -EAGAIN;
         }
         if (has_timeout && futex_emu_now_ns() >= deadline) {
             pthread_mutex_unlock(&futex_emu_lock);
-            return -SP_ETIMEDOUT;
+            return -ETIMEDOUT;
         }
         slot = futex_emu_find(uaddr, 1);
         if (slot == 0) {
             pthread_mutex_unlock(&futex_emu_lock);
-            return -SP_EAGAIN;
+            return -EAGAIN;
         }
         slot->waiters++;
         if (!has_timeout) {
@@ -183,9 +183,9 @@ long sparc32_futex_wait_emu(sparc32_ctx_t *ctx, uint32_t uaddr,
             return 0L;
         }
         if (rc == ETIMEDOUT) {
-            return -SP_ETIMEDOUT;
+            return -ETIMEDOUT;
         }
-        return (rc == EINTR) ? -SP_EINTR : -SP_EINVAL;
+        return (rc == EINTR) ? -EINTR : -EINVAL;
     }
 }
 
@@ -225,10 +225,10 @@ long sparc32_l2a_futex_emu32(sparc32_ctx_t *ctx, uint32_t uaddr,
     int absolute = (op & FUTEX_SP_CLOCK_REALTIME) != 0U;
     (void)absolute;
     if (cmd != FUTEX_SP_WAIT && cmd != FUTEX_SP_WAKE) {
-        return -SP_ENOSYS;
+        return -ENOSYS;
     }
     if (l2a_range_ok(uaddr, 4U) != 0) {
-        return -SP_EFAULT;
+        return -EFAULT;
     }
     if (cmd == FUTEX_SP_WAKE) {
         return sparc32_futex_wake_emu(ctx, uaddr, val);
@@ -241,7 +241,7 @@ long sparc32_l2a_futex_emu32(sparc32_ctx_t *ctx, uint32_t uaddr,
         int64_t sec;
         int64_t nsec;
         if (l2a_load(ctx, timeout_va, tp, sizeof(tp)) != 0) {
-            return -SP_EFAULT;
+            return -EFAULT;
         }
         sec = (int64_t)(int32_t)get_be32(tp);
         nsec = (int64_t)(int32_t)get_be32(tp + 4);
@@ -260,10 +260,10 @@ long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
     int absolute = (op & FUTEX_SP_CLOCK_REALTIME) != 0U;
     (void)absolute;
     if (cmd != FUTEX_SP_WAIT && cmd != FUTEX_SP_WAKE) {
-        return -SP_ENOSYS;
+        return -ENOSYS;
     }
     if (l2a_range_ok(uaddr, 4U) != 0) {
-        return -SP_EFAULT;
+        return -EFAULT;
     }
     /* Host key must match ordinary futex: keep PRIVATE and REALTIME bits. */
     if (cmd == FUTEX_SP_WAKE) {
@@ -292,12 +292,12 @@ long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
         uint64_t sec;
         uint64_t nsec;
         if (l2a_load(ctx, timeout_va, tp, sizeof(tp)) != 0) {
-            return -SP_EFAULT;
+            return -EFAULT;
         }
         sec = ((uint64_t)get_be32(tp) << 32) | (uint64_t)get_be32(tp + 4);
         nsec = ((uint64_t)get_be32(tp + 8) << 32) | (uint64_t)get_be32(tp + 12);
         if ((sec >> 63) != 0U || (nsec >> 63) != 0U) {
-            return -SP_EINVAL;
+            return -EINVAL;
         }
 #if defined(__linux__) && defined(SYS_futex_time64)
         {
@@ -322,7 +322,7 @@ long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
             struct timespec hts;
             long rc;
             if (nsec >= 1000000000ULL) {
-                return -SP_EINVAL;
+                return -EINVAL;
             }
             hts.tv_sec = (time_t)sec;
             hts.tv_nsec = (long)nsec;
@@ -332,7 +332,7 @@ long sparc32_l2a_futex_time64(sparc32_ctx_t *ctx, uint32_t uaddr,
         }
 #else
         if (nsec >= 1000000000ULL) {
-            return -SP_EINVAL;
+            return -EINVAL;
         }
         return sparc32_futex_wait_emu(ctx, uaddr, val, (int64_t)sec,
             (int64_t)nsec, 1, absolute);

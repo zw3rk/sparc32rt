@@ -443,13 +443,3 @@ void dbt_patch_chain(sparc32_ctx_t *ctx, const dbt_block_t *from,
     ctx->chain_hits += 1U;
     ctx->last_exec_entry = (void *)to->host_code;
 }
-
-void dbt_jmpl_record_target(sparc32_ctx_t *ctx, uint32_t target)
-{
-    if (ctx == NULL) {
-        return;
-    }
-    ctx->jmpl_target = target;
-    ctx->jmpl_delay_armed = 1u;
-    aot_delay_target_set(ctx, target);
-}

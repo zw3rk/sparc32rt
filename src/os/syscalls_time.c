@@ -39,11 +39,6 @@ long sparc32_l2a_futex_emu32(sparc32_ctx_t *ctx, uint32_t uaddr,
 /* Blocked-mask ownership (S32-R3-5): the mask is per-thread state in
  * ctx->sig_mask. Unblockable signals (SIGKILL=9, SIGSTOP=17) are
  * stripped on every write. */
-uint64_t sparc32_l2a_blocked_mask(void)
-{
-    return 0ULL;
-}
-
 void sparc32_l2a_set_blocked_mask(sparc32_ctx_t *ctx, uint64_t mask)
 {
     if (ctx != NULL) {

@@ -16,6 +16,14 @@
 /* Nonzero when nr is a terminal exit (exit/exit_group). */
 int sparc32_syscall_is_exit(long nr);
 
+/* Single host-to-guest errno mapping (S32-R13-8): SPARC Linux follows
+ * SunOS numbering (arch/sparc/include/uapi/asm/errno.h), so ENOSYS is
+ * 90 (not 38) and ETIMEDOUT is 60 (not 110). Every layer returns
+ * negative host errnos; only the carry commit (and this function)
+ * converts. Declared here so futex.c shares it instead of keeping
+ * conflicting SP_* constants. */
+uint32_t sparc32_errno_from_host(long host_errno);
+
 /* Short name for nr, or NULL when out of range. */
 const char *sparc32_syscall_name(long nr);
 

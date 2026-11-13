@@ -847,8 +847,15 @@ uint32_t rt32_vm_brk(sparc32_ctx_t *ctx, uint32_t new_brk)
                                       (uint32_t)(PROT_READ | PROT_WRITE), 0x22U, "[heap]");
     } else if (new_page < old_page) {
         uint32_t len = old_page - new_page;
-        /* Re-reserve shrunk brk pages with PROT_NONE inside the guest window */
-        (void)vm_reserve_prot_none(ctx, new_page, len);
+        /* Re-reserve shrunk brk pages with PROT_NONE inside the guest
+         * window (S32-R13-15): a failed reserve keeps the old break
+         * instead of committing new_brk over still-mapped pages. */
+        if (vm_reserve_prot_none(ctx, new_page, len) != 0) {
+            uint32_t curr = g_vm_brk_curr;
+            vm_sync_brk_to_ctx(ctx);
+            vm_lock_release();
+            return curr;
+        }
         vm_unmap_regions_pub(new_page, old_page);
         {
             uint32_t va;

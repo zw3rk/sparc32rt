@@ -692,8 +692,10 @@ int vm_reserve_prot_none(sparc32_ctx_t *ctx, uint32_t start, uint32_t len)
         uint32_t in_start = (start + mask) & ~mask;
         uint32_t in_end   = (start + len) & ~mask;
         if (in_end > in_start) {
-            (void)mprotect(sparc32_guest_ptr(ctx, in_start),
-                           (size_t)(in_end - in_start), PROT_NONE);
+            if (mprotect(sparc32_guest_ptr(ctx, in_start),
+                         (size_t)(in_end - in_start), PROT_NONE) != 0) {
+                return -errno;
+            }
         }
         return 0;
     }

@@ -97,18 +97,6 @@ int rt_host_map_anon_darwin(void *hint_addr, size_t len, int linux_prot,
  * JIT W^X on Darwin: MAP_JIT arena, thread APRR published via
  * pthread_jit_write_protect_np; seal flips to RX and flushes I-cache.
  */
-void *rt_host_jit_alloc_darwin(size_t size)
-{
-#if defined(__APPLE__)
-    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
-    return (p == MAP_FAILED) ? NULL : p;
-#else
-    (void)size;
-    return NULL;
-#endif
-}
-
 void rt_host_jit_thread_init_darwin(void)
 {
 #if defined(__APPLE__)

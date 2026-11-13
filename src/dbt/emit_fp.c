@@ -48,9 +48,10 @@ static void fp_flags_commit(a64_buf_t *b);
 /* Lane P5: fast-path FSR status. The inline FP sequence is valid only
  * when FSR.TEM == 0 (bits 27:23, no trapped exception) and FSR.RD == 0
  * (bits 31:30, round-to-nearest matches the host FPCR default);
- * otherwise exit UNDEF so the dispatcher replays via interp. S32-R7-16:
- * TEM is rechecked on every op (an LDFSR earlier in the block may have
- * set it), while the RD check stays once-per-block (arith/cmp ignore RD). */
+ * otherwise exit UNDEF so the dispatcher replays via interp. Both the
+ * TEM == 0 and RD == 0 checks run once per block (S32-R13-13): FPop
+ * instructions cannot modify FSR.TEM or FSR.RD, while LDFSR resets
+ * fp_fast_checked and handles FSR state itself. */
 static int fp_guard_fast(sparc32_emit_ctx_t *ec)
 {
     a64_buf_t *b = ec->buf;
@@ -292,9 +293,19 @@ static void fp_fpcr_restore(a64_buf_t *b)
     fp_flags_commit(b);
 }
 
+/* FMOV Sd, Sn (single-register move, for NaN payload selection). */
+static void fp_mov_s(a64_buf_t *b, unsigned vd, unsigned vn)
+{
+    a64_emit(b, 0x1E204000U | ((vn & 31U) << 5) | (vd & 31U));
+}
+
 /* NaN canonicalization (E06): a result NaN with no NaN input takes
- * the oracle default (0x7FFFFFFF / 0x7FFFFFFFFFFFFFFF); NaN inputs
- * keep the propagated result. */
+ * the oracle default (0x7FFFFFFF / 0x7FFFFFFFFFFFFFFF); a single NaN
+ * input keeps the propagated result. Two quiet NaNs select per
+ * fp_f32_pick_nan / fp_f64_pick_nan (S32-R15-2): the larger fraction
+ * wins, ties keep va. Either SNaN keeps the ARM result, which already
+ * matches fp_f32_nan2 / fp_f64_nan2 (first SNaN quieted, FPSR.IOC set
+ * by the arithmetic op itself). */
 
 static void fp_canon(a64_buf_t *b, int is_d, unsigned vd, unsigned va,
     int has_b, unsigned vb)
@@ -302,6 +313,7 @@ static void fp_canon(a64_buf_t *b, int is_d, unsigned vd, unsigned va,
     size_t p_done;
     size_t p_keep;
     size_t p_keep2 = (size_t)-1;
+    size_t p_def;
 
     /* Fast path first (result not NaN -> done); every exit lands
      * past the canonicalize block. */
@@ -321,10 +333,87 @@ static void fp_canon(a64_buf_t *b, int is_d, unsigned vd, unsigned va,
         fp_mov64x(b, FS0, 0x7FFFFFFFFFFFFFFFULL);
         fp_mov_d_from_x(b, vd, FS0);
     }
+    p_def = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+    /* va holds a NaN here; with a second operand, check whether vb is
+     * also a NaN before selecting a payload. */
     a64_patch_b_cond(b, p_keep, b->count);
+    if (has_b != 0) {
+        size_t p_vb_ok;
+        size_t p_va_sn;
+        size_t p_vb_sn;
+        size_t p_pick_vb;
+        size_t p_pick_lo = (size_t)-1;
+        size_t p_hi_lo = (size_t)-1;
+        size_t p_skip;
+        /* Only va is known NaN so far; vb may be ordinary. */
+        fp_cmp(b, is_d, vb, vb);
+        p_vb_ok = a64_emit_b_cond_placeholder(b, A64_COND_VC);
+        if (is_d == 0) {
+            a64_emit_fmov_s_to_w(b, FS0, va);
+            a64_emit_fmov_s_to_w(b, FS1, vb);
+            /* Quiet bit 22 clear means SNaN: keep the ARM result. */
+            a64_emit_ubfm_w(b, FS2, FS0, 22U, 22U);
+            p_va_sn = a64_emit_cbz_w_placeholder(b, false, FS2);
+            a64_emit_ubfm_w(b, FS2, FS1, 22U, 22U);
+            p_vb_sn = a64_emit_cbz_w_placeholder(b, false, FS2);
+            /* Both quiet: the larger fraction wins, ties keep va. */
+            a64_emit_ubfm_w(b, FS0, FS0, 0U, 22U);
+            a64_emit_ubfm_w(b, FS1, FS1, 0U, 22U);
+            a64_emit_sub_reg_w(b, true, A64_ZR, FS1, FS0,
+                A64_SHIFT_LSL, 0U);
+            b->nzcv_valid = 0;
+            p_pick_vb = a64_emit_b_cond_placeholder(b, A64_COND_HI);
+        } else {
+            fp_mov_x_from_d(b, FS0, va);
+            fp_mov_x_from_d(b, FS1, vb);
+            /* Quiet bit 51 clear means SNaN: keep the ARM result. */
+            a64_emit_ubfx_x_to_w(b, FS2, FS0, 51U, 1U);
+            p_va_sn = a64_emit_cbz_w_placeholder(b, false, FS2);
+            a64_emit_ubfx_x_to_w(b, FS2, FS1, 51U, 1U);
+            p_vb_sn = a64_emit_cbz_w_placeholder(b, false, FS2);
+            /* Both quiet: compare the 52-bit fraction high half first,
+             * then the low half on ties (larger wins, ties keep va). */
+            a64_emit_ubfx_x_to_w(b, FS2, FS0, 32U, 20U);
+            a64_emit_ubfx_x_to_w(b, FS3, FS1, 32U, 20U);
+            a64_emit_sub_reg_w(b, true, A64_ZR, FS3, FS2,
+                A64_SHIFT_LSL, 0U);
+            b->nzcv_valid = 0;
+            p_pick_vb = a64_emit_b_cond_placeholder(b, A64_COND_HI);
+            /* CC (unsigned less) on the high half means va already
+             * wins: jump to the keep point. Equality falls through
+             * to the low-half compare. */
+            p_hi_lo = a64_emit_b_cond_placeholder(b, A64_COND_CC);
+            a64_emit_ubfx_x_to_w(b, FS2, FS0, 0U, 32U);
+            a64_emit_ubfx_x_to_w(b, FS3, FS1, 0U, 32U);
+            a64_emit_sub_reg_w(b, true, A64_ZR, FS3, FS2,
+                A64_SHIFT_LSL, 0U);
+            b->nzcv_valid = 0;
+            p_pick_lo = a64_emit_b_cond_placeholder(b,
+                A64_COND_HI);
+        }
+        /* Fallthrough keeps vd; skip over the vb move. */
+        p_skip = a64_emit_b_cond_placeholder(b, A64_COND_AL);
+        a64_patch_b_cond(b, p_pick_vb, b->count);
+        if (is_d != 0) {
+            a64_patch_b_cond(b, p_pick_lo, b->count);
+        }
+        if (is_d == 0) {
+            fp_mov_s(b, vd, vb);
+        } else {
+            a64_emit_fmov_d_d(b, vd, vb);
+        }
+        a64_patch_b_cond(b, p_vb_ok, b->count);
+        a64_patch_cbz_w(b, p_va_sn, b->count);
+        a64_patch_cbz_w(b, p_vb_sn, b->count);
+        a64_patch_b_cond(b, p_skip, b->count);
+        if (is_d != 0) {
+            a64_patch_b_cond(b, p_hi_lo, b->count);
+        }
+    }
     if (has_b != 0) {
         a64_patch_b_cond(b, p_keep2, b->count);
     }
+    a64_patch_b_cond(b, p_def, b->count);
     a64_patch_b_cond(b, p_done, b->count);
 }
 
@@ -590,10 +679,10 @@ static int fp_emit_arith(sparc32_emit_ctx_t *ec, uint32_t opf,
     return b->overflow ? -1 : 0;
 }
 
-/* Conversions (integer operands live in the F file as raw
- * patterns). FRINT32X rounds per FPCR.RMode (FRINTI never signals
- * inexact, so it cannot drive the NXC commit); the rest converts
- * exactly, so the sequence honors FSR.RD. */
+/* Conversions (integer operands live in the F file as raw patterns).
+ * FsTOs/FsTOd/FdTOs widen/narrow under FSR.RD via FPCR.RMode
+ * (SCVTF/FCVT); FsTOi/FdTOi always round toward zero (FCVTZS) per
+ * SPARC V8 B.28. */
 static void fp_rd_load(a64_buf_t *b)
 {
     a64_emit_ldr_imm_w(b, FS0, A64_XCTX, FP_FSR_OFF);
@@ -633,6 +722,12 @@ static int fp_emit_convert(sparc32_emit_ctx_t *ec, uint32_t opf,
     case 0x0D1U: /* FsTOi: single -> int bits (always RZ per V8 B.28) */
         fp_ld_s(b, FVA, rs2);
         a64_emit_fcvtzs_s_to_w(b, FS0, FVA);
+        /* NaN saturates to 0x7FFFFFFF (S32-R15-1): FCVTZS already
+         * raised FPSR.IOC and wrote 0; FCMP sets NZCV.V for NaN
+         * without touching FPSR. */
+        fp_cmp(b, 0, FVA, FVA);
+        a64_emit_mov_imm32(b, FS1, 0x7FFFFFFFU);
+        a64_emit_csel_w(b, FS0, FS1, FS0, A64_COND_VS);
         fp_flags_commit(b);
         a64_emit_str_imm_w(b, FS0, A64_XCTX, fp_s_off(rd));
         a64_fpr_invalidate(b, rd);
@@ -640,6 +735,12 @@ static int fp_emit_convert(sparc32_emit_ctx_t *ec, uint32_t opf,
     case 0x0D2U: /* FdTOi: double -> int bits (always RZ per V8 B.28) */
         fp_ld_d(b, FVA, rs2);
         a64_emit_fcvtzs_d_to_w(b, FS0, FVA);
+        /* NaN saturates to 0x7FFFFFFF (S32-R15-1): FCVTZS already
+         * raised FPSR.IOC and wrote 0; FCMP sets NZCV.V for NaN
+         * without touching FPSR. */
+        fp_cmp(b, 1, FVA, FVA);
+        a64_emit_mov_imm32(b, FS1, 0x7FFFFFFFU);
+        a64_emit_csel_w(b, FS0, FS1, FS0, A64_COND_VS);
         fp_flags_commit(b);
         a64_emit_str_imm_w(b, FS0, A64_XCTX, fp_s_off(rd));
         a64_fpr_invalidate(b, rd);
@@ -690,27 +791,9 @@ static int fp_emit_cmp(sparc32_emit_ctx_t *ec, uint32_t opf,
 }
 
 /* FPop dispatcher: double-dest needs even rd, double sources need
- * even rs1/rs2 (manual-strict; covers decoder gaps FSQRTd, FiTOd,
- * FsMULd, so no decode.c change is needed). */
-
-static int fp_double_dest(uint32_t op3, uint32_t opf)
-{
-    if (op3 == (uint32_t)SPARC32_OP3_FPOP1) {
-        switch (opf) {
-        case 0x002U: case 0x006U: case 0x00AU:
-        case 0x042U: case 0x046U: case 0x04AU: case 0x04EU:
-        case 0x02AU: case 0x069U:
-        case 0x0C8U: case 0x0C9U: case 0x0CBU:
-            return 1;
-        default:
-            return 0;
-        }
-    }
-    if (op3 == (uint32_t)SPARC32_OP3_FPOP2) {
-        return opf == 0x069U ? 1 : 0;
-    }
-    return 0;
-}
+ * even rs1/rs2 (manual-strict). Double-dest classification is the
+ * shared sparc32_fpu_double_dest (S32-R13-7): this emitter keeps only
+ * the source-parity half locally. */
 
 /* which: 1 = rs1, 2 = rs2. Arithmetic-d and FCMPd/FCMPEd take
  * double rs1+rs2; FSQRTd/FdTOi/FdTOs take double rs2 only. */
@@ -753,7 +836,7 @@ int sparc32_emit_fpu(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d)
     rd = d->rd;
     rs1 = d->rs1;
     rs2 = d->rs2;
-    if (fp_double_dest(op3, opf) != 0 && ((rd & 1U) != 0U)) {
+    if (sparc32_fpu_double_dest(op3, opf) != 0 && ((rd & 1U) != 0U)) {
         return fp_undef(ec);
     }
     if (fp_double_source(op3, opf, 1) != 0 && ((rs1 & 1U) != 0U)) {

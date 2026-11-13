@@ -89,4 +89,21 @@ int sparc32_emit_fallback(sparc32_emit_ctx_t *ec, const sparc32_decoded_t *d);
  * Carries pc in w15, SPARC32_EXIT_SINGLE_STEP in w16, then returns. */
 int sparc32_emit_exit_singlestep(sparc32_emit_ctx_t *ec, uint32_t pc);
 
+/* Delay-slot emitter for the shared page-final branch skeleton below:
+ * emits the delay instruction addressed at npc (ec->pc/->fault_pc
+ * already name it), like e_emit_delay / fp_emit_delay. */
+typedef int (*sparc32_cti_delay_fn)(sparc32_emit_ctx_t *ec, uint32_t npc);
+
+/* Shared page-final conditional-branch body (S32-R13-6): the not-taken
+ * delay/exit runs under the caller's taken-test placeholder, which is
+ * patched here (b_cond for Bicc, cbz for FBfcc); the taken delay runs
+ * with jmpl record/disarm gated on e_delay_needs_jmpl_record(ec->delay)
+ * so a taken delay fault commits npc = target. Both exits leave via
+ * SINGLE_STEP. Implemented in emit_cti.c; called by sparc32_emit_branch
+ * (Bicc) and sparc32_emit_fbranch (FBfcc). */
+int sparc32_emit_branch_page_final(sparc32_emit_ctx_t *ec, uint32_t npc,
+    uint32_t target, int not_taken_runs, int taken_runs,
+    size_t taken_patch, int taken_is_cbz,
+    sparc32_cti_delay_fn emit_delay);
+
 #endif /* SPARC32RT_DBT_EMIT_INT_H */

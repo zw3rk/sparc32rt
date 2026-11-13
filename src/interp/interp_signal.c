@@ -33,22 +33,36 @@ RC1 subset of Phase-4 signals: rt_signal_frame32 construction for
 /* C2-3 delivery stack: an SA_ONSTACK handler runs on the installed
  * alternate stack (top, frame built under it 16-aligned) unless a
  * handler already runs there. Returns the sp to build under. */
-static uint32_t interp_delivery_sp(sparc32_ctx_t *ctx, uint32_t flags)
+static bool interp_delivery_sp(sparc32_ctx_t *ctx, uint32_t flags,
+    uint32_t *out_sp)
 {
-    uint32_t sp = ctx->r[SPARC32_SP];
+    uint32_t sp;
+    int i;
+    if (ctx == NULL || out_sp == NULL) {
+        return false;
+    }
+    sp = ctx->r[SPARC32_SP];
     /* Flush all cached caller windows and the interrupted live window to
      * the interrupted stack before overwriting %sp with the signal frame,
      * so setjmp/longjmp or stack unwinding out of a signal handler finds
-     * the interrupted window's L0..I7 at its true home sp. */
-    (void)interp_flush_windows(ctx);
-    if (interp_range_ok(ctx, sp, SPARC32_RWINDOW_SIZE, 2U)) {
-        int i;
-        for (i = 0; i < 8; i++) {
-            uint32_t base = sp + (uint32_t)i * 4U;
-            (void)interp_st_be(ctx, base, 4U,
-                ctx->r[SPARC32_L0 + (uint32_t)i]);
-            (void)interp_st_be(ctx, base + 32U, 4U,
-                ctx->r[SPARC32_I0 + (uint32_t)i]);
+     * the interrupted window's L0..I7 at its true home sp. A failed
+     * spill or store aborts delivery (S32-R13-1): the handler must never
+     * run over an unspilled window file. */
+    if (!interp_flush_windows(ctx)) {
+        return false;
+    }
+    if (!interp_range_ok(ctx, sp, SPARC32_RWINDOW_SIZE, 2U)) {
+        return false;
+    }
+    for (i = 0; i < 8; i++) {
+        uint32_t base = sp + (uint32_t)i * 4U;
+        if (!interp_st_be(ctx, base, 4U,
+                ctx->r[SPARC32_L0 + (uint32_t)i])) {
+            return false;
+        }
+        if (!interp_st_be(ctx, base + 32U, 4U,
+                ctx->r[SPARC32_I0 + (uint32_t)i])) {
+            return false;
         }
     }
     if ((flags & SPARC32_SA_ONSTACK) != 0U) {
@@ -67,7 +81,8 @@ static uint32_t interp_delivery_sp(sparc32_ctx_t *ctx, uint32_t flags)
             sp = asp + asize;
         }
     }
-    return sp;
+    *out_sp = sp;
+    return true;
 }
 
 static bool interp_frame_fpu(sparc32_ctx_t *ctx, uint32_t fpu_va)
@@ -211,8 +226,14 @@ bool interp_try_deliver_sync(sparc32_ctx_t *ctx, int signo)
         code = (ctx->exit_arg == 0x03U &&
             ctx->exit_reason == (uint32_t)SPARC32_EXIT_TRAP) ? 4U : 1U;
     }
-    frame = (interp_delivery_sp(ctx, flags) -
-        (SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE)) & ~15U;
+    {
+        uint32_t base_sp;
+        if (!interp_delivery_sp(ctx, flags, &base_sp)) {
+            return false;
+        }
+        frame = (base_sp -
+            (SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE)) & ~15U;
+    }
     fpu_va = frame + SPARC32_RT_SIGFRAME_SIZE;
     if (!interp_range_ok(ctx, frame,
             SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE, 2U)) {
@@ -359,8 +380,14 @@ static bool interp_async_build(sparc32_ctx_t *ctx, int signo,
         return false;
     }
     flags = act->flags;
-    fr = (interp_delivery_sp(ctx, flags) -
-        (SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE)) & ~15U;
+    {
+        uint32_t base_sp;
+        if (!interp_delivery_sp(ctx, flags, &base_sp)) {
+            return false;
+        }
+        fr = (base_sp -
+            (SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE)) & ~15U;
+    }
     fpu_va = fr + SPARC32_RT_SIGFRAME_SIZE;
     if (!interp_range_ok(ctx, fr,
             SPARC32_RT_SIGFRAME_SIZE + SPARC32_SIGFPU_SIZE, 2U)) {

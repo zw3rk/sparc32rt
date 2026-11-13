@@ -43,13 +43,6 @@
 #define VM32_GUEST_PAGE 4096u
 #define VM32_PAGE_COUNT (VM32_WINDOW_LEN / VM32_GUEST_PAGE)
 
-/* Regime selectors. */
-typedef enum {
-    VM32_REGIME_A1 = 1, /* H == 4096 */
-    VM32_REGIME_A2 = 2  /* H > 4096 sub-page software permissions */
-} vm32_regime_t;
-
-static vm32_regime_t g_vm32_regime = VM32_REGIME_A1;
 static bool g_vm32_ready = false;
 static uint64_t g_vm32_base = 0u;
 
@@ -114,12 +107,6 @@ static uint64_t vm32_line_mask_in_page(uint32_t vpn, uint32_t gva, size_t len)
     return ((UINT64_C(1) << (l1 - l0 + 1u)) - 1ULL) << l0;
 }
 
-/* Current regime (valid after vm32_reserve/vm32_attach). */
-int vm32_regime(void)
-{
-    return (int)g_vm32_regime;
-}
-
 /* True once the window has been reserved for this process. */
 bool vm32_ready(void)
 {
@@ -164,7 +151,6 @@ static int vm32_alloc_tables(void)
  */
 int vm32_reserve(sparc32_ctx_t *ctx)
 {
-    size_t host_page;
     void *base = NULL;
     int rc;
     if (ctx == NULL) {
@@ -174,9 +160,6 @@ int vm32_reserve(sparc32_ctx_t *ctx)
         ctx->guest_base = g_vm32_base;
         return 0;
     }
-    host_page = rt_host_page_size();
-    g_vm32_regime = (host_page == (size_t)VM32_GUEST_PAGE) ?
-        VM32_REGIME_A1 : VM32_REGIME_A2;
     rc = rt_host_map_anon(NULL, (size_t)VM32_WINDOW_LEN, 0, 0, 1, &base);
     if (rc != 0 || base == NULL) {
         return -1;
@@ -203,7 +186,6 @@ int vm32_reserve(sparc32_ctx_t *ctx)
  */
 int vm32_attach(sparc32_ctx_t *ctx)
 {
-    size_t host_page;
     if (ctx == NULL) {
         return -1;
     }
@@ -215,9 +197,6 @@ int vm32_attach(sparc32_ctx_t *ctx)
         return -1;
     }
     g_vm32_prot_jit = g_vm32_prot;
-    host_page = rt_host_page_size();
-    g_vm32_regime = (host_page == (size_t)VM32_GUEST_PAGE) ?
-        VM32_REGIME_A1 : VM32_REGIME_A2;
     g_vm32_base = ctx->guest_base;
     g_vm32_ready = true;
     return 0;
